@@ -467,8 +467,8 @@ ENTRY art_quick_do_long_jump
     // Skip slot 8*0(a0) for zero/x0 as it is hard-wired zero.
     ld  ra,   8*1(a0)   // x1
     // Skip slot 8*2(a0) for sp/x2 as it is set below.
-    // Skip slot 8*3(a0) for platform-specific thread pointer tp/x3.
-    // Skip slot 8*4(a0) for platform-specific global pointer gp/x4.
+    // Skip slot 8*3(a0) for platform-specific thread pointer gp/x3.
+    // Skip slot 8*4(a0) for platform-specific global pointer tp/x4.
     // Skip slot 8*5(a0) for t0/x5 as it is clobbered below.
     // Skip slot 8*6(a0) for t1/x6 as it is clobbered below.
     ld  t2,   8*7(a0)   // x7
@@ -482,7 +482,7 @@ ENTRY art_quick_do_long_jump
     ld  a5,   8*15(a0)  // x15
     ld  a6,   8*16(a0)  // x16
     ld  a7,   8*17(a0)  // x17
-    // Skip slot 8*18(a0) for shadow stack s2/x18.
+    ld  s2,   8*18(a0)  // x18
     ld  s3,   8*19(a0)  // x19
     ld  s4,   8*20(a0)  // x20
     ld  s5,   8*21(a0)  // x21
@@ -542,9 +542,47 @@ ENTRY art_quick_proxy_invoke_handler
 END art_quick_proxy_invoke_handler
 
 
+.macro ONE_ARG_RUNTIME_EXCEPTION c_name, cxx_name
+.extern \cxx_name
+ENTRY \c_name
+    SETUP_SAVE_ALL_CALLEE_SAVES_FRAME // save all registers as basis for long jump context.
+    mv  a1, xSELF                     // pass Thread::Current.
+    jal \cxx_name                     // \cxx_name(arg, Thread*).
+    ebreak
+END \c_name
+.endm
+
+
+// Called to attempt to execute an obsolete method.
+ONE_ARG_RUNTIME_EXCEPTION art_invoke_obsolete_method_stub, artInvokeObsoleteMethod
+
+
+ENTRY art_quick_resolution_trampoline
+    SETUP_SAVE_REFS_AND_ARGS_FRAME
+
+    // const void* artQuickResolutionTrampoline(ArtMethod* called,         // a0
+    //                                          mirror::Object* receiver,  // a1
+    //                                          Thread* self,              // a2
+    //                                          ArtMethod** sp)            // a3
+    mv   a2, xSELF
+    mv   a3, sp
+    call artQuickResolutionTrampoline
+
+    beqz a0, 1f
+    .cfi_remember_state
+    mv   t0, a0    // Remember returned code pointer in t0.
+    ld   a0, (sp)  // artQuickResolutionTrampoline puts called method in *sp.
+
+    RESTORE_SAVE_REFS_AND_ARGS_FRAME
+    jr   t0
+1:
+    CFI_RESTORE_STATE_AND_DEF_CFA sp, FRAME_SIZE_SAVE_REFS_AND_ARGS
+    RESTORE_SAVE_REFS_AND_ARGS_FRAME
+    DELIVER_PENDING_EXCEPTION
+END art_quick_resolution_trampoline
+
+
 UNDEFINED art_quick_imt_conflict_trampoline
-UNDEFINED art_invoke_obsolete_method_stub
-UNDEFINED art_quick_resolution_trampoline
 UNDEFINED art_quick_deoptimize_from_compiled_code
 UNDEFINED art_quick_string_builder_append
 UNDEFINED art_quick_compile_optimized

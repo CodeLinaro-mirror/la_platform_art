@@ -298,7 +298,7 @@ Runtime::Runtime()
       experimental_flags_(ExperimentalFlags::kNone),
       oat_file_manager_(nullptr),
       is_low_memory_mode_(false),
-      madvise_willneed_vdex_filesize_(0),
+      madvise_willneed_total_dex_size_(0),
       madvise_willneed_odex_filesize_(0),
       madvise_willneed_art_filesize_(0),
       safe_mode_(false),
@@ -714,35 +714,20 @@ void Runtime::Abort(const char* msg) {
 }
 
 /**
- * Update entrypoints (native and Java) of methods before the first fork. This
+ * Update entrypoints of methods before the first fork. This
  * helps sharing pages where ArtMethods are allocated between the zygote and
  * forked apps.
  */
 class UpdateMethodsPreFirstForkVisitor : public ClassVisitor {
  public:
-  UpdateMethodsPreFirstForkVisitor(Thread* self, ClassLinker* class_linker)
-      : vm_(down_cast<JNIEnvExt*>(self->GetJniEnv())->GetVm()),
-        self_(self),
-        class_linker_(class_linker),
+  explicit UpdateMethodsPreFirstForkVisitor(ClassLinker* class_linker)
+      : class_linker_(class_linker),
         can_use_nterp_(interpreter::CanRuntimeUseNterp()) {}
 
   bool operator()(ObjPtr<mirror::Class> klass) override REQUIRES_SHARED(Locks::mutator_lock_) {
     bool is_initialized = klass->IsVisiblyInitialized();
     for (ArtMethod& method : klass->GetDeclaredMethods(kRuntimePointerSize)) {
-      if (is_initialized || !method.NeedsClinitCheckBeforeCall()) {
-        if (method.IsNative()) {
-          const void* existing = method.GetEntryPointFromJni();
-          if (method.IsCriticalNative()
-                  ? class_linker_->IsJniDlsymLookupCriticalStub(existing)
-                  : class_linker_->IsJniDlsymLookupStub(existing)) {
-            const void* native_code =
-                vm_->FindCodeForNativeMethod(&method, /*error_msg=*/ nullptr, /*can_suspend=*/ false);
-            if (native_code != nullptr) {
-              class_linker_->RegisterNative(self_, &method, native_code);
-            }
-          }
-        }
-      } else if (can_use_nterp_) {
+      if (!is_initialized && method.NeedsClinitCheckBeforeCall() && can_use_nterp_) {
         const void* existing = method.GetEntryPointFromQuickCompiledCode();
         if (class_linker_->IsQuickResolutionStub(existing) && CanMethodUseNterp(&method)) {
           method.SetEntryPointFromQuickCompiledCode(interpreter::GetNterpWithClinitEntryPoint());
@@ -753,8 +738,6 @@ class UpdateMethodsPreFirstForkVisitor : public ClassVisitor {
   }
 
  private:
-  JavaVMExt* const vm_;
-  Thread* const self_;
   ClassLinker* const class_linker_;
   const bool can_use_nterp_;
 
@@ -775,7 +758,7 @@ void Runtime::PreZygoteFork() {
     class_linker_->MakeInitializedClassesVisiblyInitialized(self, /*wait=*/ true);
 
     ScopedObjectAccess soa(self);
-    UpdateMethodsPreFirstForkVisitor visitor(self, class_linker_);
+    UpdateMethodsPreFirstForkVisitor visitor(class_linker_);
     class_linker_->VisitClasses(&visitor);
   }
   heap_->PreZygoteFork();
@@ -1602,8 +1585,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   zygote_max_failed_boots_ = runtime_options.GetOrDefault(Opt::ZygoteMaxFailedBoots);
   experimental_flags_ = runtime_options.GetOrDefault(Opt::Experimental);
   is_low_memory_mode_ = runtime_options.Exists(Opt::LowMemoryMode);
-  madvise_random_access_ = runtime_options.GetOrDefault(Opt::MadviseRandomAccess);
-  madvise_willneed_vdex_filesize_ = runtime_options.GetOrDefault(Opt::MadviseWillNeedVdexFileSize);
+  madvise_willneed_total_dex_size_ = runtime_options.GetOrDefault(Opt::MadviseWillNeedVdexFileSize);
   madvise_willneed_odex_filesize_ = runtime_options.GetOrDefault(Opt::MadviseWillNeedOdexFileSize);
   madvise_willneed_art_filesize_ = runtime_options.GetOrDefault(Opt::MadviseWillNeedArtFileSize);
 
@@ -2195,6 +2177,9 @@ void Runtime::InitNativeMethods() {
   // com_android_art linker namespace.
   jclass java_lang_Object;
   {
+    // Use global JNI reference to keep the local references empty. If we allocated a
+    // local reference here, the `PushLocalFrame(128)` that these internal libraries do
+    // in their `JNI_OnLoad()` would reserve a lot of unnecessary space due to rounding.
     ScopedObjectAccess soa(self);
     java_lang_Object = reinterpret_cast<jclass>(
         GetJavaVM()->AddGlobalRef(self, GetClassRoot<mirror::Object>(GetClassLinker())));
@@ -2775,6 +2760,30 @@ void Runtime::RegisterAppInfo(const std::string& package_name,
   }
   if (code_paths.empty()) {
     LOG(WARNING) << "JIT profile information will not be recorded: code paths is empty.";
+    return;
+  }
+
+  // Framework calls this method for all split APKs. Ignore the calls for the ones with no dex code
+  // so that we don't unnecessarily create profiles for them or write bootclasspath profiling info
+  // to those profiles.
+  bool has_code = false;
+  for (const std::string& path : code_paths) {
+    std::string error_msg;
+    std::vector<uint32_t> checksums;
+    std::vector<std::string> dex_locations;
+    if (!ArtDexFileLoader::GetMultiDexChecksums(
+            path.c_str(), &checksums, &dex_locations, &error_msg)) {
+      LOG(WARNING) << error_msg;
+      continue;
+    }
+    if (dex_locations.size() > 0) {
+      has_code = true;
+      break;
+    }
+  }
+  if (!has_code) {
+    VLOG(profiler) << "JIT profile information will not be recorded: no dex code in '" +
+                          android::base::Join(code_paths, ',') + "'.";
     return;
   }
 
@@ -3411,6 +3420,8 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
                                   const uint8_t* map_begin,
                                   const uint8_t* map_end,
                                   const std::string& file_name) {
+  map_begin = AlignDown(map_begin, kPageSize);
+  map_size_bytes = RoundUp(map_size_bytes, kPageSize);
 #ifdef ART_TARGET_ANDROID
   // Short-circuit the madvise optimization for background processes. This
   // avoids IO and memory contention with foreground processes, particularly
@@ -3443,7 +3454,7 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
 
     // Clamp endOfFile if its past map_end
     if (target_pos > map_end) {
-        target_pos = map_end;
+      target_pos = map_end;
     }
 
     // Madvise the whole file up to target_pos in chunks of
@@ -3461,7 +3472,9 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
       int status = madvise(madvise_addr, madvise_length, MADV_WILLNEED);
       // In case of error we stop madvising rest of the file
       if (status < 0) {
-        LOG(ERROR) << "Failed to madvise file:" << file_name << " for size:" << map_size_bytes;
+        LOG(ERROR) << "Failed to madvise file " << file_name
+                   << " for size:" << map_size_bytes
+                   << ": " << strerror(errno);
         break;
       }
     }

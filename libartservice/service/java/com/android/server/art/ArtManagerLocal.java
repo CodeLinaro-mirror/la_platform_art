@@ -31,12 +31,14 @@ import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptSt
 import android.annotation.CallbackExecutor;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.annotation.SuppressLint;
 import android.annotation.SystemApi;
 import android.annotation.SystemService;
 import android.app.job.JobInfo;
 import android.apphibernation.AppHibernationManager;
 import android.content.Context;
 import android.os.Binder;
+import android.os.Build;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
@@ -49,6 +51,8 @@ import android.os.storage.StorageManager;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
+
+import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.LocalManagerRegistry;
@@ -72,6 +76,9 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -102,7 +109,9 @@ import java.util.stream.Stream;
  */
 @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
 public final class ArtManagerLocal {
-    private static final String TAG = "ArtService";
+    /** @hide */
+    public static final String TAG = "ArtService";
+
     private static final String[] CLASSPATHS_FOR_BOOT_IMAGE_PROFILE = {
             "BOOTCLASSPATH", "SYSTEMSERVERCLASSPATH", "STANDALONE_SYSTEMSERVER_JARS"};
 
@@ -126,6 +135,7 @@ public final class ArtManagerLocal {
      * @param context the system server context
      * @throws NullPointerException if required dependencies are missing
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public ArtManagerLocal(@NonNull Context context) {
         mInjector = new Injector(this, context);
     }
@@ -149,6 +159,7 @@ public final class ArtManagerLocal {
      * @throws IllegalArgumentException if the arguments are illegal
      * @see ArtShellCommand#printHelp(PrintWriter)
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public int handleShellCommand(@NonNull Binder target, @NonNull ParcelFileDescriptor in,
             @NonNull ParcelFileDescriptor out, @NonNull ParcelFileDescriptor err,
             @NonNull String[] args) {
@@ -158,6 +169,7 @@ public final class ArtManagerLocal {
     }
 
     /** Prints ART Service shell command help. */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void printShellCommandHelp(@NonNull PrintWriter pw) {
         ArtShellCommand.printHelp(pw);
     }
@@ -170,6 +182,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DeleteResult deleteDexoptArtifacts(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
@@ -200,7 +213,8 @@ public final class ArtManagerLocal {
 
             return DeleteResult.create(freedBytes);
         } catch (RemoteException e) {
-            throw new IllegalStateException("An error occurred when calling artd", e);
+            Utils.logArtdException(e);
+            return DeleteResult.create(0 /* freedBytes */);
         }
     }
 
@@ -213,6 +227,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptStatus getDexoptStatus(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
@@ -224,6 +239,7 @@ public final class ArtManagerLocal {
      *
      * @see #getDexoptStatus(PackageManagerLocal.FilteredSnapshot, String)
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptStatus getDexoptStatus(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @GetStatusFlags int flags) {
@@ -235,55 +251,61 @@ public final class ArtManagerLocal {
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
 
+        List<Pair<DetailedDexInfo, Abi>> dexAndAbis = new ArrayList<>();
+
+        if ((flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0) {
+            for (DetailedPrimaryDexInfo dexInfo :
+                    PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
+                if (!dexInfo.hasCode()) {
+                    continue;
+                }
+                for (Abi abi : Utils.getAllAbis(pkgState)) {
+                    dexAndAbis.add(Pair.create(dexInfo, abi));
+                }
+            }
+        }
+
+        if ((flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0) {
+            for (SecondaryDexInfo dexInfo :
+                    mInjector.getDexUseManager().getSecondaryDexInfo(packageName)) {
+                for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
+                    dexAndAbis.add(Pair.create(dexInfo, abi));
+                }
+            }
+        }
+
         try {
             List<DexContainerFileDexoptStatus> statuses = new ArrayList<>();
 
-            if ((flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0) {
-                for (DetailedPrimaryDexInfo dexInfo :
-                        PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
-                    if (!dexInfo.hasCode()) {
-                        continue;
-                    }
-                    for (Abi abi : Utils.getAllAbis(pkgState)) {
-                        try {
-                            GetDexoptStatusResult result = mInjector.getArtd().getDexoptStatus(
-                                    dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
-                            statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
-                                    true /* isPrimaryDex */, abi.isPrimaryAbi(), abi.name(),
-                                    result.compilerFilter, result.compilationReason,
-                                    result.locationDebugString));
-                        } catch (ServiceSpecificException e) {
-                            statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
-                                    true /* isPrimaryDex */, abi.isPrimaryAbi(), abi.name(),
-                                    "error", "error", e.getMessage()));
-                        }
-                    }
-                }
-            }
-
-            if ((flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0) {
-                for (SecondaryDexInfo dexInfo :
-                        mInjector.getDexUseManager().getSecondaryDexInfo(packageName)) {
-                    for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
-                        try {
-                            GetDexoptStatusResult result = mInjector.getArtd().getDexoptStatus(
-                                    dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
-                            statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
-                                    false /* isPrimaryDex */, abi.isPrimaryAbi(), abi.name(),
-                                    result.compilerFilter, result.compilationReason,
-                                    result.locationDebugString));
-                        } catch (ServiceSpecificException e) {
-                            statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
-                                    false /* isPrimaryDex */, abi.isPrimaryAbi(), abi.name(),
-                                    "error", "error", e.getMessage()));
-                        }
-                    }
+            for (Pair<DetailedDexInfo, Abi> pair : dexAndAbis) {
+                DetailedDexInfo dexInfo = pair.first;
+                Abi abi = pair.second;
+                try {
+                    GetDexoptStatusResult result = mInjector.getArtd().getDexoptStatus(
+                            dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
+                    statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
+                            dexInfo instanceof DetailedPrimaryDexInfo, abi.isPrimaryAbi(),
+                            abi.name(), result.compilerFilter, result.compilationReason,
+                            result.locationDebugString));
+                } catch (ServiceSpecificException e) {
+                    statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
+                            dexInfo instanceof DetailedPrimaryDexInfo, abi.isPrimaryAbi(),
+                            abi.name(), "error", "error", e.getMessage()));
                 }
             }
 
             return DexoptStatus.create(statuses);
         } catch (RemoteException e) {
-            throw new IllegalStateException("An error occurred when calling artd", e);
+            Utils.logArtdException(e);
+            List<DexContainerFileDexoptStatus> statuses = new ArrayList<>();
+            for (Pair<DetailedDexInfo, Abi> pair : dexAndAbis) {
+                DetailedDexInfo dexInfo = pair.first;
+                Abi abi = pair.second;
+                statuses.add(DexContainerFileDexoptStatus.create(dexInfo.dexPath(),
+                        dexInfo instanceof DetailedPrimaryDexInfo, abi.isPrimaryAbi(), abi.name(),
+                        "error", "error", e.getMessage()));
+            }
+            return DexoptStatus.create(statuses);
         }
     }
 
@@ -296,6 +318,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public void clearAppProfiles(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
@@ -325,7 +348,7 @@ public final class ArtManagerLocal {
                         AidlUtils.buildProfilePathForSecondaryCur(dexInfo.dexPath()));
             }
         } catch (RemoteException e) {
-            throw new IllegalStateException("An error occurred when calling artd", e);
+            Utils.logArtdException(e);
         }
     }
 
@@ -340,6 +363,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptResult dexoptPackage(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @NonNull DexoptParams params) {
@@ -352,6 +376,7 @@ public final class ArtManagerLocal {
      *
      * @see #dexoptPackage(PackageManagerLocal.FilteredSnapshot, String, DexoptParams)
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptResult dexoptPackage(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @NonNull DexoptParams params,
@@ -371,6 +396,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptResult resetDexoptStatus(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @NonNull CancellationSignal cancellationSignal) {
@@ -437,6 +463,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public DexoptResult dexoptPackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull @BatchDexoptReason String reason,
@@ -484,6 +511,7 @@ public final class ArtManagerLocal {
      * If this method is not called, the default list of packages and options determined by {@code
      * reason} will be used.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void setBatchDexoptStartCallback(@NonNull @CallbackExecutor Executor executor,
             @NonNull BatchDexoptStartCallback callback) {
         mInjector.getConfig().setBatchDexoptStartCallback(executor, callback);
@@ -494,6 +522,7 @@ public final class ArtManagerLocal {
      * #setBatchDexoptStartCallback(Executor, BatchDexoptStartCallback)}. This method is
      * thread-safe.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void clearBatchDexoptStartCallback() {
         mInjector.getConfig().clearBatchDexoptStartCallback();
     }
@@ -531,6 +560,7 @@ public final class ArtManagerLocal {
      *
      * @throws RuntimeException if called during boot before the job scheduler service has started.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public @ScheduleStatus int scheduleBackgroundDexoptJob() {
         return mInjector.getBackgroundDexoptJob().schedule();
     }
@@ -547,6 +577,7 @@ public final class ArtManagerLocal {
      * DexoptResult#DEXOPT_CANCELLED}. Note that a job started by {@link
      * #startBackgroundDexoptJob()} will not be cancelled by this method.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void unscheduleBackgroundDexoptJob() {
         mInjector.getBackgroundDexoptJob().unschedule();
     }
@@ -554,6 +585,7 @@ public final class ArtManagerLocal {
     /**
      * Overrides the configuration of the background dexopt job. This method is thread-safe.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void setScheduleBackgroundDexoptJobCallback(@NonNull @CallbackExecutor Executor executor,
             @NonNull ScheduleBackgroundDexoptJobCallback callback) {
         mInjector.getConfig().setScheduleBackgroundDexoptJobCallback(executor, callback);
@@ -564,6 +596,7 @@ public final class ArtManagerLocal {
      * #setScheduleBackgroundDexoptJobCallback(Executor, ScheduleBackgroundDexoptJobCallback)}. This
      * method is thread-safe.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void clearScheduleBackgroundDexoptJobCallback() {
         mInjector.getConfig().clearScheduleBackgroundDexoptJobCallback();
     }
@@ -582,6 +615,7 @@ public final class ArtManagerLocal {
      * by {@link #addDexoptDoneCallback(Executor, DexoptDoneCallback)} with the
      * reason {@link ReasonMapping#REASON_BG_DEXOPT}.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void startBackgroundDexoptJob() {
         mInjector.getBackgroundDexoptJob().start();
     }
@@ -591,6 +625,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public CompletableFuture<BackgroundDexoptJob.Result> startBackgroundDexoptJobAndReturnFuture() {
         return mInjector.getBackgroundDexoptJob().start();
@@ -601,6 +636,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @Nullable
     public CompletableFuture<BackgroundDexoptJob.Result> getRunningBackgroundDexoptJob() {
         return mInjector.getBackgroundDexoptJob().get();
@@ -615,6 +651,7 @@ public final class ArtManagerLocal {
      * #addDexoptDoneCallback(Executor, DexoptDoneCallback)} will contain {@link
      * DexoptResult#DEXOPT_CANCELLED}.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void cancelBackgroundDexoptJob() {
         mInjector.getBackgroundDexoptJob().cancel();
     }
@@ -630,6 +667,7 @@ public final class ArtManagerLocal {
      *         don't have any update.
      * @throws IllegalStateException if the same callback instance is already added
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void addDexoptDoneCallback(boolean onlyIncludeUpdates,
             @NonNull @CallbackExecutor Executor executor, @NonNull DexoptDoneCallback callback) {
         mInjector.getConfig().addDexoptDoneCallback(onlyIncludeUpdates, executor, callback);
@@ -640,6 +678,7 @@ public final class ArtManagerLocal {
      * #addDexoptDoneCallback(Executor, DexoptDoneCallback)}. Does nothing if the
      * callback was not added. This method is thread-safe.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void removeDexoptDoneCallback(@NonNull DexoptDoneCallback callback) {
         mInjector.getConfig().removeDexoptDoneCallback(callback);
     }
@@ -659,6 +698,7 @@ public final class ArtManagerLocal {
      * @throws SnapshotProfileException if the operation encounters an error that the caller should
      *         handle (e.g., an I/O error, a sub-process crash).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public ParcelFileDescriptor snapshotAppProfile(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
@@ -673,6 +713,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public ParcelFileDescriptor dumpAppProfile(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
@@ -684,24 +725,46 @@ public final class ArtManagerLocal {
         return snapshotOrDumpAppProfile(snapshot, packageName, splitName, options);
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     private ParcelFileDescriptor snapshotOrDumpAppProfile(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
             @Nullable String splitName, @NonNull MergeProfileOptions options)
             throws SnapshotProfileException {
-        PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
-        AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        PrimaryDexInfo dexInfo = PrimaryDexUtils.getDexInfoBySplitName(pkg, splitName);
+        try {
+            PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
+            AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+            PrimaryDexInfo dexInfo = PrimaryDexUtils.getDexInfoBySplitName(pkg, splitName);
 
-        List<ProfilePath> profiles = new ArrayList<>();
-        profiles.add(PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo));
-        profiles.addAll(
-                PrimaryDexUtils.getCurProfiles(mInjector.getUserManager(), pkgState, dexInfo));
+            List<ProfilePath> profiles = new ArrayList<>();
 
-        OutputProfile output = PrimaryDexUtils.buildOutputProfile(
-                pkgState, dexInfo, Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */);
+            Pair<ProfilePath, Boolean> pair = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
+                    dexInfo.dexPath(), PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo),
+                    PrimaryDexUtils.getExternalProfiles(dexInfo),
+                    PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
+                            Process.SYSTEM_UID, false /* isPublic */));
+            ProfilePath refProfile = pair != null ? pair.first : null;
 
-        return mergeProfilesAndGetFd(profiles, output, List.of(dexInfo.dexPath()), options);
+            if (refProfile != null) {
+                profiles.add(refProfile);
+            }
+
+            profiles.addAll(
+                    PrimaryDexUtils.getCurProfiles(mInjector.getUserManager(), pkgState, dexInfo));
+
+            OutputProfile output = PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo,
+                    Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */);
+
+            try {
+                return mergeProfilesAndGetFd(profiles, output, List.of(dexInfo.dexPath()), options);
+            } finally {
+                if (refProfile != null && refProfile.getTag() == ProfilePath.tmpProfilePath) {
+                    mInjector.getArtd().deleteProfile(refProfile);
+                }
+            }
+        } catch (RemoteException e) {
+            throw new SnapshotProfileException(e);
+        }
     }
 
     /**
@@ -718,6 +781,7 @@ public final class ArtManagerLocal {
      * @throws SnapshotProfileException if the operation encounters an error that the caller should
      *         handle (e.g., an I/O error, a sub-process crash).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public ParcelFileDescriptor snapshotBootImageProfile(
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot)
@@ -780,6 +844,7 @@ public final class ArtManagerLocal {
      *
      * See {@link #dexoptPackages} for how to customize the behavior.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void onBoot(@NonNull @BootReason String bootReason,
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
             @Nullable Consumer<OperationProgress> progressCallback) {
@@ -797,6 +862,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dump(
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
         new DumpHelper(this).dump(pw, snapshot);
@@ -811,6 +877,7 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dumpPackage(@NonNull PrintWriter pw,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
         new DumpHelper(this).dumpPackage(
@@ -822,9 +889,13 @@ public final class ArtManagerLocal {
      *
      * This is done in a mark-and-sweep approach.
      *
+     * @return The amount of the disk space freed by the cleanup, in bytes.
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public long cleanup(@NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        mInjector.getDexUseManager().cleanup();
+
         try {
             // For every primary dex container file or secondary dex container file of every app, if
             // it has code, we keep the following types of files:
@@ -877,7 +948,8 @@ public final class ArtManagerLocal {
             }
             return mInjector.getArtd().cleanup(profilesToKeep, artifactsToKeep, vdexFilesToKeep);
         } catch (RemoteException e) {
-            throw new IllegalStateException("An error occurred when calling artd", e);
+            Utils.logArtdException(e);
+            return 0;
         }
     }
 
@@ -885,6 +957,7 @@ public final class ArtManagerLocal {
      * Checks if the artifacts are up-to-date, and maybe adds them to {@code artifactsToKeep} or
      * {@code vdexFilesToKeep} based on the result.
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private void maybeKeepArtifacts(@NonNull List<ArtifactsPath> artifactsToKeep,
             @NonNull List<VdexPath> vdexFilesToKeep, @NonNull PackageState pkgState,
             @NonNull DetailedDexInfo dexInfo, @NonNull Abi abi, boolean isInDalvikCache)
@@ -922,11 +995,13 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     BackgroundDexoptJob getBackgroundDexoptJob() {
         return mInjector.getBackgroundDexoptJob();
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private void maybeDowngradePackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull Set<String> excludedPackages, @NonNull CancellationSignal cancellationSignal,
             @NonNull Executor executor) {
@@ -949,6 +1024,7 @@ public final class ArtManagerLocal {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     private boolean shouldDowngrade() {
         try {
             return mInjector.getStorageManager().getAllocatableBytes(StorageManager.UUID_DEFAULT)
@@ -960,6 +1036,7 @@ public final class ArtManagerLocal {
     }
 
     /** Returns the list of packages to process for the given reason. */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     private List<String> getDefaultPackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull /* @BatchDexoptReason|REASON_INACTIVE */ String reason) {
@@ -990,6 +1067,7 @@ public final class ArtManagerLocal {
         return packages.map(PackageState::getPackageName).collect(Collectors.toList());
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     private Stream<PackageState> filterAndSortByLastActiveTime(
             @NonNull Stream<PackageState> packages, boolean keepRecent, boolean descending) {
@@ -1011,6 +1089,7 @@ public final class ArtManagerLocal {
                 .map(pair -> pair.first);
     }
 
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     private ParcelFileDescriptor mergeProfilesAndGetFd(@NonNull List<ProfilePath> profiles,
             @NonNull OutputProfile output, @NonNull List<String> dexPaths,
@@ -1024,7 +1103,18 @@ public final class ArtManagerLocal {
                 throw new SnapshotProfileException(e);
             }
 
-            String path = hasContent ? output.profilePath.tmpPath : "/dev/null";
+            String path;
+            Path emptyFile = null;
+            if (hasContent) {
+                path = output.profilePath.tmpPath;
+            } else {
+                // We cannot use /dev/null because `ParcelFileDescriptor` have an API `getStatSize`,
+                // which expects the file to be a regular file or a link, and apps may call that
+                // API.
+                emptyFile =
+                        Files.createTempFile(Paths.get(mInjector.getTempDir()), "empty", ".tmp");
+                path = emptyFile.toString();
+            }
             ParcelFileDescriptor fd;
             try {
                 fd = ParcelFileDescriptor.open(new File(path), ParcelFileDescriptor.MODE_READ_ONLY);
@@ -1033,20 +1123,23 @@ public final class ArtManagerLocal {
                         String.format("Failed to open profile snapshot '%s'", path), e);
             }
 
+            // The deletion is done on the open file so that only the FD keeps a reference to the
+            // file.
             if (hasContent) {
-                // This is done on the open file so that only the FD keeps a reference to its
-                // contents.
                 mInjector.getArtd().deleteProfile(ProfilePath.tmpProfilePath(output.profilePath));
+            } else {
+                Files.delete(emptyFile);
             }
 
             return fd;
-        } catch (RemoteException e) {
-            throw new IllegalStateException("An error occurred when calling artd", e);
+        } catch (IOException | RemoteException e) {
+            throw new SnapshotProfileException(e);
         }
     }
 
     /** @hide */
     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public interface BatchDexoptStartCallback {
         /**
          * Mutates {@code builder} to override the default params for {@link #dexoptPackages}. It
@@ -1079,6 +1172,7 @@ public final class ArtManagerLocal {
 
     /** @hide */
     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public interface ScheduleBackgroundDexoptJobCallback {
         /**
          * Mutates {@code builder} to override the configuration of the background dexopt job.
@@ -1100,6 +1194,7 @@ public final class ArtManagerLocal {
 
     /** @hide */
     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public interface DexoptDoneCallback {
         void onDexoptDone(@NonNull DexoptResult result);
     }
@@ -1110,6 +1205,7 @@ public final class ArtManagerLocal {
      * @hide
      */
     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public static class SnapshotProfileException extends Exception {
         /** @hide */
         public SnapshotProfileException(@NonNull Throwable cause) {
@@ -1135,6 +1231,9 @@ public final class ArtManagerLocal {
         @Nullable private final Config mConfig;
         @Nullable private BackgroundDexoptJob mBgDexoptJob = null;
 
+        // TODO(jiakaiz): Remove @SuppressLint and check `Build.VERSION.SDK_INT >=
+        // Build.VERSION_CODES.UPSIDE_DOWN_CAKE` once the SDK is finalized.
+        @SuppressLint("NewApi")
         Injector(@NonNull ArtManagerLocal artManagerLocal, @Nullable Context context) {
             mArtManagerLocal = artManagerLocal;
             mContext = context;
@@ -1157,33 +1256,39 @@ public final class ArtManagerLocal {
             }
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public Context getContext() {
             return Objects.requireNonNull(mContext);
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public PackageManagerLocal getPackageManagerLocal() {
             return Objects.requireNonNull(mPackageManagerLocal);
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public IArtd getArtd() {
             return Utils.getArtd();
         }
 
         /** Returns a new {@link DexoptHelper} instance. */
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public DexoptHelper getDexoptHelper() {
             return new DexoptHelper(getContext(), getConfig());
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public Config getConfig() {
             return mConfig;
         }
 
         /** Returns the registered {@link AppHibernationManager} instance. */
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public AppHibernationManager getAppHibernationManager() {
             return Objects.requireNonNull(mContext.getSystemService(AppHibernationManager.class));
@@ -1195,6 +1300,7 @@ public final class ArtManagerLocal {
          * @throws RuntimeException if called during boot before the job scheduler service has
          *         started.
          */
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public synchronized BackgroundDexoptJob getBackgroundDexoptJob() {
             if (mBgDexoptJob == null) {
@@ -1203,32 +1309,45 @@ public final class ArtManagerLocal {
             return mBgDexoptJob;
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public UserManager getUserManager() {
             return Objects.requireNonNull(mContext.getSystemService(UserManager.class));
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public DexUseManagerLocal getDexUseManager() {
             return Objects.requireNonNull(
                     LocalManagerRegistry.getManager(DexUseManagerLocal.class));
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         public boolean isSystemUiPackage(@NonNull String packageName) {
             return Utils.isSystemUiPackage(mContext, packageName);
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         public boolean isLauncherPackage(@NonNull String packageName) {
             return Utils.isLauncherPackage(mContext, packageName);
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         public long getCurrentTimeMillis() {
             return System.currentTimeMillis();
         }
 
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public StorageManager getStorageManager() {
             return Objects.requireNonNull(mContext.getSystemService(StorageManager.class));
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public String getTempDir() {
+            // This is a path that system_server is known to have full access to.
+            return "/data/system";
         }
     }
 }
