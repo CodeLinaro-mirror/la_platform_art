@@ -55,7 +55,7 @@ bool AotClassLinker::InitializeClass(Thread* self,
   }
 
   if (strict_mode_) {
-    runtime->EnterTransactionMode(true, klass.Get()->AsClass().Ptr());
+    runtime->EnterTransactionMode(/*strict=*/ true, klass.Get());
   }
   bool success = ClassLinker::InitializeClass(self, klass, can_init_statics, can_init_parents);
 
