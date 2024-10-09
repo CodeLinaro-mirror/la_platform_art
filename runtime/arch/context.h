@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/instruction_set.h"
 #include "base/macros.h"
 #include "entrypoints/quick/runtime_entrypoints_list.h"
 
@@ -39,12 +40,14 @@ class Context {
   // Re-initializes the registers for context re-use.
   virtual void Reset() = 0;
 
+  template <InstructionSet kIsa>
   static uintptr_t* CalleeSaveAddress(uint8_t* frame, int num, size_t frame_size) {
+    static constexpr size_t kPointerSize = static_cast<size_t>(GetInstructionSetPointerSize(kIsa));
     // Callee saves are held at the top of the frame
-    uint8_t* save_addr = frame + frame_size - ((num + 1) * sizeof(void*));
-#if defined(__i386__) || defined(__x86_64__)
-    save_addr -= sizeof(void*);  // account for return address
-#endif
+    uint8_t* save_addr = frame + frame_size - ((num + 1) * kPointerSize);
+    if (kIsa == InstructionSet::kX86 || kIsa == InstructionSet::kX86_64) {
+      save_addr -= kPointerSize;  // account for return address
+    }
     return reinterpret_cast<uintptr_t*>(save_addr);
   }
 
