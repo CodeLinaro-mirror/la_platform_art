@@ -1215,8 +1215,7 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
 
   // For app-compatibility, code after a runtime throw is treated as dead code
   // for apps targeting <= S.
-  // Returns whether the current instruction was marked as throwing.
-  bool PotentiallyMarkRuntimeThrow() override;
+  void PotentiallyMarkRuntimeThrow() override;
 
   // Dump the failures encountered by the verifier.
   std::ostream& DumpFailures(std::ostream& os) {
@@ -1234,7 +1233,12 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
   }
   void Dump(VariableIndentationOutputStream* vios) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool HandleMoveException(const Instruction* inst) REQUIRES_SHARED(Locks::mutator_lock_);
+  struct HandleMoveExceptionResult {
+    bool success;
+    bool skip_verification_of_exception_handler;
+  };
+  HandleMoveExceptionResult HandleMoveException(const Instruction* inst)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   const uint32_t method_access_flags_;  // Method's access flags.
   const RegType* return_type_;  // Lazily computed return type of the method.
@@ -1351,9 +1355,8 @@ class MethodVerifier final : public MethodVerifierImpl {
   * next_insn, and set the changed flag on the target address if any of the registers were changed.
   * In the case of fall-through, update the merge line on a change as it's the working line for the
   * next instruction.
-  * Returns "false" if an error is encountered.
   */
-  bool UpdateRegisters(uint32_t next_insn, RegisterLine* merge_line, bool update_merge_line)
+  void UpdateRegisters(uint32_t next_insn, RegisterLine* merge_line, bool update_merge_line)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Run verification on the method. Returns true if verification completes and false if the input
@@ -2476,13 +2479,31 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyMethod() {
       HandleMonitorDexPcsWorkLine(monitor_enter_dex_pcs_, work_line_.get());
     }
 
-    if (!CodeFlowVerifyInstruction(&start_guess)) {
+    if (UNLIKELY(!CodeFlowVerifyInstruction(&start_guess))) {
+      DCHECK(flags_.have_pending_hard_failure_);
+      if (IsAotMode()) {
+        /* When AOT compiling, check that the last failure is a hard failure */
+        DCHECK(!failures_.empty());
+        if (failures_.back().error != VERIFY_ERROR_BAD_CLASS_HARD) {
+          LOG(ERROR) << "Pending failures:";
+          for (const VerifyErrorAndMessage& veam : failures_) {
+            LOG(ERROR) << veam.error << " " << veam.message.view();
+          }
+          LOG(FATAL) << "Pending hard failure, but last failure not hard.";
+        }
+      }
+      if (kVerifierDebug) {
+        InfoMessages() << "Rejecting opcode "
+                       << code_item_accessor_.InstructionAt(work_insn_idx_).DumpString(dex_file_);
+      }
+
       std::string prepend(dex_file_->PrettyMethod(dex_method_idx_));
       prepend += " failed to verify: ";
       PrependToLastFailMessage(prepend);
       return false;
     }
     /* Clear "changed" and mark as visited. */
+    DCHECK(!flags_.have_pending_hard_failure_);
     GetModifiableInstructionFlags(insn_idx).SetVisited();
     GetModifiableInstructionFlags(insn_idx).ClearChanged();
   }
@@ -2538,37 +2559,6 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyMethod() {
   return true;
 }
 
-// Setup a register line for the given return instruction.
-template <bool kVerifierDebug>
-static void AdjustReturnLine(MethodVerifier<kVerifierDebug>* verifier,
-                             const Instruction* ret_inst,
-                             RegisterLine* line) {
-  Instruction::Code opcode = ret_inst->Opcode();
-
-  switch (opcode) {
-    case Instruction::RETURN_VOID:
-      if (verifier->IsInstanceConstructor()) {
-        // Before we mark all regs as conflicts, check that we don't have an uninitialized this.
-        line->CheckConstructorReturn(verifier);
-      }
-      line->MarkAllRegistersAsConflicts(verifier);
-      break;
-
-    case Instruction::RETURN:
-    case Instruction::RETURN_OBJECT:
-      line->MarkAllRegistersAsConflictsExcept(verifier, ret_inst->VRegA_11x());
-      break;
-
-    case Instruction::RETURN_WIDE:
-      line->MarkAllRegistersAsConflictsExceptWide(verifier, ret_inst->VRegA_11x());
-      break;
-
-    default:
-      LOG(FATAL) << "Unknown return opcode " << opcode;
-      UNREACHABLE();
-  }
-}
-
 template <bool kVerifierDebug>
 bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_guess) {
   /*
@@ -2616,7 +2606,6 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
   }
   // Per-instruction flag, should not be set here.
   DCHECK(!flags_.have_pending_runtime_throw_failure_);
-  bool exc_handler_unreachable = false;
 
 
   // We need to ensure the work line is consistent while performing validation. When we spot a
@@ -2693,11 +2682,18 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       work_line_->CopyResultRegister1(this, inst->VRegA_11x(inst_data), true);
       break;
 
-    case Instruction::MOVE_EXCEPTION:
-      if (!HandleMoveException(inst)) {
-        exc_handler_unreachable = true;
+    case Instruction::MOVE_EXCEPTION: {
+      auto result = HandleMoveException(inst);
+      if (!result.success) {
+        return false;
+      }
+      DCHECK_NE(opcode_flags & Instruction::kContinue, 0);
+      if (UNLIKELY(result.skip_verification_of_exception_handler)) {
+        // Avoid verification of the following exception handler instructions.
+        opcode_flags &= ~Instruction::kContinue;
       }
       break;
+    }
 
     case Instruction::RETURN_VOID:
       if (!IsInstanceConstructor() || work_line_->CheckConstructorReturn(this)) {
@@ -2969,25 +2965,12 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
           (is_checkcast) ? inst->VRegA_21c(inst_data) : inst->VRegB_22c(inst_data);
       const RegType& orig_type = work_line_->GetRegisterType(this, orig_type_reg);
       if (!res_type.IsNonZeroReferenceTypes()) {
-        if (is_checkcast) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "check-cast on unexpected class " << res_type;
-        } else {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "instance-of on unexpected class " << res_type;
-        }
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on unexpected class " << res_type;
       } else if (!orig_type.IsReferenceTypes()) {
-        if (is_checkcast) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "check-cast on non-reference in v" << orig_type_reg;
-        } else {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "instance-of on non-reference in v" << orig_type_reg;
-        }
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on non-reference in v" << orig_type_reg;
       } else if (orig_type.IsUninitializedTypes()) {
-        if (is_checkcast) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "check-cast on uninitialized reference in v"
-                                            << orig_type_reg;
-        } else {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "instance-of on uninitialized reference in v"
-                                            << orig_type_reg;
-        }
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on uninitialized reference in v"
+                                          << orig_type_reg;
       } else {
         if (is_checkcast) {
           work_line_->SetRegisterType<LockOp::kKeep>(inst->VRegA_21c(inst_data), res_type);
@@ -3819,19 +3802,7 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
   }  // end - switch (dec_insn.opcode)
 
   if (flags_.have_pending_hard_failure_) {
-    if (IsAotMode()) {
-      /* When AOT compiling, check that the last failure is a hard failure */
-      DCHECK(!failures_.empty());
-      if (failures_.back().error != VERIFY_ERROR_BAD_CLASS_HARD) {
-        LOG(ERROR) << "Pending failures:";
-        for (const VerifyErrorAndMessage& veam : failures_) {
-          LOG(ERROR) << veam.error << " " << veam.message.view();
-        }
-        LOG(FATAL) << "Pending hard failure, but last failure not hard.";
-      }
-    }
     /* immediate failure, reject class */
-    InfoMessages() << "Rejecting opcode " << inst->DumpString(dex_file_);
     return false;
   } else if (flags_.have_pending_runtime_throw_failure_) {
     LogVerifyInfo() << "Elevating opcode flags from " << opcode_flags << " to Throw";
@@ -3873,13 +3844,9 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
     DCHECK(!IsMoveResultOrMoveException(inst->RelativeAt(branch_target)->Opcode()));
     /* update branch target, set "changed" if appropriate */
     if (nullptr != branch_line) {
-      if (!UpdateRegisters(work_insn_idx_ + branch_target, branch_line.get(), false)) {
-        return false;
-      }
+      UpdateRegisters(work_insn_idx_ + branch_target, branch_line.get(), false);
     } else {
-      if (!UpdateRegisters(work_insn_idx_ + branch_target, work_line_.get(), false)) {
-        return false;
-      }
+      UpdateRegisters(work_insn_idx_ + branch_target, work_line_.get(), false);
     }
   }
 
@@ -3915,9 +3882,7 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       abs_offset = work_insn_idx_ + offset;
       DCHECK_LT(abs_offset, code_item_accessor_.InsnsSizeInCodeUnits());
       DCHECK(!IsMoveResultOrMoveException(inst->RelativeAt(offset)->Opcode()));
-      if (!UpdateRegisters(abs_offset, work_line_.get(), false)) {
-        return false;
-      }
+      UpdateRegisters(abs_offset, work_line_.get(), false);
     }
   }
 
@@ -3961,9 +3926,7 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
         LogVerifyInfo() << "Updating exception handler 0x"
                         << std::hex << iterator.GetHandlerAddress();
       }
-      if (!UpdateRegisters(iterator.GetHandlerAddress(), saved_line_.get(), false)) {
-        return false;
-      }
+      UpdateRegisters(iterator.GetHandlerAddress(), saved_line_.get(), false);
     }
 
     /*
@@ -3989,37 +3952,30 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
    *        because it changes work_line_ when performing peephole optimization
    *        and this change should not be used in those cases.
    */
-  if ((opcode_flags & Instruction::kContinue) != 0 && !exc_handler_unreachable) {
+  if ((opcode_flags & Instruction::kContinue) != 0) {
     DCHECK_EQ(&code_item_accessor_.InstructionAt(work_insn_idx_), inst);
     uint32_t next_insn_idx = work_insn_idx_ + inst->SizeInCodeUnits();
     if (next_insn_idx >= code_item_accessor_.InsnsSizeInCodeUnits()) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "Execution can walk off end of code area";
+      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "Can flow through to end of code area";
       return false;
     }
     // The only way to get to a move-exception instruction is to get thrown there. Make sure the
     // next instruction isn't one.
     Instruction::Code next_opcode = code_item_accessor_.InstructionAt(next_insn_idx).Opcode();
     if (UNLIKELY(next_opcode == Instruction::MOVE_EXCEPTION)) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "invalid use of move-exception";
+      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "Can flow through to move-exception";
       return false;
     }
     if (nullptr != fallthrough_line) {
       // Make workline consistent with fallthrough computed from peephole optimization.
       work_line_->CopyFromLine(fallthrough_line.get());
     }
-    if (GetInstructionFlags(next_insn_idx).IsReturn()) {
-      // For returns we only care about the operand to the return, all other registers are dead.
-      const Instruction* ret_inst = &code_item_accessor_.InstructionAt(next_insn_idx);
-      AdjustReturnLine(this, ret_inst, work_line_.get());
-    }
     RegisterLine* next_line = reg_table_.GetLine(next_insn_idx);
     if (next_line != nullptr) {
       // Merge registers into what we have for the next instruction, and set the "changed" flag if
       // needed. If the merge changes the state of the registers then the work line will be
       // updated.
-      if (!UpdateRegisters(next_insn_idx, work_line_.get(), true)) {
-        return false;
-      }
+      UpdateRegisters(next_insn_idx, work_line_.get(), true);
     } else {
       /*
        * We're not recording register data for the next instruction, so we don't know what the
@@ -4114,89 +4070,97 @@ const RegType& MethodVerifierImpl::ResolveClass(dex::TypeIndex class_idx) {
   return result;
 }
 
-bool MethodVerifierImpl::HandleMoveException(const Instruction* inst)  {
+MethodVerifierImpl::HandleMoveExceptionResult
+MethodVerifierImpl::HandleMoveException(const Instruction* inst)  {
   // We do not allow MOVE_EXCEPTION as the first instruction in a method. This is a simple case
   // where one entrypoint to the catch block is not actually an exception path.
   if (work_insn_idx_ == 0) {
     Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "move-exception at pc 0x0";
-    return true;
+    return {false, false};
   }
   /*
    * This statement can only appear as the first instruction in an exception handler. We verify
    * that as part of extracting the exception type from the catch block list.
    */
-  auto caught_exc_type_fn = [&]() REQUIRES_SHARED(Locks::mutator_lock_) ->
-      std::pair<bool, const RegType*> {
-    const RegType* common_super = nullptr;
-    if (code_item_accessor_.TriesSize() != 0) {
-      const uint8_t* handlers_ptr = code_item_accessor_.GetCatchHandlerData();
-      uint32_t handlers_size = DecodeUnsignedLeb128(&handlers_ptr);
-      const RegType* unresolved = nullptr;
-      for (uint32_t i = 0; i < handlers_size; i++) {
-        CatchHandlerIterator iterator(handlers_ptr);
-        for (; iterator.HasNext(); iterator.Next()) {
-          if (iterator.GetHandlerAddress() == (uint32_t) work_insn_idx_) {
-            if (!iterator.GetHandlerTypeIndex().IsValid()) {
-              common_super = &reg_types_.JavaLangThrowable();
-            } else {
-              // Do access checks only on resolved exception classes.
-              const RegType& exception =
-                  ResolveClass<CheckAccess::kOnResolvedClass>(iterator.GetHandlerTypeIndex());
-              if (!IsAssignableFrom(reg_types_.JavaLangThrowable(), exception)) {
-                DCHECK(!exception.IsUninitializedTypes());  // Comes from dex, shouldn't be uninit.
-                if (exception.IsUnresolvedTypes()) {
-                  if (unresolved == nullptr) {
-                    unresolved = &exception;
-                  } else {
-                    unresolved = &unresolved->SafeMerge(exception, &reg_types_, this);
-                  }
+  const RegType* common_super = nullptr;
+  const RegType* unresolved = nullptr;
+  if (code_item_accessor_.TriesSize() != 0) {
+    const uint8_t* handlers_ptr = code_item_accessor_.GetCatchHandlerData();
+    uint32_t handlers_size = DecodeUnsignedLeb128(&handlers_ptr);
+    for (uint32_t i = 0; i < handlers_size; i++) {
+      CatchHandlerIterator iterator(handlers_ptr);
+      for (; iterator.HasNext(); iterator.Next()) {
+        if (iterator.GetHandlerAddress() == (uint32_t) work_insn_idx_) {
+          if (!iterator.GetHandlerTypeIndex().IsValid()) {
+            common_super = &reg_types_.JavaLangThrowable();
+          } else {
+            // Do access checks only on resolved exception classes.
+            const RegType& exception =
+                ResolveClass<CheckAccess::kOnResolvedClass>(iterator.GetHandlerTypeIndex());
+            if (!IsAssignableFrom(reg_types_.JavaLangThrowable(), exception)) {
+              DCHECK(!exception.IsUninitializedTypes());  // Comes from dex, shouldn't be uninit.
+              if (exception.IsUnresolvedTypes()) {
+                if (unresolved == nullptr) {
+                  unresolved = &exception;
                 } else {
-                  Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unexpected non-throwable class "
-                                                    << exception;
-                  return std::make_pair(true, &reg_types_.Conflict());
+                  unresolved = &unresolved->SafeMerge(exception, &reg_types_, this);
                 }
-              } else if (common_super == nullptr) {
-                common_super = &exception;
-              } else if (common_super->Equals(exception)) {
-                // odd case, but nothing to do
               } else {
-                common_super = &common_super->Merge(exception, &reg_types_, this);
-                if (UNLIKELY(!IsAssignableFrom(reg_types_.JavaLangThrowable(), *common_super))) {
-                  Fail(VERIFY_ERROR_BAD_CLASS_HARD)
-                      << "java.lang.Throwable is not assignable-from common_super";
-                  break;
-                }
+                Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unexpected non-throwable class "
+                                                  << exception;
+                return {false, false};
+              }
+            } else if (common_super == nullptr) {
+              common_super = &exception;
+            } else if (common_super->Equals(exception)) {
+              // odd case, but nothing to do
+            } else {
+              common_super = &common_super->Merge(exception, &reg_types_, this);
+              if (UNLIKELY(!IsAssignableFrom(reg_types_.JavaLangThrowable(), *common_super))) {
+                Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+                    << "java.lang.Throwable is not assignable-from common_super";
+                return {false, false};
               }
             }
           }
         }
-        handlers_ptr = iterator.EndDataPointer();
       }
-      if (unresolved != nullptr) {
-        // Soft-fail, but do not handle this with a synthetic throw.
-        Fail(VERIFY_ERROR_UNRESOLVED_TYPE_CHECK, /*pending_exc=*/ false)
-            << "Unresolved catch handler";
-        bool should_continue = true;
-        if (common_super != nullptr) {
-          unresolved = &unresolved->Merge(*common_super, &reg_types_, this);
-        } else {
-          should_continue = !PotentiallyMarkRuntimeThrow();
-        }
-        return std::make_pair(should_continue, unresolved);
+      handlers_ptr = iterator.EndDataPointer();
+    }
+  }
+  const RegType* reg_type = nullptr;
+  bool skip_verification_of_exception_handler = false;
+  if (unresolved != nullptr) {
+    // Soft-fail, but do not handle this with a synthetic throw.
+    Fail(VERIFY_ERROR_UNRESOLVED_TYPE_CHECK, /*pending_exc=*/ false)
+        << "Unresolved catch handler";
+    bool should_continue = true;
+    if (common_super != nullptr) {
+      reg_type = &unresolved->Merge(*common_super, &reg_types_, this);
+    } else {
+      reg_type = unresolved;
+      if (!IsAotMode() && !IsSdkVersionSetAndAtLeast(api_level_, SdkVersion::kS_V2)) {
+        // This is an unreachable handler at runtime. For older API levels, we avoid the
+        // verification of the entire handler for compatibility reasons. The instruction
+        // doesn't throw, but we mark the method as having a pending runtime throw failure
+        // so that the JIT compiler does not try to compile it - the compiler expects all
+        // instructions to be properly verified and may crash otherwise.
+        Fail(VERIFY_ERROR_RUNTIME_THROW, /* pending_exc= */ false);
+        skip_verification_of_exception_handler = true;
       }
     }
-    if (common_super == nullptr) {
-      /* No catch block */
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unable to find exception handler";
-      return std::make_pair(true, &reg_types_.Conflict());
-    }
+  } else if (common_super == nullptr) {
+    /* No catch block */
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unable to find exception handler";
+    return {false, false};
+  } else {
     DCHECK(common_super->HasClass());
     CheckForFinalAbstractClass(common_super->GetClass());
-    return std::make_pair(true, common_super);
-  };
-  auto result = caught_exc_type_fn();
-  work_line_->SetRegisterType<LockOp::kClear>(inst->VRegA_11x(), *result.second);
-  return result.first;
+    reg_type = common_super;
+  }
+  DCHECK(reg_type != nullptr);
+  work_line_->SetRegisterType<LockOp::kClear>(inst->VRegA_11x(), *reg_type);
+  return {true, skip_verification_of_exception_handler};
 }
 
 ArtMethod* MethodVerifierImpl::ResolveMethodAndCheckAccess(
@@ -4272,6 +4236,16 @@ ArtMethod* MethodVerifierImpl::ResolveMethodAndCheckAccess(
       Fail(VERIFY_ERROR_CLASS_CHANGE)
           << "non-interface method " << dex_file_->PrettyMethod(dex_method_idx)
           << " is in an interface class " << klass->PrettyClass();
+      return nullptr;
+    }
+    if (method_type == METHOD_SUPER &&
+        res_method->GetDeclaringClass()->IsObjectClass()) {
+      Fail(VERIFY_ERROR_NO_METHOD) << "invoke-super " << klass->PrettyDescriptor() << "."
+                                   << dex_file_->GetMethodName(method_id) << " "
+                                   << dex_file_->GetMethodSignature(method_id) << " resolved to "
+                                   << "object method " << res_method->PrettyMethod() << " "
+                                   << "but Object methods are excluded from super "
+                                   << "method resolution on interfaces.";
       return nullptr;
     }
   } else {
@@ -5153,9 +5127,10 @@ void MethodVerifierImpl::VerifyISFieldAccess(const Instruction* inst,
 }
 
 template <bool kVerifierDebug>
-bool MethodVerifier<kVerifierDebug>::UpdateRegisters(uint32_t next_insn,
+void MethodVerifier<kVerifierDebug>::UpdateRegisters(uint32_t next_insn,
                                                      RegisterLine* merge_line,
                                                      bool update_merge_line) {
+  DCHECK(!flags_.have_pending_hard_failure_);
   bool changed = true;
   RegisterLine* target_line = reg_table_.GetLine(next_insn);
   if (!GetInstructionFlags(next_insn).IsVisitedOrChanged()) {
@@ -5165,19 +5140,6 @@ bool MethodVerifier<kVerifierDebug>::UpdateRegisters(uint32_t next_insn,
      * only way a register can transition out of "unknown", so this is not just an optimization.)
      */
     target_line->CopyFromLine(merge_line);
-    if (GetInstructionFlags(next_insn).IsReturn()) {
-      // Verify that the monitor stack is empty on return.
-      merge_line->VerifyMonitorStackEmpty(this);
-
-      // For returns we only care about the operand to the return, all other registers are dead.
-      // Initialize them as conflicts so they don't add to GC and deoptimization information.
-      const Instruction* ret_inst = &code_item_accessor_.InstructionAt(next_insn);
-      AdjustReturnLine(this, ret_inst, target_line);
-      // Directly bail if a hard failure was found.
-      if (flags_.have_pending_hard_failure_) {
-        return false;
-      }
-    }
   } else {
     RegisterLineArenaUniquePtr copy;
     if (kVerifierDebug) {
@@ -5185,9 +5147,6 @@ bool MethodVerifier<kVerifierDebug>::UpdateRegisters(uint32_t next_insn,
       copy->CopyFromLine(target_line);
     }
     changed = target_line->MergeRegisters(this, merge_line);
-    if (flags_.have_pending_hard_failure_) {
-      return false;
-    }
     if (kVerifierDebug && changed) {
       LogVerifyInfo() << "Merging at [" << reinterpret_cast<void*>(work_insn_idx_) << "]"
                       << " to [" << reinterpret_cast<void*>(next_insn) << "]: " << "\n"
@@ -5202,7 +5161,7 @@ bool MethodVerifier<kVerifierDebug>::UpdateRegisters(uint32_t next_insn,
   if (changed) {
     GetModifiableInstructionFlags(next_insn).SetChanged();
   }
-  return true;
+  DCHECK(!flags_.have_pending_hard_failure_);
 }
 
 const RegType& MethodVerifierImpl::GetMethodReturnType() {
@@ -5237,9 +5196,9 @@ RegType::Kind MethodVerifierImpl::DetermineCat1Constant(int32_t value) {
   }
 }
 
-bool MethodVerifierImpl::PotentiallyMarkRuntimeThrow() {
+void MethodVerifierImpl::PotentiallyMarkRuntimeThrow() {
   if (IsAotMode() || IsSdkVersionSetAndAtLeast(api_level_, SdkVersion::kS_V2)) {
-    return false;
+    return;
   }
   // Compatibility mode: we treat the following code unreachable and the verifier
   // will not analyze it.
@@ -5248,13 +5207,7 @@ bool MethodVerifierImpl::PotentiallyMarkRuntimeThrow() {
   if (work_insn_idx_ < dex::kDexNoIndex) {
     const Instruction& inst = code_item_accessor_.InstructionAt(work_insn_idx_);
     Instruction::Code opcode = inst.Opcode();
-    if (opcode == Instruction::MOVE_EXCEPTION) {
-      // This is an unreachable handler. The instruction doesn't throw, but we
-      // mark the method as having a pending runtime throw failure so that
-      // the compiler does not try to compile it.
-      Fail(VERIFY_ERROR_RUNTIME_THROW, /* pending_exc= */ false);
-      return true;
-    }
+    DCHECK_NE(opcode, Instruction::MOVE_EXCEPTION);
     // How to handle runtime failures for instructions that are not flagged kThrow.
     if ((Instruction::FlagsOf(opcode) & Instruction::kThrow) == 0 &&
         !impl::IsCompatThrow(opcode) &&
@@ -5270,7 +5223,6 @@ bool MethodVerifierImpl::PotentiallyMarkRuntimeThrow() {
     }
   }
   flags_.have_pending_runtime_throw_failure_ = true;
-  return true;
 }
 
 }  // namespace
