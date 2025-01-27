@@ -172,19 +172,11 @@ IntrinsicVisitor::ValueOfInfo IntrinsicVisitor::ComputeValueOfInfo(
 }
 
 MemberOffset IntrinsicVisitor::GetReferenceDisableIntrinsicOffset() {
-  ScopedObjectAccess soa(Thread::Current());
-  // The "disableIntrinsic" is the first field.
-  ArtField* field = GetClassRoot<mirror::Reference>()->GetField(0);
-  DCHECK_STREQ(field->GetName(), "disableIntrinsic");
-  return field->GetOffset();
+  return WellKnownClasses::java_lang_ref_Reference_disableIntrinsic->GetOffset();
 }
 
 MemberOffset IntrinsicVisitor::GetReferenceSlowPathEnabledOffset() {
-  ScopedObjectAccess soa(Thread::Current());
-  // The "slowPathEnabled" is the sixth field.
-  ArtField* field = GetClassRoot<mirror::Reference>()->GetField(5);
-  DCHECK_STREQ(field->GetName(), "slowPathEnabled");
-  return field->GetOffset();
+  return WellKnownClasses::java_lang_ref_Reference_slowPathEnabled->GetOffset();
 }
 
 void IntrinsicVisitor::CreateReferenceGetReferentLocations(HInvoke* invoke,
