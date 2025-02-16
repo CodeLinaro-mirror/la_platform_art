@@ -2278,6 +2278,10 @@ bool ClassLinker::AddImageSpace(gc::space::ImageSpace* space,
       }, space->Begin(), image_pointer_size_);
     }
 
+    for (auto dex_cache : dex_caches.Iterate<mirror::DexCache>()) {
+      CHECK(!dex_cache->GetDexFile()->IsCompactDexFile());
+    }
+
     ScopedTrace trace("AppImage:UpdateCodeItemAndNterp");
     bool can_use_nterp = interpreter::CanRuntimeUseNterp();
     uint16_t hotness_threshold = runtime->GetJITOptions()->GetWarmupThreshold();
@@ -2287,7 +2291,7 @@ bool ClassLinker::AddImageSpace(gc::space::ImageSpace* space,
       if (method.HasCodeItem()) {
         const dex::CodeItem* code_item = method.GetDexFile()->GetCodeItem(
             reinterpret_cast32<uint32_t>(method.GetDataPtrSize(image_pointer_size_)));
-        method.SetCodeItem(code_item, method.GetDexFile()->IsCompactDexFile());
+        method.SetCodeItem(code_item);
         // The hotness counter may have changed since we compiled the image, so
         // reset it with the runtime value.
         method.ResetCounter(hotness_threshold);
@@ -3827,44 +3831,6 @@ class ClassLinker::OatClassCodeIterator {
   const uint32_t num_methods_;
 };
 
-inline void ClassLinker::LinkCode(ArtMethod* method,
-                                  uint32_t class_def_method_index,
-                                  /*inout*/ OatClassCodeIterator* occi) {
-  ScopedAssertNoThreadSuspension sants(__FUNCTION__);
-  Runtime* const runtime = Runtime::Current();
-  if (runtime->IsAotCompiler()) {
-    // The following code only applies to a non-compiler runtime.
-    return;
-  }
-
-  // Method shouldn't have already been linked.
-  DCHECK_EQ(method->GetEntryPointFromQuickCompiledCode(), nullptr);
-  DCHECK(!method->GetDeclaringClass()->IsVisiblyInitialized());  // Actually ClassStatus::Idx.
-
-  if (!method->IsInvokable()) {
-    EnsureThrowsInvocationError(this, method);
-    occi->SkipAbstract(class_def_method_index);
-    return;
-  }
-
-  const void* quick_code = occi->GetAndAdvance(class_def_method_index);
-  if (method->IsNative() && quick_code == nullptr) {
-    const void* boot_jni_stub = FindBootJniStub(method);
-    if (boot_jni_stub != nullptr) {
-      // Use boot JNI stub if found.
-      quick_code = boot_jni_stub;
-    }
-  }
-  runtime->GetInstrumentation()->InitializeMethodsCode(method, quick_code);
-
-  if (method->IsNative()) {
-    // Set up the dlsym lookup stub. Do not go through `UnregisterNative()`
-    // as the extra processing for @CriticalNative is not needed yet.
-    method->SetEntryPointFromJni(
-        method->IsCriticalNative() ? GetJniDlsymLookupCriticalStub() : GetJniDlsymLookupStub());
-  }
-}
-
 void ClassLinker::SetupClass(const DexFile& dex_file,
                              const dex::ClassDef& dex_class_def,
                              Handle<mirror::Class> klass,
@@ -3968,10 +3934,158 @@ class ClassLinker::MethodAnnotationsIterator {
   const dex::MethodAnnotationsItem* const end_;
 };
 
+void ClassLinker::LoadField(const ClassAccessor::Field& field,
+                            Handle<mirror::Class> klass,
+                            ArtField* dst) {
+  const uint32_t field_idx = field.GetIndex();
+  dst->SetDexFieldIndex(field_idx);
+  dst->SetDeclaringClass(klass.Get());
+
+  // Get access flags from the DexFile and set hiddenapi runtime access flags.
+  dst->SetAccessFlags(field.GetAccessFlags() | hiddenapi::CreateRuntimeFlags(field));
+}
+
+void ClassLinker::LoadMethod(const DexFile& dex_file,
+                             const ClassAccessor::Method& method,
+                             ObjPtr<mirror::Class> klass,
+                             /*inout*/ MethodAnnotationsIterator* mai,
+                             /*out*/ ArtMethod* dst) {
+  ScopedAssertNoThreadSuspension sants(__FUNCTION__);
+
+  const uint32_t dex_method_idx = method.GetIndex();
+  const dex::MethodId& method_id = dex_file.GetMethodId(dex_method_idx);
+  uint32_t name_utf16_length;
+  const char* method_name = dex_file.GetStringDataAndUtf16Length(method_id.name_idx_,
+                                                                 &name_utf16_length);
+  std::string_view shorty = dex_file.GetShortyView(dex_file.GetProtoId(method_id.proto_idx_));
+
+  dst->SetDexMethodIndex(dex_method_idx);
+  dst->SetDeclaringClass(klass);
+
+  // Get access flags from the DexFile and set hiddenapi runtime access flags.
+  uint32_t access_flags = method.GetAccessFlags() | hiddenapi::CreateRuntimeFlags(method);
+
+  auto has_ascii_name = [method_name, name_utf16_length](const char* ascii_name,
+                                                         size_t length) ALWAYS_INLINE {
+    DCHECK_EQ(strlen(ascii_name), length);
+    return length == name_utf16_length &&
+           method_name[length] == 0 &&  // Is `method_name` an ASCII string?
+           memcmp(ascii_name, method_name, length) == 0;
+  };
+  if (UNLIKELY(has_ascii_name("finalize", sizeof("finalize") - 1u))) {
+    // Set finalizable flag on declaring class if the method has the right signature.
+    // When initializing without a boot image, `Object` and `Enum` shall have the finalizable
+    // flag cleared immediately after loading these classes, see  `InitWithoutImage()`.
+    if (shorty == "V") {
+      klass->SetFinalizable();
+    }
+  } else if (method_name[0] == '<') {
+    // Fix broken access flags for initializers. Bug 11157540.
+    // `DexFileVerifier` rejects method names starting with '<' other than constructors.
+    DCHECK(has_ascii_name("<init>", sizeof("<init>") - 1u) ||
+           has_ascii_name("<clinit>", sizeof("<clinit>") - 1u)) << method_name;
+    if (UNLIKELY((access_flags & kAccConstructor) == 0)) {
+      LOG(WARNING) << method_name << " didn't have expected constructor access flag in class "
+          << klass->PrettyDescriptor() << " in dex file " << dex_file.GetLocation();
+      access_flags |= kAccConstructor;
+    }
+  }
+
+  access_flags |= GetNterpFastPathFlags(shorty, access_flags, kRuntimeQuickCodeISA);
+
+  if (UNLIKELY((access_flags & kAccNative) != 0u)) {
+    // Check if the native method is annotated with @FastNative or @CriticalNative.
+    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
+    if (method_annotations != nullptr) {
+      access_flags |=
+          annotations::GetNativeMethodAnnotationAccessFlags(dex_file, *method_annotations);
+    }
+    dst->SetAccessFlags(access_flags);
+    DCHECK(!dst->IsAbstract());
+    DCHECK(!dst->HasCodeItem());
+    DCHECK_EQ(method.GetCodeItemOffset(), 0u);
+    dst->SetDataPtrSize(nullptr, image_pointer_size_);  // JNI stub/trampoline not linked yet.
+  } else if ((access_flags & kAccAbstract) != 0u) {
+    dst->SetAccessFlags(access_flags);
+    // Must be done after SetAccessFlags since IsAbstract depends on it.
+    DCHECK(dst->IsAbstract());
+    if (klass->IsInterface()) {
+      dst->CalculateAndSetImtIndex();
+    }
+    DCHECK(!dst->HasCodeItem());
+    DCHECK_EQ(method.GetCodeItemOffset(), 0u);
+    dst->SetDataPtrSize(nullptr, image_pointer_size_);  // Single implementation not set yet.
+  } else {
+    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
+    if (method_annotations != nullptr &&
+        annotations::MethodIsNeverCompile(dex_file, *method_annotations)) {
+      access_flags |= kAccCompileDontBother;
+    }
+    dst->SetAccessFlags(access_flags);
+    DCHECK(!dst->IsAbstract());
+    DCHECK(dst->HasCodeItem());
+    uint32_t code_item_offset = method.GetCodeItemOffset();
+    DCHECK_NE(code_item_offset, 0u);
+    if (Runtime::Current()->IsAotCompiler()) {
+      dst->SetDataPtrSize(reinterpret_cast32<void*>(code_item_offset), image_pointer_size_);
+    } else {
+      dst->SetCodeItem(dex_file.GetCodeItem(code_item_offset));
+    }
+  }
+
+  if ((access_flags & kAccAbstract) == 0u &&
+      Runtime::Current()->IsZygote() &&
+      !Runtime::Current()->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath()) {
+    DCHECK(!ArtMethod::IsAbstract(access_flags));
+    DCHECK(!ArtMethod::IsIntrinsic(access_flags));
+    dst->SetMemorySharedMethod();
+    dst->SetHotCounter();
+  }
+}
+
+inline void ClassLinker::LinkCode(ArtMethod* method,
+                                  uint32_t class_def_method_index,
+                                  /*inout*/ OatClassCodeIterator* occi) {
+  ScopedAssertNoThreadSuspension sants(__FUNCTION__);
+  Runtime* const runtime = Runtime::Current();
+  if (runtime->IsAotCompiler()) {
+    // The following code only applies to a non-compiler runtime.
+    return;
+  }
+
+  // Method shouldn't have already been linked.
+  DCHECK_EQ(method->GetEntryPointFromQuickCompiledCode(), nullptr);
+  DCHECK(!method->GetDeclaringClass()->IsVisiblyInitialized());  // Actually ClassStatus::Idx.
+
+  if (!method->IsInvokable()) {
+    EnsureThrowsInvocationError(this, method);
+    occi->SkipAbstract(class_def_method_index);
+    return;
+  }
+
+  const void* quick_code = occi->GetAndAdvance(class_def_method_index);
+  if (method->IsNative() && quick_code == nullptr) {
+    const void* boot_jni_stub = FindBootJniStub(method);
+    if (boot_jni_stub != nullptr) {
+      // Use boot JNI stub if found.
+      quick_code = boot_jni_stub;
+    }
+  }
+  runtime->GetInstrumentation()->InitializeMethodsCode(method, quick_code);
+
+  if (method->IsNative()) {
+    // Set up the dlsym lookup stub. Do not go through `UnregisterNative()`
+    // as the extra processing for @CriticalNative is not needed yet.
+    method->SetEntryPointFromJni(
+        method->IsCriticalNative() ? GetJniDlsymLookupCriticalStub() : GetJniDlsymLookupStub());
+  }
+}
+
 void ClassLinker::LoadClass(Thread* self,
                             const DexFile& dex_file,
                             const dex::ClassDef& dex_class_def,
                             Handle<mirror::Class> klass) {
+  CHECK(!dex_file.IsCompactDexFile());
   ClassAccessor accessor(dex_file,
                          dex_class_def,
                          /* parse_hiddenapi_class_data= */ klass->IsBootStrapClassLoaded());
@@ -4088,115 +4202,6 @@ void ClassLinker::LoadClass(Thread* self,
   // Ensure that the card is marked so that remembered sets pick up native roots.
   WriteBarrier::ForEveryFieldWrite(klass.Get());
   self->AllowThreadSuspension();
-}
-
-void ClassLinker::LoadField(const ClassAccessor::Field& field,
-                            Handle<mirror::Class> klass,
-                            ArtField* dst) {
-  const uint32_t field_idx = field.GetIndex();
-  dst->SetDexFieldIndex(field_idx);
-  dst->SetDeclaringClass(klass.Get());
-
-  // Get access flags from the DexFile and set hiddenapi runtime access flags.
-  dst->SetAccessFlags(field.GetAccessFlags() | hiddenapi::CreateRuntimeFlags(field));
-}
-
-void ClassLinker::LoadMethod(const DexFile& dex_file,
-                             const ClassAccessor::Method& method,
-                             ObjPtr<mirror::Class> klass,
-                             /*inout*/ MethodAnnotationsIterator* mai,
-                             /*out*/ ArtMethod* dst) {
-  ScopedAssertNoThreadSuspension sants(__FUNCTION__);
-
-  const uint32_t dex_method_idx = method.GetIndex();
-  const dex::MethodId& method_id = dex_file.GetMethodId(dex_method_idx);
-  uint32_t name_utf16_length;
-  const char* method_name = dex_file.GetStringDataAndUtf16Length(method_id.name_idx_,
-                                                                 &name_utf16_length);
-  std::string_view shorty = dex_file.GetShortyView(dex_file.GetProtoId(method_id.proto_idx_));
-
-  dst->SetDexMethodIndex(dex_method_idx);
-  dst->SetDeclaringClass(klass);
-
-  // Get access flags from the DexFile and set hiddenapi runtime access flags.
-  uint32_t access_flags = method.GetAccessFlags() | hiddenapi::CreateRuntimeFlags(method);
-
-  auto has_ascii_name = [method_name, name_utf16_length](const char* ascii_name,
-                                                         size_t length) ALWAYS_INLINE {
-    DCHECK_EQ(strlen(ascii_name), length);
-    return length == name_utf16_length &&
-           method_name[length] == 0 &&  // Is `method_name` an ASCII string?
-           memcmp(ascii_name, method_name, length) == 0;
-  };
-  if (UNLIKELY(has_ascii_name("finalize", sizeof("finalize") - 1u))) {
-    // Set finalizable flag on declaring class if the method has the right signature.
-    // When initializing without a boot image, `Object` and `Enum` shall have the finalizable
-    // flag cleared immediately after loading these classes, see  `InitWithoutImage()`.
-    if (shorty == "V") {
-      klass->SetFinalizable();
-    }
-  } else if (method_name[0] == '<') {
-    // Fix broken access flags for initializers. Bug 11157540.
-    // `DexFileVerifier` rejects method names starting with '<' other than constructors.
-    DCHECK(has_ascii_name("<init>", sizeof("<init>") - 1u) ||
-           has_ascii_name("<clinit>", sizeof("<clinit>") - 1u)) << method_name;
-    if (UNLIKELY((access_flags & kAccConstructor) == 0)) {
-      LOG(WARNING) << method_name << " didn't have expected constructor access flag in class "
-          << klass->PrettyDescriptor() << " in dex file " << dex_file.GetLocation();
-      access_flags |= kAccConstructor;
-    }
-  }
-
-  access_flags |= GetNterpFastPathFlags(shorty, access_flags, kRuntimeQuickCodeISA);
-
-  if (UNLIKELY((access_flags & kAccNative) != 0u)) {
-    // Check if the native method is annotated with @FastNative or @CriticalNative.
-    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
-    if (method_annotations != nullptr) {
-      access_flags |=
-          annotations::GetNativeMethodAnnotationAccessFlags(dex_file, *method_annotations);
-    }
-    dst->SetAccessFlags(access_flags);
-    DCHECK(!dst->IsAbstract());
-    DCHECK(!dst->HasCodeItem());
-    DCHECK_EQ(method.GetCodeItemOffset(), 0u);
-    dst->SetDataPtrSize(nullptr, image_pointer_size_);  // JNI stub/trampoline not linked yet.
-  } else if ((access_flags & kAccAbstract) != 0u) {
-    dst->SetAccessFlags(access_flags);
-    // Must be done after SetAccessFlags since IsAbstract depends on it.
-    DCHECK(dst->IsAbstract());
-    if (klass->IsInterface()) {
-      dst->CalculateAndSetImtIndex();
-    }
-    DCHECK(!dst->HasCodeItem());
-    DCHECK_EQ(method.GetCodeItemOffset(), 0u);
-    dst->SetDataPtrSize(nullptr, image_pointer_size_);  // Single implementation not set yet.
-  } else {
-    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
-    if (method_annotations != nullptr &&
-        annotations::MethodIsNeverCompile(dex_file, *method_annotations)) {
-      access_flags |= kAccCompileDontBother;
-    }
-    dst->SetAccessFlags(access_flags);
-    DCHECK(!dst->IsAbstract());
-    DCHECK(dst->HasCodeItem());
-    uint32_t code_item_offset = method.GetCodeItemOffset();
-    DCHECK_NE(code_item_offset, 0u);
-    if (Runtime::Current()->IsAotCompiler()) {
-      dst->SetDataPtrSize(reinterpret_cast32<void*>(code_item_offset), image_pointer_size_);
-    } else {
-      dst->SetCodeItem(dex_file.GetCodeItem(code_item_offset), dex_file.IsCompactDexFile());
-    }
-  }
-
-  if ((access_flags & kAccAbstract) == 0u &&
-      Runtime::Current()->IsZygote() &&
-      !Runtime::Current()->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath()) {
-    DCHECK(!ArtMethod::IsAbstract(access_flags));
-    DCHECK(!ArtMethod::IsIntrinsic(access_flags));
-    dst->SetMemorySharedMethod();
-    dst->SetHotCounter();
-  }
 }
 
 void ClassLinker::AppendToBootClassPath(Thread* self, const DexFile* dex_file) {
@@ -5200,8 +5205,7 @@ void ClassLinker::ResolveMethodExceptionHandlerTypes(ArtMethod* method) {
   CHECK(method->GetDexFile()->IsInDataSection(handlers_ptr))
       << method->PrettyMethod()
       << "@" << method->GetDexFile()->GetLocation()
-      << "@" << reinterpret_cast<const void*>(handlers_ptr)
-      << " is_compact_dex=" << method->GetDexFile()->IsCompactDexFile();
+      << "@" << reinterpret_cast<const void*>(handlers_ptr);
 
   uint32_t handlers_size = DecodeUnsignedLeb128(&handlers_ptr);
   for (uint32_t idx = 0; idx < handlers_size; idx++) {
