@@ -65,6 +65,7 @@
 #include "stack.h"
 #include "vdex_file.h"
 #include "verifier/method_verifier.h"
+#include "verifier_compiler_binding.h"
 #include "verifier_deps.h"
 
 namespace art HIDDEN {
@@ -422,25 +423,18 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
   // Perform static checks on an instruction referencing a constant method handle. All we do here
   // is ensure that the method index is in the valid range.
   bool CheckMethodHandleIndex(uint32_t idx) {
-    uint32_t limit = dex_file_->NumMethodHandles();
-    if (UNLIKELY(idx >= limit)) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad method handle index " << idx << " (max "
-                                        << limit << ")";
+    if (UNLIKELY(idx >= dex_file_->NumMethodHandles())) {
+      FailBadMethodHandleIndex(idx);
       return false;
     }
     return true;
   }
 
-  // Perform static checks on a "new-instance" instruction. Specifically, make sure the class
-  // reference isn't for an array class.
-  bool CheckNewInstance(dex::TypeIndex idx);
-
   // Perform static checks on a prototype indexing instruction. All we do here is ensure that the
   // prototype index is in the valid range.
   bool CheckPrototypeIndex(uint32_t idx) {
-    if (UNLIKELY(idx >= dex_file_->GetHeader().proto_ids_size_)) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad prototype index " << idx << " (max "
-                                        << dex_file_->GetHeader().proto_ids_size_ << ")";
+    if (UNLIKELY(idx >= dex_file_->NumProtoIds())) {
+      FailBadPrototypeIndex(idx);
       return false;
     }
     return true;
@@ -448,9 +442,8 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
 
   /* Ensure that the string index is in the valid range. */
   bool CheckStringIndex(uint32_t idx) {
-    if (UNLIKELY(idx >= dex_file_->GetHeader().string_ids_size_)) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad string index " << idx << " (max "
-                                        << dex_file_->GetHeader().string_ids_size_ << ")";
+    if (UNLIKELY(idx >= dex_file_->NumStringIds())) {
+      FailBadStringIndex(idx);
       return false;
     }
     return true;
@@ -460,15 +453,22 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
   // index is in the valid range.
   bool CheckTypeIndex(dex::TypeIndex idx) {
     if (UNLIKELY(idx.index_ >= dex_file_->GetHeader().type_ids_size_)) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad type index " << idx.index_ << " (max "
-                                        << dex_file_->GetHeader().type_ids_size_ << ")";
+      FailBadTypeIndex(idx);
       return false;
     }
     return true;
   }
 
-  // Perform static checks on a "new-array" instruction. Specifically, make sure they aren't
-  // creating an array of arrays that causes the number of dimensions to exceed 255.
+  // Perform static checks on a `new-instance` instruction. Specifically, make sure the class
+  // reference isn't for an array class.
+  bool CheckNewInstance(dex::TypeIndex idx);
+
+  // Perform static checks on a `*new-array*` instruction. Specifically, make sure it
+  // references an array class with the number of dimensions not exceeding 255.
+  // For `filled-new-array*`, check for a valid component type; `I` is accepted, `J` and `D`
+  // are rejected in line with the specification and other primitive component types are marked
+  // for interpreting (throws `InternalError` in interpreter and the compiler cannot handle them).
+  template <bool kFilled>
   bool CheckNewArray(dex::TypeIndex idx);
 
   // Determine if the relative `offset` targets a valid dex pc.
@@ -565,8 +565,8 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
   // This has the side-effect of validating the signature.
   bool SetTypesFromSignature() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Perform verification of a new array instruction
-  void VerifyNewArray(const Instruction* inst, bool is_filled, bool is_range)
+  // Perform verification of a `filled-new-array/-range` instruction.
+  bool VerifyFilledNewArray(const Instruction* inst, bool is_range)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Helper to perform verification on puts of primitive type.
@@ -731,6 +731,41 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
         << "bad method index " << method_idx << " (max " << dex_file_->NumMethodIds() << ")";
   }
 
+  NO_INLINE void FailBadMethodHandleIndex(uint32_t idx) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "bad method handle index " << idx << " (max " << dex_file_->NumMethodHandles() << ")";
+  }
+
+  NO_INLINE void FailBadPrototypeIndex(uint32_t idx) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "bad prototype index " << idx << " (max " << dex_file_->NumProtoIds() << ")";
+  }
+
+  NO_INLINE void FailBadStringIndex(uint32_t idx) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "bad string index " << idx << " (max " << dex_file_->NumStringIds() << ")";
+  }
+
+  NO_INLINE void FailBadTypeIndex(dex::TypeIndex idx) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "bad type index " << idx.index_ << " (max " << dex_file_->NumTypeIds() << ")";
+  }
+
+  NO_INLINE void FailBadNewArrayNotArray(const char* descriptor) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "can't new-array class '" << descriptor << "' (not an array)";
+  }
+
+  NO_INLINE void FailBadNewArrayTooManyDimensions(const char* descriptor) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "can't new-array class '" << descriptor << "' (exceeds limit)";
+  }
+
+  NO_INLINE void FailBadFilledNewArray(const char* descriptor) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "can't fill-new-array class '" << descriptor << "' (wide component type)";
+  }
+
   NO_INLINE void FailBranchOffsetZero(uint32_t dex_pc) {
     work_insn_idx_ = dex_pc;  // Let `Fail()` record the dex PC of the failing instruction.
     Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "branch offset of zero not allowed.";
@@ -836,6 +871,25 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
         << ", target index " << target_index;
   }
 
+  NO_INLINE void FailForCopyReference(uint32_t vdst, uint32_t vsrc, const RegType& type)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "copy-reference v" << vdst << "<-v" << vsrc << " type=" << type;
+  }
+
+  NO_INLINE void FailForCopyCat1(uint32_t vdst, uint32_t vsrc, const RegType& type)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "copy-cat1 v" << vdst << "<-v" << vsrc << " type=" << type;
+  }
+
+  NO_INLINE void FailForCopyCat2(
+      uint32_t vdst, uint32_t vsrc, const RegType& type_l, const RegType& type_h)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
+        << "copy-cat2 v" << vdst << "<-v" << vsrc << " type=" << type_l << "/" << type_h;
+  }
+
   NO_INLINE void FailForRegisterType(uint32_t vsrc,
                                      const RegType& check_type,
                                      const RegType& src_type,
@@ -869,6 +923,60 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
         vsrc, reg_types_.GetFromId(src_type_id), reg_types_.GetFromId(src_type_id_h));
   }
 
+  ALWAYS_INLINE inline bool VerifyCopyReference(uint32_t vdst, uint32_t vsrc)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    const RegType& type = work_line_->GetRegisterType(this, vsrc);
+    // Allow conflicts to be copied around.
+    if (UNLIKELY(!type.IsConflict() && !type.IsReferenceTypes())) {
+      FailForCopyReference(vdst, vsrc, type);
+      return false;
+    }
+    work_line_->CopyReference(vdst, vsrc, type);
+    return true;
+  }
+
+  ALWAYS_INLINE inline bool VerifyCopyCat1(uint32_t vdst, uint32_t vsrc)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint16_t src_type_id = work_line_->GetRegisterTypeId(vsrc);
+    if (UNLIKELY(src_type_id >= RegTypeCache::NumberOfRegKindCacheIds()) ||
+        UNLIKELY(RegTypeCache::RegKindForId(src_type_id) != RegType::kConflict &&
+                 !RegType::IsCategory1Types(RegTypeCache::RegKindForId(src_type_id)))) {
+      const RegType& type = reg_types_.GetFromId(src_type_id);
+      DCHECK(!type.IsConflict() && !type.IsCategory1Types()) << type;
+      FailForCopyCat1(vdst, vsrc, type);
+      return false;
+    }
+    RegType::Kind kind = RegTypeCache::RegKindForId(src_type_id);
+    DCHECK(kind == RegType::kConflict || RegType::IsCategory1Types(kind)) << kind;
+    work_line_->SetRegisterType(vdst, kind);
+    return true;
+  }
+
+  ALWAYS_INLINE inline bool VerifyCopyCat2(uint32_t vdst, uint32_t vsrc)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint16_t src_type_id_l = work_line_->GetRegisterTypeId(vsrc);
+    uint16_t src_type_id_h = work_line_->GetRegisterTypeId(vsrc + 1);
+    auto to_high_id = [](uint16_t low_id) ALWAYS_INLINE {
+      RegType::Kind low_kind = RegTypeCache::RegKindForId(low_id);
+      DCHECK(RegType::IsLowHalf(low_kind));
+      return RegTypeCache::IdForRegKind(RegType::ToHighHalf(low_kind));
+    };
+    if (UNLIKELY(src_type_id_l >= RegTypeCache::NumberOfRegKindCacheIds()) ||
+        UNLIKELY(!RegType::IsLowHalf(RegTypeCache::RegKindForId(src_type_id_l))) ||
+        UNLIKELY(src_type_id_h != to_high_id(src_type_id_l))) {
+      const RegType& type_l = reg_types_.GetFromId(src_type_id_l);
+      const RegType& type_h = reg_types_.GetFromId(src_type_id_h);
+      DCHECK(!type_l.CheckWidePair(type_h));
+      FailForCopyCat2(vdst, vsrc, type_l, type_h);
+      return false;
+    }
+    DCHECK(reg_types_.GetFromId(src_type_id_l).CheckWidePair(reg_types_.GetFromId(src_type_id_h)));
+    work_line_->SetRegisterTypeWide(vdst,
+                                    RegTypeCache::RegKindForId(src_type_id_l),
+                                    RegTypeCache::RegKindForId(src_type_id_h));
+    return true;
+  }
+
   ALWAYS_INLINE inline bool VerifyRegisterType(uint32_t vsrc, const RegType& check_type)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     // Verify the src register type against the check type refining the type of the register
@@ -887,7 +995,7 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
         fail_type = VERIFY_ERROR_BAD_CLASS_HARD;
       }
       FailForRegisterType(vsrc, check_type, src_type, fail_type);
-      return false;
+      return fail_type != VERIFY_ERROR_BAD_CLASS_HARD;
     }
     if (check_type.IsLowHalf()) {
       const RegType& src_type_h = work_line_->GetRegisterType(this, vsrc + 1);
@@ -1887,6 +1995,10 @@ inline bool MethodVerifierImpl::VerifyInstruction(uint32_t dex_pc,
     case Instruction::kVerifyRegBPrototype:
       result = result && CheckPrototypeIndex(inst->VRegB(kFormat, inst_data));
       break;
+    case Instruction::kVerifyRegBFilledNewArray:
+      result = result &&
+               CheckNewArray</*kFilled=*/ true>(dex::TypeIndex(inst->VRegB(kFormat, inst_data)));
+      break;
     case Instruction::kVerifyNothing:
       break;
   }
@@ -1900,7 +2012,7 @@ inline bool MethodVerifierImpl::VerifyInstruction(uint32_t dex_pc,
       result = result && CheckFieldIndex(inst, inst_data, inst->VRegC(kFormat));
       break;
     case Instruction::kVerifyRegCNewArray:
-      result = result && CheckNewArray(dex::TypeIndex(inst->VRegC(kFormat)));
+      result = result && CheckNewArray</*kFilled=*/ false>(dex::TypeIndex(inst->VRegC(kFormat)));
       break;
     case Instruction::kVerifyRegCType:
       result = result && CheckTypeIndex(dex::TypeIndex(inst->VRegC(kFormat)));
@@ -1968,9 +2080,7 @@ inline bool MethodVerifierImpl::VerifyInstruction(uint32_t dex_pc,
 }
 
 inline bool MethodVerifierImpl::CheckNewInstance(dex::TypeIndex idx) {
-  if (UNLIKELY(idx.index_ >= dex_file_->GetHeader().type_ids_size_)) {
-    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad type index " << idx.index_ << " (max "
-                                      << dex_file_->GetHeader().type_ids_size_ << ")";
+  if (!CheckTypeIndex(idx)) {
     return false;
   }
   // We don't need the actual class, just a pointer to the class name.
@@ -1979,35 +2089,41 @@ inline bool MethodVerifierImpl::CheckNewInstance(dex::TypeIndex idx) {
     Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "can't call new-instance on type '" << descriptor << "'";
     return false;
   } else if (UNLIKELY(descriptor == "Ljava/lang/Class;")) {
-    // An unlikely new instance on Class is not allowed. Fall back to interpreter to ensure an
-    // exception is thrown when this statement is executed (compiled code would not do that).
+    // An unlikely new instance on Class is not allowed.
     Fail(VERIFY_ERROR_INSTANTIATION);
   }
   return true;
 }
 
-bool MethodVerifierImpl::CheckNewArray(dex::TypeIndex idx) {
-  if (UNLIKELY(idx.index_ >= dex_file_->GetHeader().type_ids_size_)) {
-    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "bad type index " << idx.index_ << " (max "
-                                      << dex_file_->GetHeader().type_ids_size_ << ")";
+template <bool kFilled>
+inline bool MethodVerifierImpl::CheckNewArray(dex::TypeIndex idx) {
+  if (!CheckTypeIndex(idx)) {
     return false;
   }
-  int bracket_count = 0;
   const char* descriptor = dex_file_->GetTypeDescriptor(idx);
   const char* cp = descriptor;
-  while (*cp++ == '[') {
-    bracket_count++;
+  while (*cp == '[') {
+    ++cp;
   }
-  if (UNLIKELY(bracket_count == 0)) {
+  size_t bracket_count = static_cast<size_t>(cp - descriptor);
+  if (UNLIKELY(bracket_count == 0u)) {
     /* The given class must be an array type. */
-    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
-        << "can't new-array class '" << descriptor << "' (not an array)";
+    FailBadNewArrayNotArray(descriptor);
     return false;
-  } else if (UNLIKELY(bracket_count > 255)) {
+  } else if (UNLIKELY(bracket_count > 255u)) {
     /* It is illegal to create an array of more than 255 dimensions. */
-    Fail(VERIFY_ERROR_BAD_CLASS_HARD)
-        << "can't new-array class '" << descriptor << "' (exceeds limit)";
+    FailBadNewArrayTooManyDimensions(descriptor);
     return false;
+  }
+  if (kFilled && bracket_count == 1u && UNLIKELY(*cp != 'I' && *cp != 'L')) {
+    if (UNLIKELY(*cp == 'J') || UNLIKELY(*cp == 'D')) {
+      // Forbidden, see https://source.android.com/docs/core/runtime/dalvik-bytecode .
+      FailBadFilledNewArray(descriptor);
+      return false;
+    } else {
+      // Fall back to interpreter to throw `InternalError`. Compiler does not handle this case.
+      Fail(VERIFY_ERROR_FILLED_NEW_ARRAY);
+    }
   }
   return true;
 }
@@ -2664,35 +2780,49 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       break;
 
     case Instruction::MOVE:
-      work_line_->CopyRegister1(
-          this, inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data), kTypeCategory1nr);
+      if (!VerifyCopyCat1(inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data))) {
+        return false;
+      }
       break;
     case Instruction::MOVE_FROM16:
-      work_line_->CopyRegister1(
-          this, inst->VRegA_22x(inst_data), inst->VRegB_22x(), kTypeCategory1nr);
+      if (!VerifyCopyCat1(inst->VRegA_22x(inst_data), inst->VRegB_22x())) {
+        return false;
+      }
       break;
     case Instruction::MOVE_16:
-      work_line_->CopyRegister1(this, inst->VRegA_32x(), inst->VRegB_32x(), kTypeCategory1nr);
+      if (!VerifyCopyCat1(inst->VRegA_32x(), inst->VRegB_32x())) {
+        return false;
+      }
       break;
     case Instruction::MOVE_WIDE:
-      work_line_->CopyRegister2(this, inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data));
+      if (!VerifyCopyCat2(inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data))) {
+        return false;
+      }
       break;
     case Instruction::MOVE_WIDE_FROM16:
-      work_line_->CopyRegister2(this, inst->VRegA_22x(inst_data), inst->VRegB_22x());
+      if (!VerifyCopyCat2(inst->VRegA_22x(inst_data), inst->VRegB_22x())) {
+        return false;
+      }
       break;
     case Instruction::MOVE_WIDE_16:
-      work_line_->CopyRegister2(this, inst->VRegA_32x(), inst->VRegB_32x());
+      if (!VerifyCopyCat2(inst->VRegA_32x(), inst->VRegB_32x())) {
+        return false;
+      }
       break;
     case Instruction::MOVE_OBJECT:
-      work_line_->CopyRegister1(
-          this, inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data), kTypeCategoryRef);
+      if (!VerifyCopyReference(inst->VRegA_12x(inst_data), inst->VRegB_12x(inst_data))) {
+        return false;
+      }
       break;
     case Instruction::MOVE_OBJECT_FROM16:
-      work_line_->CopyRegister1(
-          this, inst->VRegA_22x(inst_data), inst->VRegB_22x(), kTypeCategoryRef);
+      if (!VerifyCopyReference(inst->VRegA_22x(inst_data), inst->VRegB_22x())) {
+        return false;
+      }
       break;
     case Instruction::MOVE_OBJECT_16:
-      work_line_->CopyRegister1(this, inst->VRegA_32x(), inst->VRegB_32x(), kTypeCategoryRef);
+      if (!VerifyCopyReference(inst->VRegA_32x(), inst->VRegB_32x())) {
+        return false;
+      }
       break;
 
     /*
@@ -2730,98 +2860,104 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
     }
 
     case Instruction::RETURN_VOID:
-      if (!IsInstanceConstructor() || work_line_->CheckConstructorReturn(this)) {
-        if (!GetMethodReturnType().IsConflict()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-void not expected";
-          return false;
+      if (IsInstanceConstructor() && UNLIKELY(!work_line_->CheckConstructorReturn(this))) {
+        return false;
+      }
+      if (!GetMethodReturnType().IsConflict()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-void not expected";
+        return false;
+      }
+      break;
+    case Instruction::RETURN: {
+      if (IsInstanceConstructor() && UNLIKELY(!work_line_->CheckConstructorReturn(this))) {
+        return false;
+      }
+      /* check the method signature */
+      const RegType& return_type = GetMethodReturnType();
+      if (!return_type.IsCategory1Types()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unexpected non-category 1 return type "
+                                          << return_type;
+        return false;
+      } else {
+        // Compilers may generate synthetic functions that write byte values into boolean fields.
+        // Also, it may use integer values for boolean, byte, short, and character return types.
+        const uint32_t vregA = inst->VRegA_11x(inst_data);
+        const RegType& src_type = work_line_->GetRegisterType(this, vregA);
+        bool use_src = ((return_type.IsBoolean() && src_type.IsByte()) ||
+                        ((return_type.IsBoolean() || return_type.IsByte() ||
+                         return_type.IsShort() || return_type.IsChar()) &&
+                         src_type.IsInteger()));
+        /* check the register contents */
+        bool success = VerifyRegisterType(vregA, use_src ? src_type : return_type);
+        if (!success) {
+          LastFailureMessageStream() << " return-1nr on invalid register v" << vregA;
         }
       }
       break;
-    case Instruction::RETURN:
-      if (!IsInstanceConstructor() || work_line_->CheckConstructorReturn(this)) {
-        /* check the method signature */
-        const RegType& return_type = GetMethodReturnType();
-        if (!return_type.IsCategory1Types()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unexpected non-category 1 return type "
-                                            << return_type;
+    }
+    case Instruction::RETURN_WIDE: {
+      if (IsInstanceConstructor() && UNLIKELY(!work_line_->CheckConstructorReturn(this))) {
+        return false;
+      }
+      /* check the method signature */
+      const RegType& return_type = GetMethodReturnType();
+      if (!return_type.IsCategory2Types()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-wide not expected";
+        return false;
+      } else {
+        /* check the register contents */
+        const uint32_t vregA = inst->VRegA_11x(inst_data);
+        bool success = VerifyRegisterTypeWide(vregA, return_type.GetKind());
+        if (!success) {
+          LastFailureMessageStream() << " return-wide on invalid register v" << vregA;
+        }
+      }
+      break;
+    }
+    case Instruction::RETURN_OBJECT: {
+      if (IsInstanceConstructor() && UNLIKELY(!work_line_->CheckConstructorReturn(this))) {
+        return false;
+      }
+      const RegType& return_type = GetMethodReturnType();
+      if (!return_type.IsReferenceTypes()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-object not expected";
+        return false;
+      } else {
+        /* return_type is the *expected* return type, not register value */
+        DCHECK(!return_type.IsZeroOrNull());
+        DCHECK(!return_type.IsUninitializedReference());
+        const uint32_t vregA = inst->VRegA_11x(inst_data);
+        const RegType& reg_type = work_line_->GetRegisterType(this, vregA);
+        // Disallow returning undefined, conflict & uninitialized values and verify that the
+        // reference in vAA is an instance of the "return_type."
+        if (reg_type.IsUndefined()) {
+          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning undefined register";
           return false;
-        } else {
-          // Compilers may generate synthetic functions that write byte values into boolean fields.
-          // Also, it may use integer values for boolean, byte, short, and character return types.
-          const uint32_t vregA = inst->VRegA_11x(inst_data);
-          const RegType& src_type = work_line_->GetRegisterType(this, vregA);
-          bool use_src = ((return_type.IsBoolean() && src_type.IsByte()) ||
-                          ((return_type.IsBoolean() || return_type.IsByte() ||
-                           return_type.IsShort() || return_type.IsChar()) &&
-                           src_type.IsInteger()));
-          /* check the register contents */
-          bool success = VerifyRegisterType(vregA, use_src ? src_type : return_type);
-          if (!success) {
-            LastFailureMessageStream() << " return-1nr on invalid register v" << vregA;
+        } else if (reg_type.IsConflict()) {
+          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning register with conflict";
+          return false;
+        } else if (reg_type.IsUninitializedTypes()) {
+          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning uninitialized object '"
+                                            << reg_type << "'";
+          return false;
+        } else if (!reg_type.IsReferenceTypes()) {
+          // We really do expect a reference here.
+          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-object returns a non-reference type "
+                                            << reg_type;
+          return false;
+        } else if (!IsAssignableFrom(return_type, reg_type)) {
+          if (reg_type.IsUnresolvedTypes() || return_type.IsUnresolvedTypes()) {
+            Fail(VERIFY_ERROR_UNRESOLVED_TYPE_CHECK)
+                << " can't resolve returned type '" << return_type << "' or '" << reg_type << "'";
+          } else {
+            Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning '" << reg_type
+                << "', but expected from declaration '" << return_type << "'";
+            return false;
           }
         }
       }
       break;
-    case Instruction::RETURN_WIDE:
-      if (!IsInstanceConstructor() || work_line_->CheckConstructorReturn(this)) {
-        /* check the method signature */
-        const RegType& return_type = GetMethodReturnType();
-        if (!return_type.IsCategory2Types()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-wide not expected";
-          return false;
-        } else {
-          /* check the register contents */
-          const uint32_t vregA = inst->VRegA_11x(inst_data);
-          bool success = VerifyRegisterTypeWide(vregA, return_type.GetKind());
-          if (!success) {
-            LastFailureMessageStream() << " return-wide on invalid register v" << vregA;
-          }
-        }
-      }
-      break;
-    case Instruction::RETURN_OBJECT:
-      if (!IsInstanceConstructor() || work_line_->CheckConstructorReturn(this)) {
-        const RegType& return_type = GetMethodReturnType();
-        if (!return_type.IsReferenceTypes()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-object not expected";
-          return false;
-        } else {
-          /* return_type is the *expected* return type, not register value */
-          DCHECK(!return_type.IsZeroOrNull());
-          DCHECK(!return_type.IsUninitializedReference());
-          const uint32_t vregA = inst->VRegA_11x(inst_data);
-          const RegType& reg_type = work_line_->GetRegisterType(this, vregA);
-          // Disallow returning undefined, conflict & uninitialized values and verify that the
-          // reference in vAA is an instance of the "return_type."
-          if (reg_type.IsUndefined()) {
-            Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning undefined register";
-            return false;
-          } else if (reg_type.IsConflict()) {
-            Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning register with conflict";
-            return false;
-          } else if (reg_type.IsUninitializedTypes()) {
-            Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning uninitialized object '"
-                                              << reg_type << "'";
-            return false;
-          } else if (!reg_type.IsReferenceTypes()) {
-            // We really do expect a reference here.
-            Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "return-object returns a non-reference type "
-                                              << reg_type;
-            return false;
-          } else if (!IsAssignableFrom(return_type, reg_type)) {
-            if (reg_type.IsUnresolvedTypes() || return_type.IsUnresolvedTypes()) {
-              Fail(VERIFY_ERROR_UNRESOLVED_TYPE_CHECK)
-                  << " can't resolve returned type '" << return_type << "' or '" << reg_type << "'";
-            } else {
-              Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "returning '" << reg_type
-                  << "', but expected from declaration '" << return_type << "'";
-              return false;
-            }
-          }
-        }
-      }
-      break;
-
+    }
       /* could be boolean, int, float, or a null reference */
     case Instruction::CONST_4: {
       int32_t val = static_cast<int32_t>(inst->VRegB_11n(inst_data) << 28) >> 28;
@@ -2882,8 +3018,14 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       work_line_->SetRegisterType<LockOp::kClear>(
           inst->VRegA_21c(inst_data), reg_types_.JavaLangInvokeMethodType());
       break;
-    case Instruction::MONITOR_ENTER:
-      work_line_->PushMonitor(this, inst->VRegA_11x(inst_data), work_insn_idx_);
+    case Instruction::MONITOR_ENTER: {
+      uint32_t vreg = inst->VRegA_11x(inst_data);
+      const RegType& reg_type = work_line_->GetRegisterType(this, vreg);
+      if (!reg_type.IsReferenceTypes()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "monitor-enter on non-object (" << reg_type << ")";
+        return false;
+      }
+      work_line_->PushMonitor(this, vreg, reg_type, work_insn_idx_);
       // Check whether the previous instruction is a move-object with vAA as a source, creating
       // untracked lock aliasing.
       if (0 != work_insn_idx_ && !GetInstructionFlags(work_insn_idx_).IsBranchTarget()) {
@@ -2896,13 +3038,10 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
           case Instruction::MOVE_OBJECT:
           case Instruction::MOVE_OBJECT_16:
           case Instruction::MOVE_OBJECT_FROM16:
-            if (prev_inst.VRegB() == inst->VRegA_11x(inst_data)) {
+            if (static_cast<uint32_t>(prev_inst.VRegB()) == vreg) {
               // Redo the copy. This won't change the register types, but update the lock status
               // for the aliased register.
-              work_line_->CopyRegister1(this,
-                                        prev_inst.VRegA(),
-                                        prev_inst.VRegB(),
-                                        kTypeCategoryRef);
+              work_line_->CopyReference(prev_inst.VRegA(), vreg, reg_type);
             }
             break;
 
@@ -2931,16 +3070,12 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
             }
 
             // Update the lock status for the aliased register.
-            if (prev_inst.VRegA() == inst->VRegA_11x(inst_data)) {
-              work_line_->CopyRegister1(this,
-                                        prev2_inst.VRegA(),
-                                        inst->VRegA_11x(inst_data),
-                                        kTypeCategoryRef);
-            } else if (prev2_inst.VRegA() == inst->VRegA_11x(inst_data)) {
-              work_line_->CopyRegister1(this,
-                                        prev_inst.VRegA(),
-                                        inst->VRegA_11x(inst_data),
-                                        kTypeCategoryRef);
+            uint32_t prev_inst_vregA = prev_inst.VRegA_21c(prev_inst.Fetch16(0));
+            uint32_t prev2_inst_vregA = prev2_inst.VRegA_21c(prev2_inst.Fetch16(0));
+            if (prev_inst_vregA == vreg) {
+              work_line_->CopyReference(prev2_inst_vregA, vreg, reg_type);
+            } else if (prev2_inst_vregA == vreg) {
+              work_line_->CopyReference(prev_inst_vregA, vreg, reg_type);
             }
             break;
           }
@@ -2950,7 +3085,8 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
         }
       }
       break;
-    case Instruction::MONITOR_EXIT:
+    }
+    case Instruction::MONITOR_EXIT: {
       /*
        * monitor-exit instructions are odd. They can throw exceptions,
        * but when they do they act as if they succeeded and the PC is
@@ -2972,8 +3108,15 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
        * "live" so we still need to check it.
        */
       opcode_flags &= ~Instruction::kThrow;
-      work_line_->PopMonitor(this, inst->VRegA_11x(inst_data));
+      uint32_t vreg = inst->VRegA_11x(inst_data);
+      const RegType& reg_type = work_line_->GetRegisterType(this, vreg);
+      if (!reg_type.IsReferenceTypes()) {
+        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "monitor-exit on non-object (" << reg_type << ")";
+        return false;
+      }
+      work_line_->PopMonitor(this, vreg, reg_type);
       break;
+    }
     case Instruction::CHECK_CAST:
     case Instruction::INSTANCE_OF: {
       /*
@@ -3028,18 +3171,12 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
     }
     case Instruction::ARRAY_LENGTH: {
       const RegType& res_type = work_line_->GetRegisterType(this, inst->VRegB_12x(inst_data));
-      if (res_type.IsReferenceTypes()) {
-        if (!res_type.IsArrayTypes() && !res_type.IsZeroOrNull()) {
-          // ie not an array or null
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "array-length on non-array " << res_type;
-          return false;
-        } else {
-          work_line_->SetRegisterType(inst->VRegA_12x(inst_data), kInteger);
-        }
-      } else {
+      if (!res_type.IsReferenceTypes() || (!res_type.IsArrayTypes() && !res_type.IsZeroOrNull())) {
+        // ie not an array or null
         Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "array-length on non-array " << res_type;
         return false;
       }
+      work_line_->SetRegisterType(inst->VRegA_12x(inst_data), kInteger);
       break;
     }
     case Instruction::NEW_INSTANCE: {
@@ -3064,15 +3201,30 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       work_line_->SetRegisterTypeForNewInstance(vA, uninit_type, work_insn_idx_);
       break;
     }
-    case Instruction::NEW_ARRAY:
-      VerifyNewArray(inst, false, false);
+    case Instruction::NEW_ARRAY: {
+      // Make sure the "size" register has a valid type.
+      if (!VerifyRegisterType(inst->VRegB_22c(), RegType::Kind::kInteger)) {
+        return false;
+      }
+      // Dex file verifier ensures that all valid type indexes reference valid descriptors and the
+      // `CheckNewArray()` ensures that the descriptor starts with an `[` before we get to the
+      // code flow verification. So, we should see only array types here.
+      const RegType& res_type = ResolveClass<CheckAccess::kYes>(dex::TypeIndex(inst->VRegC_22c()));
+      DCHECK(res_type.IsArrayTypes());
+      // Set the register type to the array class.
+      work_line_->SetRegisterType<LockOp::kClear>(inst->VRegA_22c(), res_type);
       break;
+    }
     case Instruction::FILLED_NEW_ARRAY:
-      VerifyNewArray(inst, true, false);
+      if (!VerifyFilledNewArray(inst, /*is_range=*/ false)) {
+        return false;
+      }
       just_set_result = true;  // Filled new array sets result register
       break;
     case Instruction::FILLED_NEW_ARRAY_RANGE:
-      VerifyNewArray(inst, true, true);
+      if (!VerifyFilledNewArray(inst, /*is_range=*/ true)) {
+        return false;
+      }
       just_set_result = true;  // Filled new array range sets result register
       break;
     case Instruction::CMPL_FLOAT:
@@ -4835,54 +4987,41 @@ bool MethodVerifierImpl::CheckSignaturePolymorphicReceiver(const Instruction* in
   return true;
 }
 
-void MethodVerifierImpl::VerifyNewArray(const Instruction* inst,
-                                        bool is_filled,
-                                        bool is_range) {
+bool MethodVerifierImpl::VerifyFilledNewArray(const Instruction* inst, bool is_range) {
   dex::TypeIndex type_idx;
-  if (!is_filled) {
-    DCHECK_EQ(inst->Opcode(), Instruction::NEW_ARRAY);
-    type_idx = dex::TypeIndex(inst->VRegC_22c());
-  } else if (!is_range) {
+  if (!is_range) {
     DCHECK_EQ(inst->Opcode(), Instruction::FILLED_NEW_ARRAY);
     type_idx = dex::TypeIndex(inst->VRegB_35c());
   } else {
     DCHECK_EQ(inst->Opcode(), Instruction::FILLED_NEW_ARRAY_RANGE);
     type_idx = dex::TypeIndex(inst->VRegB_3rc());
   }
+  // Dex file verifier ensures that all valid type indexes reference valid descriptors and the
+  // `CheckNewArray()` ensures that the descriptor starts with an `[` before we get to the
+  // code flow verification. So, we should see only array types here.
   const RegType& res_type = ResolveClass<CheckAccess::kYes>(type_idx);
-  if (res_type.IsConflict()) {  // bad class
-    DCHECK_NE(failures_.size(), 0U);
-  } else {
-    // TODO: check Compiler::CanAccessTypeWithoutChecks returns false when res_type is unresolved
-    if (!res_type.IsArrayTypes()) {
-      Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "new-array on non-array class " << res_type;
-    } else if (!is_filled) {
-      /* make sure "size" register is valid type */
-      VerifyRegisterType(inst->VRegB_22c(), RegType::Kind::kInteger);
-      /* set register type to array class */
-      work_line_->SetRegisterType<LockOp::kClear>(inst->VRegA_22c(), res_type);
-    } else {
-      DCHECK(!res_type.IsUnresolvedMergedReference());
-      // Verify each register. If "arg_count" is bad, VerifyRegisterType() will run off the end of
-      // the list and fail. It's legal, if silly, for arg_count to be zero.
-      const RegType& expected_type = reg_types_.GetComponentType(res_type);
-      uint32_t arg_count = (is_range) ? inst->VRegA_3rc() : inst->VRegA_35c();
-      uint32_t arg[5];
-      if (!is_range) {
-        inst->GetVarArgs(arg);
-      }
-      for (size_t ui = 0; ui < arg_count; ui++) {
-        uint32_t get_reg = is_range ? inst->VRegC_3rc() + ui : arg[ui];
-        VerifyRegisterType(get_reg, expected_type);
-        if (flags_.have_pending_hard_failure_) {
-          // Don't continue on hard failures.
-          return;
-        }
-      }
-      // filled-array result goes into "result" register
-      work_line_->SetResultRegisterType(res_type);
-    }
+  DCHECK(res_type.IsArrayTypes());
+  // TODO: check Compiler::CanAccessTypeWithoutChecks returns false when res_type is unresolved
+  DCHECK(!res_type.IsUnresolvedMergedReference());
+  // Verify each input register. It's legal, if silly, for arg_count to be zero.
+  const RegType& expected_type = reg_types_.GetComponentType(res_type);
+  uint32_t arg_count = (is_range) ? inst->VRegA_3rc() : inst->VRegA_35c();
+  uint32_t arg[5];
+  if (!is_range) {
+    inst->GetVarArgs(arg);
   }
+  for (size_t ui = 0; ui < arg_count; ui++) {
+    uint32_t get_reg = is_range ? inst->VRegC_3rc() + ui : arg[ui];
+    if (!VerifyRegisterType(get_reg, expected_type)) {
+      // Don't continue on hard failures.
+      DCHECK(flags_.have_pending_hard_failure_);
+      return false;
+    }
+    DCHECK(!flags_.have_pending_hard_failure_);
+  }
+  // filled-array result goes into "result" register
+  work_line_->SetResultRegisterType(res_type);
+  return true;
 }
 
 void MethodVerifierImpl::VerifyAGet(const Instruction* inst,
@@ -5449,24 +5588,6 @@ MethodVerifier::FailureData MethodVerifier::VerifyMethod(Thread* self,
   }
 }
 
-// Return whether the runtime knows how to execute a method without needing to
-// re-verify it at runtime (and therefore save on first use of the class).
-// The AOT/JIT compiled code is not affected.
-static inline bool CanRuntimeHandleVerificationFailure(uint32_t encountered_failure_types) {
-  constexpr uint32_t unresolved_mask =
-      verifier::VerifyError::VERIFY_ERROR_UNRESOLVED_TYPE_CHECK |
-      verifier::VerifyError::VERIFY_ERROR_NO_CLASS |
-      verifier::VerifyError::VERIFY_ERROR_CLASS_CHANGE |
-      verifier::VerifyError::VERIFY_ERROR_INSTANTIATION |
-      verifier::VerifyError::VERIFY_ERROR_ACCESS_CLASS |
-      verifier::VerifyError::VERIFY_ERROR_ACCESS_FIELD |
-      verifier::VerifyError::VERIFY_ERROR_NO_METHOD |
-      verifier::VerifyError::VERIFY_ERROR_NO_FIELD |
-      verifier::VerifyError::VERIFY_ERROR_ACCESS_METHOD |
-      verifier::VerifyError::VERIFY_ERROR_RUNTIME_THROW;
-  return (encountered_failure_types & (~unresolved_mask)) == 0;
-}
-
 template <bool kVerifierDebug>
 MethodVerifier::FailureData MethodVerifier::VerifyMethod(Thread* self,
                                                          ArenaPool* arena_pool,
@@ -5511,13 +5632,16 @@ MethodVerifier::FailureData MethodVerifier::VerifyMethod(Thread* self,
         LOG(INFO) << verifier.InfoMessages().view();
         verifier.Dump(LOG_STREAM(INFO));
       }
-      if (CanRuntimeHandleVerificationFailure(verifier.encountered_failure_types_)) {
+      if (CanCompilerHandleVerificationFailure(verifier.encountered_failure_types_)) {
         if (verifier.encountered_failure_types_ & VERIFY_ERROR_UNRESOLVED_TYPE_CHECK) {
           result.kind = FailureKind::kTypeChecksFailure;
         } else {
           result.kind = FailureKind::kAccessChecksFailure;
         }
       } else {
+        // If the compiler cannot handle the failure, force a soft failure to
+        // ensure the class will be re-verified at runtime and the method marked
+        // as not compilable.
         result.kind = FailureKind::kSoftFailure;
       }
     }
@@ -5732,6 +5856,7 @@ std::ostream& MethodVerifier::Fail(VerifyError error, bool pending_exc) {
       case VERIFY_ERROR_ACCESS_FIELD:
       case VERIFY_ERROR_ACCESS_METHOD:
       case VERIFY_ERROR_INSTANTIATION:
+      case VERIFY_ERROR_FILLED_NEW_ARRAY:
       case VERIFY_ERROR_CLASS_CHANGE: {
         PotentiallyMarkRuntimeThrow();
         break;
