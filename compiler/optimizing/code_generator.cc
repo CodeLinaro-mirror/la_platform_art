@@ -645,7 +645,7 @@ void CodeGenerator::CreateUnresolvedFieldLocationSummary(
   bool is_get = field_access->IsUnresolvedInstanceFieldGet()
       || field_access->IsUnresolvedStaticFieldGet();
 
-  ArenaAllocator* allocator = GetGraph()->GetAllocator();
+  ArenaAllocator* allocator = field_access->GetBlock()->GetGraph()->GetAllocator();
   LocationSummary* locations =
       new (allocator) LocationSummary(field_access, LocationSummary::kCallOnMainOnly);
 

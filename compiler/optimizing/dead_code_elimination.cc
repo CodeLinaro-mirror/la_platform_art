@@ -201,7 +201,7 @@ static bool RemoveNonNullControlDependences(HBasicBlock* block, HBasicBlock* thr
           user_block != throws &&
           block->Dominates(user_block)) {
         if (bound == nullptr) {
-          bound = new (block->GetGraph()->GetAllocator()) HBoundType(obj);
+          bound = new (obj->GetBlock()->GetGraph()->GetAllocator()) HBoundType(obj);
           bound->SetUpperBound(ti, /*can_be_null*/ false);
           bound->SetReferenceTypeInfo(ti);
           bound->SetCanBeNull(false);
@@ -591,15 +591,14 @@ void HDeadCodeElimination::ConnectSuccessiveBlocks() {
 
 struct HDeadCodeElimination::TryBelongingInformation {
   TryBelongingInformation(HGraph* graph, ScopedArenaAllocator* allocator)
-      : blocks_in_try(ArenaBitVector::CreateFixedSize(
-            allocator, graph->GetBlocks().size(), kArenaAllocDCE)),
-        coalesced_try_entries(ArenaBitVector::CreateFixedSize(
-            allocator, graph->GetBlocks().size(), kArenaAllocDCE)) {}
+      : blocks_in_try(allocator, graph->GetBlocks().size(), /*expandable=*/false, kArenaAllocDCE),
+        coalesced_try_entries(
+            allocator, graph->GetBlocks().size(), /*expandable=*/false, kArenaAllocDCE) {}
 
   // Which blocks belong in the try.
-  BitVectorView<size_t> blocks_in_try;
+  ArenaBitVector blocks_in_try;
   // Which other try entries are referencing this same try.
-  BitVectorView<size_t> coalesced_try_entries;
+  ArenaBitVector coalesced_try_entries;
 };
 
 bool HDeadCodeElimination::CanPerformTryRemoval(const TryBelongingInformation& try_belonging_info) {
@@ -726,7 +725,7 @@ bool HDeadCodeElimination::RemoveUnneededTries() {
       if (try_boundary->HasSameExceptionHandlersAs(*other_try_boundary)) {
         // Merge the entries as they are really the same one.
         // Block merging.
-        it->second.blocks_in_try.Union(other_it->second.blocks_in_try);
+        it->second.blocks_in_try.Union(&other_it->second.blocks_in_try);
 
         // Add the coalesced try entry to update it too.
         it->second.coalesced_try_entries.SetBit(other_block->GetBlockId());

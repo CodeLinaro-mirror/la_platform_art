@@ -198,7 +198,7 @@ void IntrinsicVisitor::CreateReferenceRefersToLocations(HInvoke* invoke, CodeGen
     return;
   }
 
-  ArenaAllocator* allocator = codegen->GetGraph()->GetAllocator();
+  ArenaAllocator* allocator = invoke->GetBlock()->GetGraph()->GetAllocator();
   LocationSummary* locations =
       new (allocator) LocationSummary(invoke, LocationSummary::kCallOnSlowPath, kIntrinsified);
   locations->SetInAt(0, Location::RequiresRegister());

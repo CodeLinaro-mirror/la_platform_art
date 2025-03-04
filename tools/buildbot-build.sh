@@ -16,8 +16,6 @@
 
 set -e
 
-export LC_ALL=C  # Generic simple locale
-
 . "$(dirname $0)/buildbot-utils.sh"
 
 shopt -s failglob

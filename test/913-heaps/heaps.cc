@@ -1119,8 +1119,6 @@ static jint JNICALL HeapIterationExtCallback([[maybe_unused]] jlong class_tag,
   return 0;
 }
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcast-function-type-mismatch"
 extern "C" JNIEXPORT void JNICALL Java_art_Test913_iterateThroughHeapExt(
     JNIEnv* env, [[maybe_unused]] jclass klass) {
   CHECK(gIterateThroughHeapExt != nullptr);
@@ -1134,7 +1132,6 @@ extern "C" JNIEXPORT void JNICALL Java_art_Test913_iterateThroughHeapExt(
   JvmtiErrorToException(env, jvmti_env, ret);
   CHECK(gFoundExt);
 }
-#pragma clang diagnostic pop
 
 extern "C" JNIEXPORT jboolean JNICALL Java_art_Test913_checkInitialized(JNIEnv* env, jclass, jclass c) {
   jint status;

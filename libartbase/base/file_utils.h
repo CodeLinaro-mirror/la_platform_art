@@ -197,6 +197,9 @@ bool LocationIsOnArtApexData(std::string_view location);
 // Return whether the location is on /apex/com.android.conscrypt
 bool LocationIsOnConscryptModule(std::string_view location);
 
+// Return whether the location is on /apex/com.android.i18n
+bool LocationIsOnI18nModule(std::string_view location);
+
 // Return whether the location is on system (i.e. android root).
 bool LocationIsOnSystem(const std::string& location);
 

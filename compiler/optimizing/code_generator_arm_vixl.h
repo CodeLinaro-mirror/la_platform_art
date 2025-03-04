@@ -204,12 +204,11 @@ ALWAYS_INLINE inline StoreOperandType GetStoreOperandType(DataType::Type type) {
 
 class JumpTableARMVIXL : public DeletableArenaObject<kArenaAllocSwitchTable> {
  public:
-  JumpTableARMVIXL(HPackedSwitch* switch_instr, ArenaAllocator* allocator)
+  explicit JumpTableARMVIXL(HPackedSwitch* switch_instr)
       : switch_instr_(switch_instr),
         table_start_(),
-        bb_addresses_(allocator->Adapter(kArenaAllocCodeGenerator)) {
+        bb_addresses_(switch_instr->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
     uint32_t num_entries = switch_instr_->GetNumEntries();
-    bb_addresses_.reserve(num_entries);
     for (uint32_t i = 0; i < num_entries; i++) {
       VIXLInt32Literal *lit = new VIXLInt32Literal(0, vixl32::RawLiteral::kManuallyPlaced);
       bb_addresses_.emplace_back(lit);
@@ -884,8 +883,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   void GenerateExplicitNullCheck(HNullCheck* instruction) override;
 
   JumpTableARMVIXL* CreateJumpTable(HPackedSwitch* switch_instr) {
-    ArenaAllocator* allocator = GetGraph()->GetAllocator();
-    jump_tables_.emplace_back(new (allocator) JumpTableARMVIXL(switch_instr, allocator));
+    jump_tables_.emplace_back(new (GetGraph()->GetAllocator()) JumpTableARMVIXL(switch_instr));
     return jump_tables_.back().get();
   }
   void EmitJumpTables();
