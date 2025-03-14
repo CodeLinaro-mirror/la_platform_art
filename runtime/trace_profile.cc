@@ -58,7 +58,9 @@ static constexpr size_t kProfileMagicValue = 0x4C4F4D54;
 // TODO(mythria): 10 is a randomly chosen value. Tune it if required.
 static constexpr size_t kBufSizeForEncodedData = kMinBufSizeForEncodedData * 10;
 
-static constexpr size_t kAlwaysOnTraceHeaderSize = 8;
+static constexpr size_t kAlwaysOnTraceHeaderSize = 12;
+static constexpr size_t kAlwaysOnMethodInfoHeaderSize = 11;
+static constexpr size_t kAlwaysOnThreadInfoHeaderSize = 7;
 
 bool TraceProfiler::profile_in_progress_ = false;
 
@@ -198,7 +200,7 @@ void RecordMethodsOnThreadStack(Thread* thread, uintptr_t* method_trace_buffer)
   // Record a placeholder method exit event into the buffer so we record method exits for the
   // methods that are currently on stack.
   method_trace_buffer[index] = 0x1;
-  thread->SetMethodTraceBufferCurrentEntry(index);
+  thread->SetMethodTraceBuffer(method_trace_buffer, index);
 }
 
 // Records the thread and method info.
@@ -206,19 +208,26 @@ void DumpThreadMethodInfo(const std::unordered_map<size_t, std::string>& traced_
                           const std::unordered_set<ArtMethod*>& traced_methods,
                           std::ostringstream& os) REQUIRES_SHARED(Locks::mutator_lock_) {
   // Dump data about thread information.
-  os << "\n*threads\n";
   for (const auto& it : traced_threads) {
-    os << it.first << "\t" << it.second << "\n";
+    uint8_t thread_header[kAlwaysOnThreadInfoHeaderSize];
+    thread_header[0] = kThreadInfoHeaderV2;
+    Append4LE(thread_header + 1, it.first);
+    Append2LE(thread_header + 5, it.second.length());
+    os.write(reinterpret_cast<char*>(thread_header), kAlwaysOnThreadInfoHeaderSize);
+    os.write(it.second.c_str(), it.second.length());
   }
 
   // Dump data about method information.
-  os << "*methods\n";
   for (ArtMethod* method : traced_methods) {
-    ArtMethod* method_ptr = reinterpret_cast<ArtMethod*>(method);
-    os << method_ptr << "\t" << GetMethodInfoLine(method);
+    std::string method_line = GetMethodInfoLine(method);
+    uint16_t method_line_length = static_cast<uint16_t>(method_line.length());
+    uint8_t method_header[kAlwaysOnMethodInfoHeaderSize];
+    method_header[0] = kMethodInfoHeaderV2;
+    Append8LE(method_header + 1, reinterpret_cast<uint64_t>(method));
+    Append2LE(method_header + 9, method_line_length);
+    os.write(reinterpret_cast<char*>(method_header), kAlwaysOnMethodInfoHeaderSize);
+    os.write(method_line.c_str(), method_line_length);
   }
-
-  os << "*end";
 }
 }  // namespace
 
@@ -236,7 +245,6 @@ static class LongRunningMethodsTraceStartCheckpoint final : public Closure {
     // Record methods that are currently on stack.
     RecordMethodsOnThreadStack(thread, buffer);
     thread->UpdateTlsLowOverheadTraceEntrypoints(LowOverheadTraceType::kLongRunningMethods);
-    thread->SetMethodTraceBuffer(buffer, kAlwaysOnTraceBufSize);
   }
 } long_running_methods_checkpoint_;
 
@@ -509,12 +517,17 @@ size_t TraceProfiler::DumpLongRunningMethodBuffer(uint32_t thread_id,
   size_t end_index = end_trace_entries - method_trace_entries;
   for (size_t i = kAlwaysOnTraceBufSize - 1; i >= end_index;) {
     uintptr_t event = method_trace_entries[i--];
+    if (event == 0x1) {
+      // This is a placeholder event. Ignore this event.
+      continue;
+    }
+
     bool is_method_exit = event & 0x1;
     uint64_t timestamp_action_encoding;
     uintptr_t method_ptr;
     if (is_method_exit) {
       // Method exit. We only have timestamp here.
-      timestamp_action_encoding = event & ~1;
+      timestamp_action_encoding = event;
     } else {
       // method entry
       method_ptr = event;
@@ -522,26 +535,29 @@ size_t TraceProfiler::DumpLongRunningMethodBuffer(uint32_t thread_id,
     }
 
     int64_t timestamp_action_diff = timestamp_action_encoding - prev_timestamp_action_encoding;
-    int64_t method_diff;
+    curr_buffer_ptr = EncodeSignedLeb128(curr_buffer_ptr, timestamp_action_diff);
+    prev_timestamp_action_encoding = timestamp_action_encoding;
+
     if (!is_method_exit) {
-      method_diff = method_ptr - prev_method_ptr;
+      int64_t method_diff = method_ptr - prev_method_ptr;
       ArtMethod* method = reinterpret_cast<ArtMethod*>(method_ptr);
       methods.insert(method);
       prev_method_ptr = method_ptr;
       curr_buffer_ptr = EncodeSignedLeb128(curr_buffer_ptr, method_diff);
     }
-    curr_buffer_ptr = EncodeSignedLeb128(curr_buffer_ptr, timestamp_action_diff);
     num_records++;
-    prev_timestamp_action_encoding = timestamp_action_encoding;
   }
 
   // Fill in header information:
   // 1 byte of header identifier
   // 4 bytes of thread_id
   // 3 bytes of number of records
+  // 4 bytes the size of the data
   buffer[0] = kEntryHeaderV2;
   Append4LE(buffer + 1, thread_id);
   Append3LE(buffer + 5, num_records);
+  size_t size = curr_buffer_ptr - buffer;
+  Append4LE(buffer + 8, size - kAlwaysOnTraceHeaderSize);
   return curr_buffer_ptr - buffer;
 }
 
