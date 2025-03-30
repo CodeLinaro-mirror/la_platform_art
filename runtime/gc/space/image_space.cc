@@ -26,6 +26,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "android-base/logging.h"
@@ -1967,9 +1968,9 @@ bool ImageSpace::BootImageLayout::CompileBootclasspathElements(
   std::string art_filename = ExpandLocation(base_filename, bcp_index);
   std::string vdex_filename = ImageHeader::GetVdexLocationFromImageLocation(art_filename);
   std::string oat_filename = ImageHeader::GetOatLocationFromImageLocation(art_filename);
-  android::base::unique_fd art_fd(memfd_create_compat(art_filename.c_str(), /*flags=*/ 0));
-  android::base::unique_fd vdex_fd(memfd_create_compat(vdex_filename.c_str(), /*flags=*/ 0));
-  android::base::unique_fd oat_fd(memfd_create_compat(oat_filename.c_str(), /*flags=*/ 0));
+  android::base::unique_fd art_fd(memfd_create(art_filename.c_str(), /*flags=*/ 0));
+  android::base::unique_fd vdex_fd(memfd_create(vdex_filename.c_str(), /*flags=*/ 0));
+  android::base::unique_fd oat_fd(memfd_create(oat_filename.c_str(), /*flags=*/ 0));
   if (art_fd.get() == -1 || vdex_fd.get() == -1 || oat_fd.get() == -1) {
     *error_msg = StringPrintf("Failed to create memfd handles for compiling bootclasspath for %s",
                               boot_class_path_locations_[bcp_index].c_str());
@@ -3415,31 +3416,39 @@ void ImageSpace::Dump(std::ostream& os) const {
       << ",name=\"" << GetName() << "\"]";
 }
 
-bool ImageSpace::ValidateApexVersions(const OatHeader& oat_header,
-                                      const std::string& apex_versions,
-                                      const std::string& file_location,
+bool ImageSpace::ValidateApexVersions(const OatFile& oat_file,
+                                      std::string_view runtime_apex_versions,
                                       std::string* error_msg) {
   // For a boot image, the key value store only exists in the first OAT file. Skip other OAT files.
-  if (oat_header.GetKeyValueStoreSize() == 0) {
+  if (oat_file.GetOatHeader().GetKeyValueStoreSize() == 0) {
     return true;
   }
 
-  const char* oat_apex_versions = oat_header.GetStoreValueByKey(OatHeader::kApexVersionsKey);
-  if (oat_apex_versions == nullptr) {
+  std::optional<std::string_view> oat_apex_versions = oat_file.GetApexVersions();
+  if (!oat_apex_versions.has_value()) {
     *error_msg = StringPrintf("ValidateApexVersions failed to get APEX versions from oat file '%s'",
-                              file_location.c_str());
+                              oat_file.GetLocation().c_str());
     return false;
   }
+
+  return ValidateApexVersions(
+      *oat_apex_versions, runtime_apex_versions, oat_file.GetLocation(), error_msg);
+}
+
+bool ImageSpace::ValidateApexVersions(std::string_view oat_apex_versions,
+                                      std::string_view runtime_apex_versions,
+                                      const std::string& file_location,
+                                      std::string* error_msg) {
   // For a boot image, it can be generated from a subset of the bootclasspath.
   // For an app image, some dex files get compiled with a subset of the bootclasspath.
   // For such cases, the OAT APEX versions will be a prefix of the runtime APEX versions.
-  if (!apex_versions.starts_with(oat_apex_versions)) {
-    *error_msg = StringPrintf(
-        "ValidateApexVersions found APEX versions mismatch between oat file '%s' and the runtime "
-        "(Oat file: '%s', Runtime: '%s')",
-        file_location.c_str(),
+  if (!runtime_apex_versions.starts_with(oat_apex_versions)) {
+    *error_msg = ART_FORMAT(
+        "ValidateApexVersions found APEX versions mismatch between oat file '{}' and the runtime "
+        "(Oat file: '{}', Runtime: '{}')",
+        file_location,
         oat_apex_versions,
-        apex_versions.c_str());
+        runtime_apex_versions);
     return false;
   }
   return true;
@@ -3455,10 +3464,7 @@ bool ImageSpace::ValidateOatFile(const OatFile& oat_file,
                                  ArrayRef<const std::string> dex_filenames,
                                  ArrayRef<File> dex_files,
                                  const std::string& apex_versions) {
-  if (!ValidateApexVersions(oat_file.GetOatHeader(),
-                            apex_versions,
-                            oat_file.GetLocation(),
-                            error_msg)) {
+  if (!ValidateApexVersions(oat_file, apex_versions, error_msg)) {
     return false;
   }
 
