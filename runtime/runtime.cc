@@ -58,7 +58,7 @@
 #include "base/dumpable.h"
 #include "base/file_utils.h"
 #include "base/flags.h"
-#include "base/malloc_arena_pool.h"
+#include "base/calloc_arena_pool.h"
 #include "base/mem_map_arena_pool.h"
 #include "base/memory_tool.h"
 #include "base/mutex.h"
@@ -1887,8 +1887,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // can't be trimmed as easily.
   const bool use_malloc = IsAotCompiler();
   if (use_malloc) {
-    arena_pool_.reset(new MallocArenaPool());
-    jit_arena_pool_.reset(new MallocArenaPool());
+    arena_pool_.reset(new CallocArenaPool());
+    jit_arena_pool_.reset(new CallocArenaPool());
   } else {
     arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ false));
     jit_arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ false, "CompilerMetadata"));
@@ -3151,6 +3151,17 @@ void Runtime::UpdateProcessState(ProcessState process_state) {
   ProcessState old_process_state = process_state_;
   process_state_ = process_state;
   GetHeap()->UpdateProcessState(old_process_state, process_state);
+
+  // When the application switches to the foreground, lock contention on classlinker_classes_lock_
+  // and priority inversion occasionally occur. Delay profile saving on hot/warm startup can reduce
+  // the occurrence of the problem. This feature depends on whether the
+  // jank_perceptible_narrow flag is enabled, which is only implemented and enabled on Android 16
+  // and above.On older Android versions, the process is always in kProcessStateJankPerceptible as
+  // long as it is not cached, so the profile saving delay is not applicable.
+  if (IsSdkVersionSetAndAtLeast(sdk_version_, SdkVersion::kB) &&
+      process_state == kProcessStateJankPerceptible) {
+    ProfileSaver::NotifyDelayProfileSaving();
+  }
 }
 
 void Runtime::RegisterSensitiveThread() const {
