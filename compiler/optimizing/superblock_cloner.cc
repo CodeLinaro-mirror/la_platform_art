@@ -269,7 +269,13 @@ void SuperblockCloner::FindBackEdgesLocal(HBasicBlock* entry_block, ArenaBitVect
 
       if (visiting.IsBitSet(successor_id)) {
         DCHECK(ContainsElement(worklist, successor));
-        successor->AddBackEdgeWhileUpdating(current);
+        // Register a back edge; if the `successor` was not a loop header, or if its loop info
+        // points to the cloned source loop header, associate a newly created loop info with it.
+        if (successor->GetLoopInformation() == nullptr ||
+            successor->GetLoopInformation()->GetHeader() != successor) {
+          successor->SetLoopInformation(new (arena_) HLoopInformation(successor, graph_));
+        }
+        successor->GetLoopInformation()->AddBackEdge(current);
       } else if (!visited.IsBitSet(successor_id)) {
         visited.SetBit(successor_id);
         visiting.SetBit(successor_id);
@@ -445,7 +451,7 @@ void SuperblockCloner::FindAndSetLocalAreaForAdjustments() {
 
   if (outer_loop_ != nullptr) {
     // Save the loop population info as it will be changed later.
-    outer_loop_bb_set_.Copy(&outer_loop_->GetBlocks());
+    outer_loop_bb_set_.Copy(&outer_loop_->GetBlockMask());
   }
 }
 
@@ -876,7 +882,7 @@ bool SuperblockCloner::IsFastCase() const {
   }
 
   // Check that orig_bb_set_ corresponds to loop peeling/unrolling.
-  if (common_loop_info == nullptr || !orig_bb_set_.SameBitsSet(&common_loop_info->GetBlocks())) {
+  if (common_loop_info == nullptr || !orig_bb_set_.SameBitsSet(&common_loop_info->GetBlockMask())) {
     return false;
   }
 
