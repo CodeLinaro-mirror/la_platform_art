@@ -319,8 +319,11 @@ bool ShouldUseGenerationalGC() {
   // can pick a different values than zygote and will be able to execute.
   return GetBoolProperty("persist.device_config.runtime_native_boot.use_generational_gc", true);
 }
+// Inter-Processor Interrupts (IPI), which are used for TLB flush, are very slow on
+// virtual devices, like cuttlefish. Therefore, we don't use MOVE ioctl on such devices.
 static const bool gMoveIoctlRequested =
     com::android::art::flags::use_uffd_move_ioctl() &&
+    android::base::GetProperty("ro.hardware.virtual_device", "") != "1" &&
     GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true);
 #else
 bool ShouldUseGenerationalGC() { return true; }
@@ -791,6 +794,7 @@ void MarkCompact::InitializePhase() {
   black_page_count_ = 0;
   bytes_scanned_ = 0;
   freed_objects_ = 0;
+  conc_compaction_started_ = false;
   // The first buffer is used by gc-thread.
   compaction_buffer_counter_.store(1, std::memory_order_relaxed);
   black_allocations_begin_ = bump_pointer_space_->Limit();
@@ -2950,7 +2954,7 @@ size_t MarkCompact::ZeropageIoctl(void* addr,
   }
 }
 
-size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_enoent) {
+size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_einval) {
   DCHECK_ALIGNED_PARAM(dst, gPageSize);
   DCHECK_ALIGNED_PARAM(src, gPageSize);
   DCHECK_ALIGNED_PARAM(len, gPageSize);
@@ -2959,6 +2963,7 @@ size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_en
                                .len = len,
                                .mode = 0,
                                .move = 0};
+  uint32_t ebusy_iters = 0;
   while (ioctl(uffd_, UFFDIO_MOVE, &uffd_move) != 0) {
     if (errno == EEXIST) {
       DCHECK_EQ(uffd_move.move, -EEXIST);
@@ -2980,7 +2985,7 @@ size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_en
       } else {
         break;
       }
-    } else if (errno == EINVAL && tolerate_enoent) {
+    } else if (errno == EINVAL && tolerate_einval) {
       // Unlike other ioctls, MOVE returns EINVAL when the memory range is found
       // to be not registered with userfaultfd context associated with 'uffd_'
       // file descriptor.
@@ -2989,19 +2994,24 @@ size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_en
       }
       break;
     } else if (errno == EBUSY) {
-      // There are a couple of situations in which MOVE ioctl can return EBUSY.
-      // The most relevant to this GC is where the page is not exclusively
-      // mapped in the process. This can happen if the page is Copy-on-Write
-      // shared with another process (like zygote), or if the page is in the
-      // process of getting swapped out. Both these situations can be handled
-      // by writing to the page. However, the page is shared by multiple
-      // threads. So we use a CAS to make sure we don't corrupt the data on it.
-      // We rely on the fact that a compare-and-exchange instruction causes the
-      // page to be exclusively mapped, even when the store isn't performed.
-      auto atomic_src = std::atomic_ref<size_t>(*static_cast<size_t*>(src));
-      size_t expected = 0;
-      atomic_src.compare_exchange_strong(expected, 0, std::memory_order_relaxed);
-      uffd_move.move = 0;
+      // The ioctl returns EBUSY for a couple of reasons. The most common is
+      // where a page is being written-back to the swap. Ideally, we should just
+      // wait a little and retry. However, for mutators that's not a good idea
+      // as they are jank sensitive as well as maybe runnable and hence waiting
+      // may delay responding to suspension requests. With COPY ioctl we can be
+      // sure that it will succeed.
+      // GC-thread, on the other hand, can wait. The exception being when it
+      // causes SIGBUS during thread-flips. Also, waiting for really long is
+      // undesirable.
+      Thread* self = Thread::Current();
+      if (self == thread_running_gc_ && conc_compaction_started_ && ebusy_iters < 10) {
+        DCHECK_NE(self->GetState(), ThreadState::kRunnable);
+        BackOff</*kYieldMax=*/5, /*kSleepUs=*/1000>(ebusy_iters++);
+        uffd_move.move = 0;
+      } else {
+        uffd_move.move = CopyIoctl(dst, src, gPageSize, true, tolerate_einval);
+        break;
+      }
     } else {
       CHECK_EQ(uffd_move.move, -errno);
       LOG(FATAL) << "ioctl_userfaultfd: move failed: " << strerror(errno) << ". src:" << src
@@ -3868,16 +3878,36 @@ void MarkCompact::UpdateNonMovingSpaceBlackAllocations() {
 
 class MarkCompact::ImmuneSpaceUpdateObjVisitor {
  public:
-  explicit ImmuneSpaceUpdateObjVisitor(MarkCompact* collector) : collector_(collector) {}
+  ImmuneSpaceUpdateObjVisitor(MarkCompact* collector, bool visit_native_roots)
+      : collector_(collector),
+        moving_space_begin_(collector->black_dense_end_),
+        moving_space_end_(collector->moving_space_end_),
+        visit_native_roots_(visit_native_roots) {}
 
   void operator()(mirror::Object* obj) const ALWAYS_INLINE
       REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
-    RefsUpdateVisitor</*kCheckBegin*/false, /*kCheckEnd*/false> visitor(collector_,
-                                                                        obj,
-                                                                        /*begin_*/nullptr,
-                                                                        /*end_*/nullptr);
-    collector_->UpdateRefsForCompaction</*kFetchObjSize=*/false, /*kObjInBlackDense=*/false>(
-        obj, visitor, MemberOffset(0), MemberOffset(-1));
+    obj->VisitReferences<false, kVerifyNone, kWithoutReadBarrier>(*this, *this);
+    // We only need to visit native-roots of dirty dex-caches. Furthermore, only
+    // those native dex-cache arrays need to be visited in the compaction pause
+    // which are allocated before zygote-fork, as the others are visited later
+    // concurrently. We identify the post-zygote native-roots using the ranges
+    // listed in 'linear_alloc_spaces_data_'.
+    if (visit_native_roots_ && obj->IsDexCache()) {
+      auto should_visit = [this](void* ptr) {
+        if (ptr == nullptr) {
+          return false;
+        }
+        for (auto& data : collector_->linear_alloc_spaces_data_) {
+          // Ensure native-roots array is not in any of the post-zygote-fork
+          // linear-alloc spaces (usually there is only one).
+          if (static_cast<uint8_t*>(ptr) >= data.begin_ && static_cast<uint8_t*>(ptr) < data.end_) {
+            return false;
+          }
+        }
+        return true;
+      };
+      obj->AsDexCache()->VisitNativeRoots<kVerifyNone, kWithoutReadBarrier>(*this, should_visit);
+    }
   }
 
   static void Callback(mirror::Object* obj, void* arg)
@@ -3885,8 +3915,38 @@ class MarkCompact::ImmuneSpaceUpdateObjVisitor {
     reinterpret_cast<ImmuneSpaceUpdateObjVisitor*>(arg)->operator()(obj);
   }
 
+  void operator()(mirror::Object* obj,
+                  MemberOffset offset,
+                  [[maybe_unused]] bool is_static) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES_SHARED(Locks::heap_bitmap_lock_) {
+    collector_->UpdateRef(obj, offset, moving_space_begin_, moving_space_end_);
+  }
+
+  void operator()([[maybe_unused]] ObjPtr<mirror::Class> klass,
+                  ObjPtr<mirror::Reference> ref) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES_SHARED(Locks::heap_bitmap_lock_) {
+    collector_->UpdateRef(
+        ref.Ptr(), mirror::Reference::ReferentOffset(), moving_space_begin_, moving_space_end_);
+  }
+
+  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(!visit_native_roots_);
+    collector_->UpdateRoot(root, moving_space_begin_, moving_space_end_);
+  }
+
  private:
   MarkCompact* const collector_;
+  uint8_t* const moving_space_begin_;
+  uint8_t* const moving_space_end_;
+  bool visit_native_roots_;
 };
 
 class MarkCompact::ClassLoaderRootsUpdater : public ClassLoaderVisitor {
@@ -4115,7 +4175,6 @@ void MarkCompact::CompactionPause() {
                        + thread_running_gc_->GetUsableStackSize<kNativeStackType>();
   }
   {
-    TimingLogger::ScopedTiming t2("(Paused)UpdateCompactionDataStructures", GetTimings());
     ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
     // Refresh data-structures to catch-up on allocations that may have
     // happened since marking-phase pause.
@@ -4144,6 +4203,7 @@ void MarkCompact::CompactionPause() {
     // Start updating roots and system weaks now.
     heap_->GetReferenceProcessor()->UpdateRoots(this);
   }
+  bool has_zygote_space = heap_->HasZygoteSpace();
   {
     // TODO: Immune space updation has to happen either before or after
     // remapping pre-compact pages to from-space. And depending on when it's
@@ -4159,7 +4219,7 @@ void MarkCompact::CompactionPause() {
       // place and that the classes/dex-caches in immune-spaces may have allocations
       // (ArtMethod/ArtField arrays, dex-cache array, etc.) in the
       // non-userfaultfd visited private-anonymous mappings. Visit them here.
-      ImmuneSpaceUpdateObjVisitor visitor(this);
+      ImmuneSpaceUpdateObjVisitor visitor(this, has_zygote_space);
       if (table != nullptr) {
         table->ProcessCards();
         table->VisitObjects(ImmuneSpaceUpdateObjVisitor::Callback, &visitor);
@@ -4176,7 +4236,6 @@ void MarkCompact::CompactionPause() {
   }
 
   {
-    TimingLogger::ScopedTiming t2("(Paused)UpdateRoots", GetTimings());
     runtime->VisitConcurrentRoots(this, kVisitRootFlagAllRoots);
     runtime->VisitNonThreadRoots(this);
     {
@@ -4188,7 +4247,6 @@ void MarkCompact::CompactionPause() {
     }
     SweepSystemWeaks(thread_running_gc_, runtime, /*paused=*/true);
 
-    bool has_zygote_space = heap_->HasZygoteSpace();
     GcVisitedArenaPool* arena_pool =
         static_cast<GcVisitedArenaPool*>(runtime->GetLinearAllocArenaPool());
     // Update immune/pre-zygote class-tables in case class redefinition took
@@ -4244,12 +4302,12 @@ void MarkCompact::CompactionPause() {
               REQUIRES_SHARED(Locks::mutator_lock_) {
             // The pre-zygote fork arenas are not visited concurrently in the
             // zygote children processes. The native roots of the dirty objects
-            // are visited during immune space visit below.
+            // are visited during immune space visit above.
             if (!arena.IsPreZygoteForkArena()) {
               uint8_t* last_byte = arena.GetLastUsedByte();
               auto ret = linear_alloc_arenas_.insert({&arena, last_byte});
               CHECK(ret.second);
-            } else if (!arena.IsSingleObjectArena() || !has_zygote_space) {
+            } else if (!has_zygote_space) {
               // Pre-zygote class-table and intern-table don't need to be updated.
               // TODO: Explore the possibility of using /proc/self/pagemap to
               // fetch which pages in these arenas are private-dirty and then only
@@ -4312,49 +4370,65 @@ void MarkCompact::KernelPreparation() {
   TimingLogger::ScopedTiming t("(Paused)KernelPreparation", GetTimings());
   uint8_t* moving_space_begin = bump_pointer_space_->Begin();
   size_t moving_space_size = bump_pointer_space_->Capacity();
-  size_t moving_space_register_sz = (moving_first_objs_count_ + black_page_count_) * gPageSize;
-  DCHECK_LE(moving_space_register_sz, moving_space_size);
+  // When using MOVE ioctl, we can serve new-page fault requests using the
+  // recycled pages. This helps in many ways:
+  // 1. madvise overhead gets reduced. This is particularly helpful when the
+  // gc-thread is not getting enough cpu-time due to CPU contention. We hold on
+  // to from-space pages. This way we avoid increasing RSS at an already
+  // constraint time for the device.
+  // 2. Simplify the userfaultfd registration. As explained in the following
+  // comments, anon_vma issue arises when not registering the entire VMA.
+  // Furthermore, we avoid the need for madvise to ensure that the moving space
+  // is entirely unmapped. We can use the same trick that we use for
+  // linear-alloc (uffd register first and then mremap).
+  if (use_move_ioctl_ && IsValidFd(uffd_)) {
+    RegisterUffd(moving_space_begin, moving_space_size);
+  }
 
   KernelPrepareRangeForUffd(moving_space_begin, from_space_begin_, moving_space_size);
 
   if (IsValidFd(uffd_)) {
-    if (moving_space_register_sz > 0) {
-      // mremap clears 'anon_vma' field of anonymous mappings. If we
-      // uffd-register only the used portion of the space, then the vma gets
-      // split (between used and unused portions) and as soon as pages are
-      // mapped to the vmas, they get different `anon_vma` assigned, which
-      // ensures that the two vmas cannot merge after we uffd-unregister the
-      // used portion. OTOH, registering the entire space avoids the split, but
-      // unnecessarily causes userfaults on allocations.
-      // By faulting-in a page we force the kernel to allocate 'anon_vma' *before*
-      // the vma-split in uffd-register. This ensures that when we unregister
-      // the used portion after compaction, the two split vmas merge. This is
-      // necessary for the mremap of the next GC cycle to not fail due to having
-      // more than one vma in the source range.
-      //
-      // Fault in address aligned to PMD size so that in case THP is enabled,
-      // we don't mistakenly fault a page in beginning portion that will be
-      // registered with uffd. If the alignment takes us beyond the space, then
-      // fault the first page and madvise it.
-      size_t pmd_size = Heap::GetPMDSize();
-      uint8_t* fault_in_addr = AlignUp(moving_space_begin + moving_space_register_sz, pmd_size);
-      if (bump_pointer_space_->Contains(reinterpret_cast<mirror::Object*>(fault_in_addr))) {
-        *const_cast<volatile uint8_t*>(fault_in_addr) = 0;
-      } else {
-        DCHECK_ALIGNED_PARAM(moving_space_begin, gPageSize);
-        *const_cast<volatile uint8_t*>(moving_space_begin) = 0;
-        madvise(moving_space_begin, pmd_size, MADV_DONTNEED);
+    if (!use_move_ioctl_) {
+      size_t moving_space_register_sz = (moving_first_objs_count_ + black_page_count_) * gPageSize;
+      DCHECK_LE(moving_space_register_sz, moving_space_size);
+      if (moving_space_register_sz > 0) {
+        // mremap clears 'anon_vma' field of anonymous mappings. If we
+        // uffd-register only the used portion of the space, then the vma gets
+        // split (between used and unused portions) and as soon as pages are
+        // mapped to the vmas, they get different `anon_vma` assigned, which
+        // ensures that the two vmas cannot merge after we uffd-unregister the
+        // used portion. OTOH, registering the entire space avoids the split, but
+        // unnecessarily causes userfaults on allocations.
+        // By faulting-in a page we force the kernel to allocate 'anon_vma' *before*
+        // the vma-split in uffd-register. This ensures that when we unregister
+        // the used portion after compaction, the two split vmas merge. This is
+        // necessary for the mremap of the next GC cycle to not fail due to having
+        // more than one vma in the source range.
+        //
+        // Fault in address aligned to PMD size so that in case THP is enabled,
+        // we don't mistakenly fault a page in beginning portion that will be
+        // registered with uffd. If the alignment takes us beyond the space, then
+        // fault the first page and madvise it.
+        size_t pmd_size = Heap::GetPMDSize();
+        uint8_t* fault_in_addr = AlignUp(moving_space_begin + moving_space_register_sz, pmd_size);
+        if (bump_pointer_space_->Contains(reinterpret_cast<mirror::Object*>(fault_in_addr))) {
+          *const_cast<volatile uint8_t*>(fault_in_addr) = 0;
+        } else {
+          DCHECK_ALIGNED_PARAM(moving_space_begin, gPageSize);
+          *const_cast<volatile uint8_t*>(moving_space_begin) = 0;
+          madvise(moving_space_begin, pmd_size, MADV_DONTNEED);
+        }
+        // Register the moving space with userfaultfd.
+        RegisterUffd(moving_space_begin, moving_space_register_sz);
+        // madvise ensures that if any page gets mapped (only possible if some
+        // thread is reading the page(s) without trying to make sense as we hold
+        // mutator-lock exclusively) between mremap and uffd-registration, then
+        // it gets zapped so that the map is empty and ready for userfaults. If
+        // we could mremap after uffd-registration (like in case of linear-alloc
+        // space below) then we wouldn't need it. But since we don't register the
+        // entire space, we can't do that.
+        madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
       }
-      // Register the moving space with userfaultfd.
-      RegisterUffd(moving_space_begin, moving_space_register_sz);
-      // madvise ensures that if any page gets mapped (only possible if some
-      // thread is reading the page(s) without trying to make sense as we hold
-      // mutator-lock exclusively) between mremap and uffd-registration, then
-      // it gets zapped so that the map is empty and ready for userfaults. If
-      // we could mremap after uffd-registration (like in case of linear-alloc
-      // space below) then we wouldn't need it. But since we don't register the
-      // entire space, we can't do that.
-      madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
     }
     // Prepare linear-alloc for concurrent compaction.
     for (auto& data : linear_alloc_spaces_data_) {
@@ -4482,6 +4556,18 @@ bool MarkCompact::SigbusHandler(siginfo_t* info) {
   }
 }
 
+size_t MarkCompact::ZeroAndMoveFreePage(uint8_t* dst, bool tolerate_einval) {
+  DCHECK(use_move_ioctl_);
+  uint8_t* free_page = GetFreePagesForMapping(gPageSize, /*atomic=*/true);
+  if (free_page != nullptr) {
+    DCHECK_ALIGNED_PARAM(free_page, gPageSize);
+    free_page += from_space_slide_diff_;
+    std::memset(free_page, 0x0, gPageSize);
+    return MoveIoctl(dst, free_page, gPageSize, tolerate_einval);
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
 void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                                                 uint8_t* buf,
                                                 size_t nr_moving_space_used_pages,
@@ -4489,11 +4575,17 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
   Thread* self = Thread::Current();
   uint8_t* unused_space_begin = moving_space_begin_ + nr_moving_space_used_pages * gPageSize;
   DCHECK(IsAlignedParam(unused_space_begin, gPageSize));
+  DCHECK_ALIGNED_PARAM(fault_page, gPageSize);
   if (fault_page >= unused_space_begin) {
-    // There is a race which allows more than one thread to install a
-    // zero-page. But we can tolerate that. So absorb the EEXIST returned by
-    // the ioctl and move on.
-    ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    // MoveIoctl() returns 0 if the VMA gets unregistered from uffd, in which
+    // case, we should just return from the signal handler.
+    if (!use_move_ioctl_ ||
+        ZeroAndMoveFreePage(fault_page, tolerate_enoent) == std::numeric_limits<size_t>::max()) {
+      // There is a race which allows more than one thread to install a
+      // zero-page. But we can tolerate that. So absorb the EEXIST returned by
+      // the ioctl and move on.
+      ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    }
     return;
   }
   size_t page_idx = DivideByPageSize(fault_page - moving_space_begin_);
@@ -4502,15 +4594,15 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
   if (first_obj == nullptr) {
     DCHECK_GT(fault_page, post_compact_end_);
     if (use_move_ioctl_) {
-      uint8_t* free_page = GetFreePagesForMapping(gPageSize, /*atomic=*/true);
-      if (free_page != nullptr) {
-        DCHECK_ALIGNED_PARAM(free_page, gPageSize);
-        free_page += from_space_slide_diff_;
-        std::memset(free_page, 0x0, gPageSize);
-        if (MoveIoctl(fault_page, free_page, gPageSize, tolerate_enoent) == gPageSize) {
-          moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
-                                               std::memory_order_release);
-        }
+      size_t ret = ZeroAndMoveFreePage(fault_page, tolerate_enoent);
+      if (ret == 0) {
+        // This indicates that the VMA got unregistered from uffd. We should just
+        // return to mutator execution. If the page is still not mapped, then the
+        // kernel itself will handle the page-fault.
+        return;
+      } else if (ret < std::numeric_limits<size_t>::max()) {
+        moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
+                                             std::memory_order_release);
         return;
       }
     }
@@ -4762,9 +4854,12 @@ void MarkCompact::ConcurrentlyProcessLinearAllocPage(uint8_t* fault_page, bool t
   if (arena_iter == linear_alloc_arenas_.end() ||
       arena_iter->first->IsWaitingForDeletion() ||
       arena_iter->second <= fault_page) {
-    // Fault page isn't in any of the arenas that existed before we started
-    // compaction. So map zeropage and return.
-    ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    if (!use_move_ioctl_ ||
+        ZeroAndMoveFreePage(fault_page, tolerate_enoent) == std::numeric_limits<size_t>::max()) {
+      // Fault page isn't in any of the arenas that existed before we started
+      // compaction. So map zeropage and return.
+      ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    }
   } else {
     // Find the linear-alloc space containing fault-page
     LinearAllocSpaceData* space_data = nullptr;
@@ -5029,6 +5124,7 @@ void MarkCompact::CompactionPhase() {
     RecordFree(ObjectBytePair(freed_objects_, freed_bytes));
   }
 
+  conc_compaction_started_ = true;
   {
     ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
     CompactMovingSpace<kUffdMode>(compaction_buffers_map_.Begin());
@@ -5055,9 +5151,11 @@ void MarkCompact::CompactionPhase() {
 
   // Unregister moving-space
   size_t moving_space_size = bump_pointer_space_->Capacity();
-  size_t used_size = (moving_first_objs_count_ + black_page_count_) * gPageSize;
-  if (used_size > 0) {
-    UnregisterUffd(bump_pointer_space_->Begin(), used_size);
+  size_t unregister_size = use_move_ioctl_
+                               ? moving_space_size
+                               : (moving_first_objs_count_ + black_page_count_) * gPageSize;
+  if (LIKELY(unregister_size > 0)) {
+    UnregisterUffd(bump_pointer_space_->Begin(), unregister_size);
   }
   // Unregister linear-alloc spaces
   for (auto& data : linear_alloc_spaces_data_) {

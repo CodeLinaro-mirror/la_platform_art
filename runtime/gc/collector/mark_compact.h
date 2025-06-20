@@ -658,7 +658,7 @@ class MarkCompact final : public GarbageCollector {
   size_t CopyIoctl(
       void* dst, void* buffer, size_t length, bool return_on_contention, bool tolerate_enoent);
   // Move 'len/page-size' pages from 'src' to 'dst'.
-  size_t MoveIoctl(void* dst, void* src, size_t len, bool tolerate_enoent);
+  size_t MoveIoctl(void* dst, void* src, size_t len, bool tolerate_einval);
 
   // Called after updating linear-alloc page(s) to map the page. It first
   // updates the state of the pages to kProcessedAndMapping and after ioctl to
@@ -784,6 +784,10 @@ class MarkCompact final : public GarbageCollector {
                                  MemberOffset end)
       REQUIRES_SHARED(Locks::heap_bitmap_lock_, Locks::mutator_lock_);
 
+  // If using MOVE ioctl, atomically fetch a free from-space page, clear it,
+  // and then move to 'dst'. Returns MoveIoctl()'s return value, or max-val
+  // if we couldn't find any available page.
+  size_t ZeroAndMoveFreePage(uint8_t* dst, bool tolerate_einval);
   // Vector to hold thread-local overflow arrays (and the number of entries in
   // there) of gc-roots found during mutator-stack scanning in marking phase.
   std::vector<std::pair<StackReference<mirror::Object>*, size_t>>* overflow_arrays_
@@ -1018,6 +1022,9 @@ class MarkCompact final : public GarbageCollector {
   // Set to true in MarkingPause() to indicate when allocation_stack_ should be
   // checked in IsMarked() for black allocations.
   bool marking_done_;
+  // Indicates if the concurrent compaction has started or not. Only accessed by
+  // the GC thread.
+  bool conc_compaction_started_;
   // Flag indicating whether one-time uffd initialization has been done. It will
   // be false on the first GC for non-zygote processes, and always for zygote.
   // Its purpose is to minimize the userfaultfd overhead to the minimal in
