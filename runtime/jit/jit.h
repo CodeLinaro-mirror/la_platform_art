@@ -138,6 +138,10 @@ class JitThreadPool : public AbstractThreadPool {
   // Visit the ArtMethods stored in the various queues.
   void VisitRoots(RootVisitor* visitor);
 
+  // Checks if there are any ongoing compilations. This is used when deciding if we can redefine
+  // the class in place or not.
+  EXPORT bool HasOngoingCompiles() REQUIRES(!task_queue_lock_);
+
  protected:
   Task* TryGetTaskLocked() REQUIRES(task_queue_lock_) override;
 
@@ -153,7 +157,7 @@ class JitThreadPool : public AbstractThreadPool {
   JitThreadPool(const char* name,
                 size_t num_threads,
                 size_t worker_stack_size)
-      // We need peers as we may report the JIT thread, e.g., in the debugger.
+      // We need peers as JIT thread can load classes and we may report related events b/29547798.
       : AbstractThreadPool(name, num_threads, /* create_peers= */ true, worker_stack_size) {}
 
   // Try to fetch an entry from `methods`. Return null if `methods` is empty.
@@ -478,6 +482,17 @@ class EXPORT ScopedJitSuspend {
  public:
   ScopedJitSuspend();
   ~ScopedJitSuspend();
+
+ private:
+  bool was_on_;
+};
+
+// Helper class to stop accepting new JIT tasks for a given scope. This doesn't wait for ongoing
+// tasks to finish.
+class EXPORT ScopedJitPauseNewTasks {
+ public:
+  ScopedJitPauseNewTasks();
+  ~ScopedJitPauseNewTasks();
 
  private:
   bool was_on_;
