@@ -172,12 +172,11 @@ inline ArraySlice<ArtMethod> Class::GetMethodsSliceRangeUnchecked(
 }
 
 inline uint32_t Class::NumMethods() {
-  DCHECK_NE(GetMethodsPtr(), nullptr);
   return NumMethods(GetMethodsPtr());
 }
 
 inline uint32_t Class::NumMethods(LengthPrefixedArray<ArtMethod>* methods) {
-  return methods->size();
+  return (methods == nullptr) ? 0 :  methods->size();
 }
 
 inline void Class::SetMethodsPtr(LengthPrefixedArray<ArtMethod>* new_methods,
