@@ -12,17 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-package: "com.android.art.native.flags"
+package: "com.android.art.rw.flags"
 container: "com.android.art"
 
-# No flags here can be used in java. It should only contain read-write flags in this file.
-# Read-only flags should go into the art-flags.aconfig file instead.
+# No flags here can be used in libcore in Java. It should only contain read-write flags in this
+# file. Read-only flags should go into the art-flags.aconfig file instead.
 
 flag {
   name: "test_rw_flag"
   namespace: "core_libraries"
   description: "Permanent test read-write flag."
   bug: "391379705"
+  is_fixed_read_only: false
+  is_exported: false
+}
+
+flag {
+  name: "post_ur_job"
+  namespace: "art_cloud"
+  description: "Flag to enable post unattended reboot job."
+  bug: "426478053"
+  is_fixed_read_only: false
+  is_exported: false
+}
+
+flag {
+  name: "assume_value_sdk_int"
+  namespace: "system_performance"
+  description: "Flag to enable use of SDK_INT as a compile-time constant"
+  bug: "204924812"
   is_fixed_read_only: false
   is_exported: false
 }

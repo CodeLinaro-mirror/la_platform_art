@@ -250,6 +250,8 @@ class FastCompilerARM64 : public FastCompiler {
   bool BuildNewInstance(
       uint32_t vreg, dex::TypeIndex string_index, uint32_t dex_pc, const Instruction* next);
   bool BuildCheckCast(uint32_t vreg, dex::TypeIndex type_index, uint32_t dex_pc);
+  bool BuildInstanceOf(
+      uint32_t vreg, uint32_t vreg_result, dex::TypeIndex type_index, uint32_t dex_pc);
   bool LoadMethod(Register reg, ArtMethod* method);
   void DoReadBarrierOn(Register reg, vixl::aarch64::Label* exit = nullptr, bool do_mr_check = true);
   bool CanGenerateCodeFor(ArtField* field, bool can_receiver_be_null)
@@ -262,6 +264,14 @@ class FastCompilerARM64 : public FastCompiler {
              bool is_object,
              uint32_t dex_pc,
              const Instruction* next);
+
+  // Update registers and masks for the merge point.
+  void PrepareToBranch(uint32_t dex_pc) {
+    // We are going to branch, move all constants to registers to make the merge
+    // point use the same locations.
+    MoveConstantsToRegisters();
+    UpdateMasks(dex_pc);
+  }
 
   // Mark whether dex register `vreg_index` is an object.
   void UpdateRegisterMask(uint32_t vreg_index, bool is_object) {
@@ -503,8 +513,7 @@ bool FastCompilerARM64::ProcessInstructions() {
     vixl::aarch64::Label* label = GetLabelOf(pair.DexPc());
     if (label->IsLinked()) {
       // Emulate a branch to this pc.
-      MoveConstantsToRegisters();
-      UpdateMasks(pair.DexPc());
+      PrepareToBranch(pair.DexPc());
       // Set new masks based on all incoming edges.
       is_non_null_mask_ = is_non_null_masks_[pair.DexPc()];
       object_register_mask_ = object_register_masks_[pair.DexPc()];
@@ -1132,6 +1141,85 @@ bool FastCompilerARM64::BuildCheckCast(uint32_t vreg, dex::TypeIndex type_index,
   return true;
 }
 
+bool FastCompilerARM64::BuildInstanceOf(uint32_t vreg,
+                                        uint32_t vreg_result,
+                                        dex::TypeIndex type_index,
+                                        uint32_t dex_pc) {
+  if (!EnsureHasFrame()) {
+    return false;
+  }
+
+  InvokeRuntimeCallingConvention calling_convention;
+  Register cls = calling_convention.GetRegisterAt(1);
+  // Use a temporary register for `obj_cls`. Cannot be a vixl temp as it needs
+  // to survive a read barrier.
+  Register obj_cls = calling_convention.GetRegisterAt(0);
+  Register obj = WRegisterFrom(GetExistingRegisterLocation(vreg, DataType::Type::kReference));
+  Location result = GetExistingRegisterLocation(vreg_result, DataType::Type::kInt32);
+  if (HitUnimplemented()) {
+    return false;
+  }
+
+  vixl::aarch64::Label exit, read_barrier_exit, set_zero, set_one;
+  {
+    ScopedObjectAccess soa(Thread::Current());
+    ObjPtr<mirror::Class> klass = dex_compilation_unit_.GetClassLinker()->ResolveType(
+        type_index, dex_compilation_unit_.GetDexCache(), dex_compilation_unit_.GetClassLoader());
+    if (klass == nullptr || !method_->GetDeclaringClass()->CanAccess(klass)) {
+      soa.Self()->ClearException();
+      unimplemented_reason_ = "UnsupportedCheckCast";
+      return false;
+    }
+    Handle<mirror::Class> h_klass = handles_->NewHandle(klass);
+    __ Cbz(obj, &set_zero);
+    __ Ldr(cls.W(), jit_patches_.DeduplicateJitClassLiteral(GetDexFile(),
+                                                            type_index,
+                                                            h_klass,
+                                                            code_generation_data_.get()));
+  }
+  __ Ldr(cls.W(), MemOperand(cls.X()));
+  __ Ldr(obj_cls.W(), MemOperand(obj.X()));
+  __ Cmp(cls.W(), obj_cls.W());
+  __ B(eq, &set_one);
+
+  // Read barrier on the GC Root.
+  DoReadBarrierOn(cls, &read_barrier_exit);
+  // Read barrier on the object's class.
+  DoReadBarrierOn(obj_cls, &read_barrier_exit, /* do_mr_check= */ false);
+
+  __ Bind(&read_barrier_exit);
+  __ Cmp(cls.W(), obj_cls.W());
+  __ B(eq, &set_one);
+  // We clobber `obj_cls` here, which is fine as we don't need it anymore.
+  if (!MoveLocation(LocationFrom(calling_convention.GetRegisterAt(0)),
+                    LocationFrom(obj),
+                    DataType::Type::kReference)) {
+    return false;
+  }
+  InvokeRuntime(kQuickInstanceofNonTrivial, dex_pc);
+  if (!MoveLocation(result,
+                    calling_convention.GetReturnLocation(DataType::Type::kInt32),
+                    DataType::Type::kInt32)) {
+    return false;
+  }
+  __ B(&exit);
+  __ Bind(&set_zero);
+  if (!MoveLocation(result,
+                    Location::ConstantLocation(new (allocator_) HIntConstant(0)),
+                    DataType::Type::kInt32)) {
+    return false;
+  }
+  __ B(&exit);
+  __ Bind(&set_one);
+  if (!MoveLocation(result,
+                    Location::ConstantLocation(new (allocator_) HIntConstant(1)),
+                    DataType::Type::kInt32)) {
+    return false;
+  }
+  __ Bind(&exit);
+  return true;
+}
+
 void FastCompilerARM64::DoReadBarrierOn(Register reg,
                                         vixl::aarch64::Label* exit,
                                         bool do_mr_check) {
@@ -1199,8 +1287,7 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
   if (kCompareWithZero) {
     // We are going to branch, move all constants to registers to make the merge
     // point use the same locations.
-    MoveConstantsToRegisters();
-    UpdateMasks(dex_pc + target_offset);
+    PrepareToBranch(dex_pc + target_offset);
     if (location.IsConstant()) {
       DCHECK(location.GetConstant()->IsIntConstant());
       int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
@@ -1241,8 +1328,7 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
   Location other_location = vreg_locations_[instruction.VRegB_22t()];
   // We are going to branch, move all constants to registers to make the merge
   // point use the same locations.
-  MoveConstantsToRegisters();
-  UpdateMasks(dex_pc + target_offset);
+  PrepareToBranch(dex_pc + target_offset);
   if (location.IsConstant() && other_location.IsConstant()) {
     int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
     int32_t other_constant = other_location.GetConstant()->AsIntConstant()->GetValue();
@@ -1451,7 +1537,16 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     case Instruction::GOTO:
     case Instruction::GOTO_16:
     case Instruction::GOTO_32: {
-      break;
+      int32_t target_offset = instruction.GetTargetOffset();
+      if (target_offset <= 0) {
+        // TODO: Support for negative branches requires two passes.
+        unimplemented_reason_ = "NegativeBranch";
+        return false;
+      }
+      PrepareToBranch(dex_pc + target_offset);
+      vixl::aarch64::Label* label = GetLabelOf(dex_pc + target_offset);
+      __ B(label);
+      return true;
     }
 
     case Instruction::RETURN:
@@ -2294,7 +2389,10 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::INSTANCE_OF: {
-      break;
+      uint8_t destination = instruction.VRegA_22c();
+      uint8_t reference = instruction.VRegB_22c();
+      dex::TypeIndex type_index(instruction.VRegC_22c());
+      return BuildInstanceOf(reference, destination, type_index, dex_pc);
     }
 
     case Instruction::CHECK_CAST: {
