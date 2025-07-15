@@ -28,6 +28,7 @@ import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -81,6 +82,9 @@ public class DexUseManagerTest {
     private static final String OWNING_PKG_NAME = "com.example.owningpackage";
     private static final String BASE_APK = "/somewhere/app/" + OWNING_PKG_NAME + "/base.apk";
     private static final String SPLIT_APK = "/somewhere/app/" + OWNING_PKG_NAME + "/split_0.apk";
+
+    // A reduced limit to make the test run faster.
+    private static final int MAX_SECONDARY_DEX_FILES_PER_OWNER_FOR_TESTING = 50;
 
     private static final String INVISIBLE_PKG_NAME = "com.example.invisiblepackage";
     private static final String INVISIBLE_BASE_APK =
@@ -176,6 +180,7 @@ public class DexUseManagerTest {
 
         lenient().when(mInjector.getArtd()).thenReturn(mArtd);
         lenient().when(mInjector.getCurrentTimeMillis()).thenReturn(0l);
+        lenient().when(mInjector.pathExists(any())).thenReturn(true);
         lenient().when(mInjector.getFilename()).thenReturn(mTempFile.getPath());
         lenient()
                 .when(mInjector.createScheduledExecutor())
@@ -185,6 +190,9 @@ public class DexUseManagerTest {
         lenient().when(mInjector.isPreReboot()).thenReturn(false);
         lenient().when(mInjector.getArtManagerLocal()).thenReturn(mArtManagerLocal);
         lenient().when(mInjector.getPackageManagerLocal()).thenReturn(mPackageManagerLocal);
+        lenient()
+                .when(mInjector.getMaxSecondaryDexFilesPerOwner())
+                .thenReturn(MAX_SECONDARY_DEX_FILES_PER_OWNER_FOR_TESTING);
 
         mDexUseManager = new DexUseManagerLocal(mInjector);
         mDexUseManager.systemReady();
@@ -838,6 +846,38 @@ public class DexUseManagerTest {
     }
 
     @Test(expected = IllegalArgumentException.class)
+    public void testTooLongDexPath() throws Exception {
+        mDexUseManager.notifyDexContainersLoaded(mSnapshot, OWNING_PKG_NAME,
+                Map.of("/" + "X".repeat(DexUseManagerLocal.MAX_PATH_LENGTH), "CLC"));
+    }
+
+    @Test
+    public void testMaxLengthDexPath() throws Exception {
+        mDexUseManager.notifyDexContainersLoaded(mSnapshot, OWNING_PKG_NAME,
+                Map.of("/" + "X".repeat(DexUseManagerLocal.MAX_PATH_LENGTH - 1), "CLC"));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+     public void testNonAbsoluteKey() {
+         mDexUseManager.notifyDexContainersLoaded(
+                 mSnapshot, OWNING_PKG_NAME, Map.of("a/b.jar", "CLC"));
+     }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testTooLongClassLoaderContext() throws Exception {
+        mDexUseManager.notifyDexContainersLoaded(mSnapshot, OWNING_PKG_NAME,
+                Map.of(mCeDir + "/foo.apk",
+                        "X".repeat(DexUseManagerLocal.MAX_CLASS_LOADER_CONTEXT_LENGTH + 1)));
+    }
+
+    @Test
+    public void testMaxLengthClassLoaderContext() throws Exception {
+        mDexUseManager.notifyDexContainersLoaded(mSnapshot, OWNING_PKG_NAME,
+                Map.of(mCeDir + "/foo.apk",
+                        "X".repeat(DexUseManagerLocal.MAX_CLASS_LOADER_CONTEXT_LENGTH)));
+    }
+
+    @Test(expected = IllegalArgumentException.class)
     public void testNullValue() {
         var map = new HashMap<String, String>();
         map.put(mCeDir + "/foo.apk", null);
@@ -871,6 +911,87 @@ public class DexUseManagerTest {
         when(mInjector.isPreReboot()).thenReturn(true);
         mDexUseManager.notifyDexContainersLoaded(
                 mSnapshot, OWNING_PKG_NAME, Map.of(BASE_APK, "CLC"));
+    }
+
+     @Test
+    public void testExistingExternalSecondaryDexPath() throws Exception {
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        long oldFileSize = mTempFile.length();
+
+        String existingDexPath = mCeDir + "/foo.apk";
+        when(mInjector.pathExists(existingDexPath)).thenReturn(true);
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, LOADING_PKG_NAME, Map.of(existingDexPath, "PCL[]"));
+
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isGreaterThan(oldFileSize);
+    }
+
+    @Test
+    public void testNonexistingExternalSecondaryDexPath() throws Exception {
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        long oldFileSize = mTempFile.length();
+
+        String nonexistingDexPath = mCeDir + "/foo.apk";
+        when(mInjector.pathExists(nonexistingDexPath)).thenReturn(false);
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, LOADING_PKG_NAME, Map.of(nonexistingDexPath, "PCL[]"));
+
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isEqualTo(oldFileSize);
+    }
+
+    @Test
+    public void testInternalSecondaryDexPath() throws Exception {
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        long oldFileSize = mTempFile.length();
+
+        String nonexistingDexPath = mCeDir + "/foo.apk";
+        lenient().when(mInjector.pathExists(nonexistingDexPath)).thenReturn(false);
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, OWNING_PKG_NAME, Map.of(nonexistingDexPath, "PCL[]"));
+        verify(mArtd, never()).getDexFileVisibility(nonexistingDexPath);
+
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isGreaterThan(oldFileSize);
+    }
+
+    @Test
+    public void testLimitSecondaryDexFiles() throws Exception {
+        for (int n = 0; n < MAX_SECONDARY_DEX_FILES_PER_OWNER_FOR_TESTING - 1; ++n) {
+            mDexUseManager.notifyDexContainersLoaded(mSnapshot, LOADING_PKG_NAME,
+                    Map.of(String.format("%s/%04d/foo.apk", mCeDir, n), "CLC"));
+        }
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        long oldFileSize = mTempFile.length();
+
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, LOADING_PKG_NAME, Map.of(mCeDir + "/9998/foo.apk", "CLC"));
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isGreaterThan(oldFileSize);
+
+        oldFileSize = mTempFile.length();
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, LOADING_PKG_NAME, Map.of(mCeDir + "/9999/foo.apk", "CLC"));
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isEqualTo(oldFileSize);
+
+        // Can still add loading packages to existing entries after the limit is reached.
+        mDexUseManager.notifyDexContainersLoaded(
+                mSnapshot, OWNING_PKG_NAME, Map.of(mCeDir + "/9998/foo.apk", "CLC"));
+        mMockClock.advanceTime(DexUseManagerLocal.INTERVAL_MS); // Save.
+        assertThat(mTempFile.length()).isGreaterThan(oldFileSize);
+    }
+
+    @Test
+    public void testLimitSecondaryDexFilesSingleCall() throws Exception {
+        Map<String, String> clcByDexFile = new HashMap<>();
+        for (int n = 0; n < MAX_SECONDARY_DEX_FILES_PER_OWNER_FOR_TESTING + 1; ++n) {
+            clcByDexFile.put(String.format("%s/%04d/foo.apk", mCeDir, n), "CLC");
+        }
+        mDexUseManager.notifyDexContainersLoaded(mSnapshot, LOADING_PKG_NAME, clcByDexFile);
+        assertThat(mDexUseManager.getSecondaryDexInfo(OWNING_PKG_NAME))
+                .hasSize(MAX_SECONDARY_DEX_FILES_PER_OWNER_FOR_TESTING);
     }
 
     private AndroidPackage createPackage(String packageName) {
