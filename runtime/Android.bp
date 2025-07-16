@@ -238,6 +238,7 @@ cc_defaults {
 cc_defaults {
     name: "libart-runtime_common_defaults",
     defaults: ["libart_common_defaults"],
+    sdclang: false,
     srcs: [
         "app_info.cc",
         "art_field.cc",
@@ -376,6 +377,7 @@ cc_defaults {
         "native/java_lang_reflect_Proxy.cc",
         "native/java_util_concurrent_atomic_AtomicLong.cc",
         "native/jdk_internal_misc_Unsafe.cc",
+        "native/jdk_internal_vm_Continuation.cc",
         "native/libcore_io_Memory.cc",
         "native/libcore_util_CharsetUtils.cc",
         "native/org_apache_harmony_dalvik_ddmc_DdmServer.cc",
@@ -893,6 +895,7 @@ art_cc_library_static {
 art_cc_library {
     name: "libart",
     defaults: ["libart_defaults"],
+    sdclang: false,
     whole_static_libs: [
         "libart-compiler",
         "libart-runtime",
