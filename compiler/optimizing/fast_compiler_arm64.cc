@@ -56,9 +56,10 @@ using helpers::CPURegisterFrom;
 using helpers::HeapOperand;
 using helpers::LocationFrom;
 using helpers::RegisterFrom;
-using helpers::WRegisterFrom;
 using helpers::DRegisterFrom;
 using helpers::SRegisterFrom;
+using helpers::WRegisterFrom;
+using helpers::XRegisterFrom;
 
 // The maximum (meaningful) distance (31) that can be used in an integer shift/rotate operation.
 static constexpr int32_t kMaxIntShiftDistance = 0x1f;
@@ -135,9 +136,9 @@ class FastCompilerARM64 : public FastCompiler {
         catch_pcs_(ArenaBitVector::CreateFixedSize(
                        allocator,
                        dex_compilation_unit.GetCodeItemAccessor().InsnsSizeInCodeUnits())),
-        catch_stack_maps_(dex_compilation_unit.GetCodeItemAccessor().TriesSize(),
-                          allocator->Adapter()),
+        catch_stack_maps_(allocator->Adapter()),
         has_frame_(false),
+        needs_vreg_info_(false),
         core_spill_mask_(0u),
         fpu_spill_mask_(0u),
         object_register_mask_(0u),
@@ -248,10 +249,13 @@ class FastCompilerARM64 : public FastCompiler {
 
   // Generate code for doing a runtime invoke.
   void InvokeRuntime(QuickEntrypointEnum entrypoint, uint32_t dex_pc);
+  bool BuildInvokeRuntime11x(
+      QuickEntrypointEnum entrypoint, const Instruction& isntruction, uint32_t dex_pc);
 
   bool BuildLoadString(uint32_t vreg, dex::StringIndex string_index, const Instruction* next);
   bool BuildNewInstance(
       uint32_t vreg, dex::TypeIndex string_index, uint32_t dex_pc, const Instruction* next);
+  bool BuildNewArray(const Instruction& instruction, uint32_t dex_pc, const Instruction* next);
   bool BuildCheckCast(uint32_t vreg, dex::TypeIndex type_index, uint32_t dex_pc);
   bool BuildInstanceOf(uint32_t vreg,
                        uint32_t vreg_result,
@@ -396,6 +400,9 @@ class FastCompilerARM64 : public FastCompiler {
   // Whether we've created a frame for this compiled method.
   bool has_frame_;
 
+  // Whether we need dex register info in stack maps.
+  bool needs_vreg_info_;
+
   // CPU registers that have been spilled in the frame.
   uint32_t core_spill_mask_;
 
@@ -487,11 +494,6 @@ void FastCompilerARM64::MoveConstantsToRegisters() {
       vreg_locations_[i] = CreateNewRegisterLocation(i, type, /* next= */ nullptr);
       MoveLocation(vreg_locations_[i], location, type);
       DCHECK(!HitUnimplemented());
-      if (location.GetConstant()->IsArithmeticZero()) {
-        // In case we branch, we need to make sure a null value can be merged
-        // with an object value, so treat the 0 value as an object.
-        UpdateRegisterMask(i, /* is_object= */ true);
-      }
     }
   }
 }
@@ -535,6 +537,25 @@ bool FastCompilerARM64::ProcessInstructions() {
 
     if (catch_pcs_.IsBitSet(pair.DexPc())) {
       catch_stack_maps_.push_back(std::make_pair(pair.DexPc(), GetAssembler()->CodePosition()));
+      // Emulate a branch to this pc.
+      PrepareToBranch(pair.DexPc());
+      // Set new masks based on all throwing instructions.
+      is_non_null_mask_ = is_non_null_masks_[pair.DexPc()];
+      object_register_mask_ = object_register_masks_[pair.DexPc()];
+    }
+
+    // If the instruction can throw, emulate a branch to the catch handler by
+    // updating dex register masks.
+    if (GetCodeItemAccessor().TriesSize() != 0 &&
+        (Instruction::FlagsOf(pair.Inst().Opcode()) & Instruction::kThrow) != 0) {
+      const dex::TryItem* try_item = GetCodeItemAccessor().FindTryItem(pair.DexPc());
+      if (try_item != nullptr) {
+        for (CatchHandlerIterator iterator(GetCodeItemAccessor(), *try_item);
+             iterator.HasNext();
+             iterator.Next()) {
+          UpdateMasks(iterator.GetHandlerAddress());
+        }
+      }
     }
 
     if (!ProcessDexInstruction(pair.Inst(), pair.DexPc(), next)) {
@@ -654,7 +675,74 @@ void FastCompilerARM64::RecordPcInfo(uint32_t dex_pc) {
   uint32_t native_pc = GetAssembler()->CodePosition();
   StackMapStream* stack_map_stream = code_generation_data_->GetStackMapStream();
   CHECK_EQ(object_register_mask_ & callee_saved_core_registers.GetList(), object_register_mask_);
-  stack_map_stream->BeginStackMapEntry(dex_pc, native_pc, object_register_mask_);
+  stack_map_stream->BeginStackMapEntry(dex_pc,
+                                       native_pc,
+                                       object_register_mask_,
+                                       /* sp_mask= */ nullptr,
+                                       StackMap::Kind::Default,
+                                       needs_vreg_info_);
+  if (needs_vreg_info_) {
+    using Kind = DexRegisterLocation::Kind;
+    uint32_t size = vreg_locations_.size();
+    for (uint32_t i = 0; i < size; ++i) {
+      Location location = vreg_locations_[i];
+      switch (location.GetKind()) {
+        case Location::kConstant: {
+          if (location.GetConstant()->IsLongConstant()) {
+            int64_t value = location.GetConstant()->AsLongConstant()->GetValue();
+            stack_map_stream->AddDexRegisterEntry(Kind::kConstant, Low32Bits(value));
+            stack_map_stream->AddDexRegisterEntry(Kind::kConstant, High32Bits(value));
+            ++i;
+            DCHECK_LT(i, size);
+          } else {
+            DCHECK(location.GetConstant()->IsIntConstant());
+            int32_t value = location.GetConstant()->AsIntConstant()->GetValue();
+            stack_map_stream->AddDexRegisterEntry(Kind::kConstant, value);
+          }
+          break;
+        }
+
+        case Location::kStackSlot: {
+          stack_map_stream->AddDexRegisterEntry(Kind::kInStack, location.GetStackIndex());
+          break;
+        }
+
+        case Location::kDoubleStackSlot: {
+          stack_map_stream->AddDexRegisterEntry(Kind::kInStack, location.GetStackIndex());
+          stack_map_stream->AddDexRegisterEntry(
+              Kind::kInStack, location.GetHighStackIndex(kVRegSize));
+          ++i;
+          DCHECK_LT(i, size);
+          break;
+        }
+
+        case Location::kRegister: {
+          int id = location.reg();
+          stack_map_stream->AddDexRegisterEntry(Kind::kInRegister, location.reg());
+          DCHECK(!compiler_options_.GetDebuggable());
+          // Note: if we were using the fast compiler for debuggable, we would
+          // need to emit a `kInRegisterHi` here for long values. This would
+          // require knowing if the current entry is a long.
+          break;
+        }
+
+        case Location::kFpuRegister: {
+          stack_map_stream->AddDexRegisterEntry(Kind::kInFpuRegister, location.reg());
+          // Note: same as above and `kInFpuRegisterHi` for double values.
+          DCHECK(!compiler_options_.GetDebuggable());
+          break;
+        }
+
+        case Location::kInvalid: {
+          stack_map_stream->AddDexRegisterEntry(Kind::kNone, 0);
+          break;
+        }
+
+        default:
+          LOG(FATAL) << "Unexpected kind " << location.GetKind();
+      }
+    }
+  }
   stack_map_stream->EndStackMapEntry();
 }
 
@@ -1080,7 +1168,7 @@ bool FastCompilerARM64::BuildNewInstance(uint32_t vreg,
   Handle<mirror::Class> h_klass = handles_->NewHandle(klass);
   __ Ldr(cls_reg.W(), jit_patches_.DeduplicateJitClassLiteral(GetDexFile(),
                                                               type_index,
-                                                              h_klass ,
+                                                              h_klass,
                                                               code_generation_data_.get()));
   __ Ldr(cls_reg.W(), MemOperand(cls_reg.X()));
   DoReadBarrierOn(cls_reg);
@@ -1103,6 +1191,64 @@ bool FastCompilerARM64::BuildNewInstance(uint32_t vreg,
     return false;
   }
   UpdateLocal(vreg, /* is_object= */ true, /* can_be_null= */ false);
+  return true;
+}
+
+bool FastCompilerARM64::BuildNewArray(const Instruction& instruction,
+                                      uint32_t dex_pc,
+                                      const Instruction* next) {
+  dex::TypeIndex type_index(instruction.VRegC_22c());
+  int32_t length = instruction.VRegB_22c();
+  int32_t dst = instruction.VRegA_22c();
+  const char* descriptor = GetDexFile().GetTypeDescriptor(GetDexFile().GetTypeId(type_index));
+  DCHECK_EQ(descriptor[0], '[');
+  size_t component_type_shift = Primitive::ComponentSizeShift(Primitive::GetType(descriptor[1]));
+  QuickEntrypointEnum entrypoint =
+      CodeGenerator::GetArrayAllocationEntrypoint(component_type_shift);
+  if (!EnsureHasFrame()) {
+    return false;
+  }
+  if (Runtime::Current()->IsAotCompiler()) {
+    unimplemented_reason_ = "AOTNewArray";
+    return false;
+  }
+
+  InvokeRuntimeCallingConvention calling_convention;
+  Register cls_reg = calling_convention.GetRegisterAt(0);
+  {
+    ScopedObjectAccess soa(Thread::Current());
+    ObjPtr<mirror::Class> klass = dex_compilation_unit_.GetClassLinker()->ResolveType(
+        type_index, dex_compilation_unit_.GetDexCache(), dex_compilation_unit_.GetClassLoader());
+    if (klass == nullptr || !method_->GetDeclaringClass()->CanAccess(klass)) {
+      soa.Self()->ClearException();
+      unimplemented_reason_ = "UnsupportedClassForNewArray";
+      return false;
+    }
+
+    Handle<mirror::Class> h_klass = handles_->NewHandle(klass);
+    __ Ldr(cls_reg.W(), jit_patches_.DeduplicateJitClassLiteral(GetDexFile(),
+                                                                type_index,
+                                                                h_klass,
+                                                                code_generation_data_.get()));
+  }
+  __ Ldr(cls_reg.W(), MemOperand(cls_reg.X()));
+  DoReadBarrierOn(cls_reg);
+  if (!MoveLocation(LocationFrom(calling_convention.GetRegisterAt(1)),
+                    GetExistingRegisterLocation(length, DataType::Type::kInt32),
+                    DataType::Type::kInt32)) {
+    return false;
+  }
+  InvokeRuntime(entrypoint, dex_pc);
+  __ Dmb(InnerShareable, BarrierWrites);
+  if (!MoveLocation(CreateNewRegisterLocation(dst, DataType::Type::kReference, next),
+                    calling_convention.GetReturnLocation(DataType::Type::kReference),
+                    DataType::Type::kReference)) {
+    return false;
+  }
+  if (HitUnimplemented()) {
+    return false;
+  }
+  UpdateLocal(dst, /* is_object= */ true, /* can_be_null= */ false);
   return true;
 }
 
@@ -1134,7 +1280,7 @@ bool FastCompilerARM64::BuildCheckCast(uint32_t vreg, dex::TypeIndex type_index,
   __ Cbz(obj, &exit);
   __ Ldr(cls.W(), jit_patches_.DeduplicateJitClassLiteral(GetDexFile(),
                                                           type_index,
-                                                          h_klass ,
+                                                          h_klass,
                                                           code_generation_data_.get()));
   __ Ldr(cls.W(), MemOperand(cls.X()));
   __ Ldr(obj_cls.W(), MemOperand(obj.X()));
@@ -1237,6 +1383,7 @@ bool FastCompilerARM64::BuildInstanceOf(uint32_t vreg,
     return false;
   }
   __ Bind(&exit);
+  UpdateLocal(vreg_result, /* is_object= */ false);
   return true;
 }
 
@@ -1407,6 +1554,7 @@ bool FastCompilerARM64::DoGet(const MemOperand& mem,
 
   // Ensure the pc position is recorded immediately after the load instruction.
   EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
+  bool is_wide = false;
   switch (opcode) {
     case Instruction::SGET_BOOLEAN:
     case Instruction::IGET_BOOLEAN: {
@@ -1436,18 +1584,21 @@ bool FastCompilerARM64::DoGet(const MemOperand& mem,
       __ Ldrsh(Register(dst), mem);
       break;
     }
+    case Instruction::SGET_WIDE:
+    case Instruction::IGET_WIDE:
+      is_wide = true;
+      FALLTHROUGH_INTENDED;
     case Instruction::SGET:
     case Instruction::IGET: {
       const dex::FieldId& field_id = GetDexFile().GetFieldId(field_index);
       const char* type = GetDexFile().GetFieldTypeDescriptor(field_id);
       DataType::Type field_type = DataType::FromShorty(type[0]);
+      Location location = CreateNewRegisterLocation(dest_reg, field_type, next);
       if (DataType::IsFloatingPointType(field_type)) {
-        VRegister dst = SRegisterFrom(
-            CreateNewRegisterLocation(dest_reg, field_type, next));
+        VRegister dst = is_wide ? DRegisterFrom(location) : SRegisterFrom(location);
         __ Ldr(dst, mem);
       } else {
-        Register dst = WRegisterFrom(
-            CreateNewRegisterLocation(dest_reg, DataType::Type::kInt32, next));
+        Register dst = is_wide ? XRegisterFrom(location) : WRegisterFrom(location);
         __ Ldr(dst, mem);
       }
       if (HitUnimplemented()) {
@@ -1497,7 +1648,26 @@ void FastCompilerARM64::SetIntConstant(uint32_t register_index,
                  Location::ConstantLocation(new (allocator_) HIntConstant(constant)),
                  DataType::Type::kInt32);
   }
-  UpdateLocal(register_index, /* is_object= */ false);
+  // In case we branch, we need to make sure a null value can be merged
+  // with an object value, so treat the 0 value as an object.
+  UpdateLocal(register_index, /* is_object= */ (constant == 0));
+}
+
+bool FastCompilerARM64::BuildInvokeRuntime11x(QuickEntrypointEnum entrypoint,
+                                              const Instruction& instruction,
+                                              uint32_t dex_pc) {
+    if (!EnsureHasFrame()) {
+      return false;
+    }
+    int32_t reg = instruction.VRegA_11x();
+    InvokeRuntimeCallingConvention calling_convention;
+    if (!MoveLocation(LocationFrom(calling_convention.GetRegisterAt(0)),
+                      vreg_locations_[reg],
+                      DataType::Type::kReference)) {
+      return false;
+    }
+    InvokeRuntime(entrypoint, dex_pc);
+    return true;
 }
 
 void FastCompilerARM64::SetLongConstant(uint32_t register_index,
@@ -1516,6 +1686,22 @@ void FastCompilerARM64::SetLongConstant(uint32_t register_index,
   }
   UpdateLocal(register_index, /* is_object= */ false);
 }
+
+#define SETUP_BINOP_12x(type) \
+  int32_t vreg_a = instruction.VRegA_12x(); \
+  Register first = RegisterFrom(GetExistingRegisterLocation(vreg_a, type), type); \
+  Register second = RegisterFrom( \
+      GetExistingRegisterLocation(instruction.VRegB_12x(), type), type); \
+  Register dst = RegisterFrom(CreateNewRegisterLocation(vreg_a, type, next), type); \
+  if (HitUnimplemented()) { \
+    return false; \
+  } \
+  UpdateLocal(vreg_a, /* is_object= */ false);
+
+#define SIMPLE_BINOP_12x(type, instruction) \
+    SETUP_BINOP_12x(type) \
+    __ instruction(dst, first, second); \
+    return true;
 
 bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
                                               uint32_t dex_pc,
@@ -1830,10 +2016,6 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
       break;
     }
 
-    case Instruction::ADD_INT_2ADDR: {
-      break;
-    }
-
     case Instruction::MUL_INT: {
       break;
     }
@@ -1930,8 +2112,81 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
       break;
     }
 
-    case Instruction::ADD_LONG_2ADDR: {
-      break;
+#define SIMPLE_2ADDR_CASE(opcode, instruction) \
+    case Instruction::opcode ##_INT_2ADDR: { \
+      SIMPLE_BINOP_12x(DataType::Type::kInt32, instruction) \
+    } \
+    case Instruction::opcode ##_LONG_2ADDR: { \
+      SIMPLE_BINOP_12x(DataType::Type::kInt64, instruction) \
+    }
+
+    SIMPLE_2ADDR_CASE(ADD, Add)
+    SIMPLE_2ADDR_CASE(SUB, Sub)
+    SIMPLE_2ADDR_CASE(MUL, Mul)
+    SIMPLE_2ADDR_CASE(SHL, Lsl)
+    SIMPLE_2ADDR_CASE(SHR, Asr)
+    SIMPLE_2ADDR_CASE(USHR, Lsr)
+    SIMPLE_2ADDR_CASE(AND, And)
+    SIMPLE_2ADDR_CASE(OR, Orr)
+    SIMPLE_2ADDR_CASE(XOR, Eor)
+#undef SIMPLE_2ADDR_CASE
+
+    case Instruction::DIV_INT_2ADDR: {
+      SETUP_BINOP_12x(DataType::Type::kInt32)
+      if (!EnsureHasFrame()) {
+        return false;
+      }
+      vixl::aarch64::Label cont;
+      __ Cbnz(second, &cont);
+      InvokeRuntime(kQuickThrowDivZero, dex_pc);
+      __ Bind(&cont);
+      __ Sdiv(dst, first, second);
+      return true;
+    }
+
+    case Instruction::DIV_LONG_2ADDR: {
+      SETUP_BINOP_12x(DataType::Type::kInt64)
+      if (!EnsureHasFrame()) {
+        return false;
+      }
+      vixl::aarch64::Label cont;
+      __ Cbnz(second, &cont);
+      InvokeRuntime(kQuickThrowDivZero, dex_pc);
+      __ Bind(&cont);
+      __ Sdiv(dst, first, second);
+      return true;
+    }
+
+    case Instruction::REM_INT_2ADDR: {
+      SETUP_BINOP_12x(DataType::Type::kInt32)
+      if (!EnsureHasFrame()) {
+        return false;
+      }
+      vixl::aarch64::Label cont;
+      __ Cbnz(second, &cont);
+      InvokeRuntime(kQuickThrowDivZero, dex_pc);
+      __ Bind(&cont);
+      UseScratchRegisterScope temps(GetVIXLAssembler());
+      Register temp = temps.AcquireSameSizeAs(dst);
+      __ Sdiv(temp, first, second);
+      __ Msub(dst, temp, second, first);
+      return true;
+    }
+
+    case Instruction::REM_LONG_2ADDR: {
+      SETUP_BINOP_12x(DataType::Type::kInt64)
+      if (!EnsureHasFrame()) {
+        return false;
+      }
+      vixl::aarch64::Label cont;
+      __ Cbnz(second, &cont);
+      InvokeRuntime(kQuickThrowDivZero, dex_pc);
+      __ Bind(&cont);
+      UseScratchRegisterScope temps(GetVIXLAssembler());
+      Register temp = temps.AcquireSameSizeAs(dst);
+      __ Sdiv(temp, first, second);
+      __ Msub(dst, temp, second, first);
+      return true;
     }
 
     case Instruction::ADD_DOUBLE_2ADDR: {
@@ -1939,14 +2194,6 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::ADD_FLOAT_2ADDR: {
-      break;
-    }
-
-    case Instruction::SUB_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::SUB_LONG_2ADDR: {
       break;
     }
 
@@ -1958,35 +2205,11 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
       break;
     }
 
-    case Instruction::MUL_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::MUL_LONG_2ADDR: {
-      break;
-    }
-
     case Instruction::MUL_FLOAT_2ADDR: {
       break;
     }
 
     case Instruction::MUL_DOUBLE_2ADDR: {
-      break;
-    }
-
-    case Instruction::DIV_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::DIV_LONG_2ADDR: {
-      break;
-    }
-
-    case Instruction::REM_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::REM_LONG_2ADDR: {
       break;
     }
 
@@ -1998,30 +2221,6 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
       break;
     }
 
-    case Instruction::SHL_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::SHL_LONG_2ADDR: {
-      break;
-    }
-
-    case Instruction::SHR_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::SHR_LONG_2ADDR: {
-      break;
-    }
-
-    case Instruction::USHR_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::USHR_LONG_2ADDR: {
-      break;
-    }
-
     case Instruction::DIV_FLOAT_2ADDR: {
       break;
     }
@@ -2030,41 +2229,19 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
       break;
     }
 
-    case Instruction::AND_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::AND_LONG_2ADDR: {
-      break;
-    }
-
-    case Instruction::OR_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::OR_LONG_2ADDR: {
-      break;
-    }
-
-    case Instruction::XOR_INT_2ADDR: {
-      break;
-    }
-
-    case Instruction::XOR_LONG_2ADDR: {
-      break;
-    }
-
 #define SETUP_BINOP_22(suffix) \
   Register source = RegisterFrom( \
       GetExistingRegisterLocation(instruction.VRegB_22 ## suffix(), DataType::Type::kInt32), \
       DataType::Type::kInt32); \
+  int32_t register_index = instruction.VRegA_22 ## suffix(); \
   Register result = RegisterFrom( \
-      CreateNewRegisterLocation(instruction.VRegA_22 ## suffix(), DataType::Type::kInt32, next), \
+      CreateNewRegisterLocation(register_index, DataType::Type::kInt32, next), \
       DataType::Type::kInt32); \
   if (HitUnimplemented()) { \
     return false; \
   } \
-  int16_t constant = instruction.VRegC_22 ## suffix();
+  int16_t constant = instruction.VRegC_22 ## suffix(); \
+  UpdateLocal(register_index, /* is_object= */ false);
 
     case Instruction::ADD_INT_LIT16: {
       SETUP_BINOP_22(s)
@@ -2245,7 +2422,7 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::NEW_ARRAY: {
-      break;
+      return BuildNewArray(instruction, dex_pc, next);
     }
 
     case Instruction::FILLED_NEW_ARRAY: {
@@ -2568,7 +2745,32 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     ARRAY_XX(_SHORT, DataType::Type::kInt16);
 
     case Instruction::ARRAY_LENGTH: {
-      break;
+      int32_t array = instruction.VRegB_12x();
+      int32_t dest = instruction.VRegA_12x();
+      if (CanBeNull(array)) {
+        if (!EnsureHasFrame()) {
+          return false;
+        }
+      }
+      Register array_reg = RegisterFrom(
+          GetExistingRegisterLocation(array, DataType::Type::kReference),
+          DataType::Type::kReference);
+      Register dest_reg = RegisterFrom(
+          CreateNewRegisterLocation(dest, DataType::Type::kInt32, next), DataType::Type::kInt32);
+      if (HitUnimplemented()) {
+        return false;
+      }
+      MemOperand mem = HeapOperand(array_reg.W(), mirror::Array::LengthOffset().Uint32Value());
+      {
+        // Ensure the pc position is recorded immediately after the store instruction.
+        EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
+        __ Ldr(dest_reg, mem);
+        if (CanBeNull(array)) {
+          RecordPcInfo(dex_pc);
+        }
+      }
+      UpdateLocal(dest, /* is_object= */ false);
+      return true;
     }
 
     case Instruction::CONST_STRING: {
@@ -2594,22 +2796,19 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::MOVE_EXCEPTION: {
-      break;
+      int32_t register_index = instruction.VRegA_11x();
+      Location new_location =
+          CreateNewRegisterLocation(register_index, DataType::Type::kReference, next);
+      MemOperand exception =
+          MemOperand(tr, Thread::ExceptionOffset<kArm64PointerSize>().Int32Value());
+      __ Ldr(WRegisterFrom(new_location), exception);
+      __ Str(wzr, exception);
+      UpdateLocal(register_index, /* is_object= */ true, /* can_be_null= */ false);
+      return true;
     }
 
     case Instruction::THROW: {
-      if (!EnsureHasFrame()) {
-        return false;
-      }
-      int32_t reg = instruction.VRegA_11x();
-      InvokeRuntimeCallingConvention calling_convention;
-      if (!MoveLocation(LocationFrom(calling_convention.GetRegisterAt(0)),
-                        vreg_locations_[reg],
-                        DataType::Type::kReference)) {
-        return false;
-      }
-      InvokeRuntime(kQuickDeliverException, dex_pc);
-      return true;
+      return BuildInvokeRuntime11x(kQuickDeliverException, instruction, dex_pc);
     }
 
     case Instruction::INSTANCE_OF: {
@@ -2626,11 +2825,21 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::MONITOR_ENTER: {
-      break;
+      // We can start collecting vreg info per stack map at this point, as the
+      // runtime will only start expecting them after getting a report of an
+      // Object in a dex register being locked. For any stack maps before that
+      // monitor-enter, we know the runtime won't expect it.
+      // Note: once we support backwards branching, we'll need to know
+      // beforehand if a method has monitor operations.
+      needs_vreg_info_ = true;
+      return BuildInvokeRuntime11x(kQuickLockObject, instruction, dex_pc);
     }
 
     case Instruction::MONITOR_EXIT: {
-      break;
+      // We don't support backwards branch yet, so we must have seen the
+      // monitor-enter before this instruction.
+      DCHECK(needs_vreg_info_);
+      return BuildInvokeRuntime11x(kQuickUnlockObject, instruction, dex_pc);
     }
 
     case Instruction::SPARSE_SWITCH:

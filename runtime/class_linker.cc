@@ -2956,67 +2956,74 @@ ObjPtr<mirror::Class> ClassLinker::EnsureResolved(Thread* self,
     Thread::PoisonObjectPointersIfDebug();
   }
 
-  // For temporary classes we must wait for them to be retired.
+  // Helper lambda to make sure we wait for a particular status (i.e. retired or resolved) while
+  // checking for circular dependencies.
+  auto wait_for_status =
+      [this, self, &klass](auto&& is_done) REQUIRES_SHARED(Locks::mutator_lock_) {
+    size_t index = 0;
+    // Maximum number of yield iterations until we start sleeping.
+    static constexpr size_t kNumYieldIterations = 1000;
+    // How long each sleep is in us.
+    static constexpr size_t kSleepDurationUS = 1000;  // 1 ms.
+    while (!is_done(klass) && !klass->IsErroneousUnresolved()) {
+      StackHandleScope<1> hs(self);
+      HandleWrapperObjPtr<mirror::Class> h_class(hs.NewHandleWrapper(&klass));
+      {
+        ObjectTryLock<mirror::Class> lock(self, h_class);
+        // Can not use a monitor wait here since it may block when returning and deadlock if another
+        // thread has locked klass.
+        if (lock.Acquired()) {
+          // Check for circular dependencies between classes, the lock is required for SetStatus.
+          if (!is_done(h_class.Get()) && h_class->GetClinitThreadId() == self->GetTid()) {
+            ThrowClassCircularityError(h_class.Get());
+            mirror::Class::SetStatus(h_class, ClassStatus::kErrorUnresolved, self);
+            return false;
+          }
+        }
+      }
+      {
+        // Handle wrapper deals with klass moving.
+        ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+        if (index < kNumYieldIterations) {
+          sched_yield();
+        } else {
+          usleep(kSleepDurationUS);
+        }
+      }
+      ++index;
+    }
+
+    if (klass->IsErroneousUnresolved()) {
+      ThrowEarlierClassFailure(klass);
+      return false;
+    }
+    return true;
+  };
+
   if (init_done_ && klass->IsTemp()) {
     CHECK(!klass->IsResolved());
     if (klass->IsErroneousUnresolved()) {
       ThrowEarlierClassFailure(klass);
       return nullptr;
     }
-    StackHandleScope<1> hs(self);
-    Handle<mirror::Class> h_class(hs.NewHandle(klass));
-    ObjectLock<mirror::Class> lock(self, h_class);
-    // Loop and wait for the resolving thread to retire this class.
-    while (!h_class->IsRetired() && !h_class->IsErroneousUnresolved()) {
-      lock.WaitIgnoringInterrupts();
-    }
-    if (h_class->IsErroneousUnresolved()) {
-      ThrowEarlierClassFailure(h_class.Get());
+
+    // For temporary classes we must wait for them to be retired.
+    if (!wait_for_status([](ObjPtr<mirror::Class> k)
+                             REQUIRES_SHARED(Locks::mutator_lock_) { return k->IsRetired(); })) {
       return nullptr;
     }
-    CHECK(h_class->IsRetired());
+
+    CHECK(klass->IsRetired());
     // Get the updated class from class table.
-    klass = LookupClass(self, descriptor, h_class.Get()->GetClassLoader());
+    klass = LookupClass(self, descriptor, klass->GetClassLoader());
   }
 
   // Wait for the class if it has not already been linked.
-  size_t index = 0;
-  // Maximum number of yield iterations until we start sleeping.
-  static const size_t kNumYieldIterations = 1000;
-  // How long each sleep is in us.
-  static const size_t kSleepDurationUS = 1000;  // 1 ms.
-  while (!klass->IsResolved() && !klass->IsErroneousUnresolved()) {
-    StackHandleScope<1> hs(self);
-    HandleWrapperObjPtr<mirror::Class> h_class(hs.NewHandleWrapper(&klass));
-    {
-      ObjectTryLock<mirror::Class> lock(self, h_class);
-      // Can not use a monitor wait here since it may block when returning and deadlock if another
-      // thread has locked klass.
-      if (lock.Acquired()) {
-        // Check for circular dependencies between classes, the lock is required for SetStatus.
-        if (!h_class->IsResolved() && h_class->GetClinitThreadId() == self->GetTid()) {
-          ThrowClassCircularityError(h_class.Get());
-          mirror::Class::SetStatus(h_class, ClassStatus::kErrorUnresolved, self);
-          return nullptr;
-        }
-      }
-    }
-    {
-      // Handle wrapper deals with klass moving.
-      ScopedThreadSuspension sts(self, ThreadState::kSuspended);
-      if (index < kNumYieldIterations) {
-        sched_yield();
-      } else {
-        usleep(kSleepDurationUS);
-      }
-    }
-    ++index;
-  }
-
-  if (klass->IsErroneousUnresolved()) {
-    ThrowEarlierClassFailure(klass);
+  if (!wait_for_status([](ObjPtr<mirror::Class> k)
+                           REQUIRES_SHARED(Locks::mutator_lock_) { return k->IsResolved(); })) {
     return nullptr;
   }
+
   // Return the loaded class.  No exceptions should be pending.
   CHECK(klass->IsResolved()) << klass->PrettyClass();
   self->AssertNoPendingException();
@@ -6706,19 +6713,6 @@ bool ClassLinker::LoadSuperAndInterfaces(Handle<mirror::Class> klass, const DexF
   const dex::ClassDef& class_def = dex_file.GetClassDef(klass->GetDexClassDefIndex());
   dex::TypeIndex super_class_idx = class_def.superclass_idx_;
   if (super_class_idx.IsValid()) {
-    // Check that a class does not inherit from itself directly.
-    //
-    // TODO: This is a cheap check to detect the straightforward case
-    // of a class extending itself (b/28685551), but we should do a
-    // proper cycle detection on loaded classes, to detect all cases
-    // of class circularity errors (b/28830038).
-    if (super_class_idx == class_def.class_idx_) {
-      ThrowClassCircularityError(klass.Get(),
-                                 "Class %s extends itself",
-                                 klass->PrettyDescriptor().c_str());
-      return false;
-    }
-
     ObjPtr<mirror::Class> super_class = ResolveType(super_class_idx, klass.Get());
     if (super_class == nullptr) {
       DCHECK(Thread::Current()->IsExceptionPending());
@@ -6738,24 +6732,14 @@ bool ClassLinker::LoadSuperAndInterfaces(Handle<mirror::Class> klass, const DexF
   if (interfaces != nullptr) {
     for (size_t i = 0; i < interfaces->Size(); i++) {
       dex::TypeIndex idx = interfaces->GetTypeItem(i).type_idx_;
-      if (idx.IsValid()) {
-        // Check that a class does not implement itself directly.
-        //
-        // TODO: This is a cheap check to detect the straightforward case of a class implementing
-        // itself, but we should do a proper cycle detection on loaded classes, to detect all cases
-        // of class circularity errors. See b/28685551, b/28830038, and b/301108855
-        if (idx == class_def.class_idx_) {
-          ThrowClassCircularityError(
-              klass.Get(), "Class %s implements itself", klass->PrettyDescriptor().c_str());
-          return false;
-        }
-      }
+      DCHECK(idx.IsValid());
 
       ObjPtr<mirror::Class> interface = ResolveType(idx, klass.Get());
       if (interface == nullptr) {
         DCHECK(Thread::Current()->IsExceptionPending());
         return false;
       }
+
       // Verify
       if (!klass->CanAccess(interface)) {
         // TODO: the RI seemed to ignore this in my testing.
@@ -8782,17 +8766,20 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
   // super vtable (which is only lazy populated in case of interface overriding,
   // see below). This makes sure that we pay the performance price only on that
   // class, and not on its subclasses (except in the case of interface overriding, see below).
-  size_t index = 0;
-  for (ArtMethod& method : klass->GetMethods(kPointerSize)) {
-    DCHECK(!method.IsCopied());
-    if (method.IsVirtual()) {
-      ArtMethod* signature_method = UNLIKELY(is_proxy_class)
-          ? method.GetInterfaceMethodForProxyUnchecked(kPointerSize)
-          : &method;
-      size_t hash = ComputeMethodHash(signature_method);
-      declared_virtual_signatures.PutWithHash(index, hash);
+  {
+    size_t index = 0;
+    for (ArtMethod& method : klass->GetMethods(kPointerSize)) {
+      DCHECK(!method.IsCopied());
+      if (method.IsVirtual()) {
+        ArtMethod* signature_method = UNLIKELY(is_proxy_class)
+            ? method.GetInterfaceMethodForProxyUnchecked(kPointerSize)
+            : &method;
+        size_t hash = ComputeMethodHash(signature_method);
+        // InsertWithHash won't insert duplicate methods.
+        declared_virtual_signatures.InsertWithHash(index, hash);
+      }
+      ++index;
     }
-    ++index;
   }
 
   // Loop through each super vtable method and see if they are overridden by a method we added to
@@ -8845,14 +8832,16 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
   }
 
   // Add the non-overridden methods at the end.
-  index = 0;
-  for (ArtMethod& m : klass->GetMethods(kPointerSize)) {
-    DCHECK(!m.IsCopied());
-    if (m.IsVirtual() && !initialized_methods.IsBitSet(index)) {
-      m.SetMethodIndex(vtable_length);
-      ++vtable_length;
+  {
+    size_t index = 0;
+    for (ArtMethod& m : klass->GetMethods(kPointerSize)) {
+      DCHECK(!m.IsCopied());
+      if (m.IsVirtual() && !initialized_methods.IsBitSet(index)) {
+        m.SetMethodIndex(vtable_length);
+        ++vtable_length;
+      }
+      ++index;
     }
-    ++index;
   }
 
   // A lazily constructed super vtable set, which we only populate in the less
@@ -8903,6 +8892,7 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
         // declared in an interface this class is inheriting). Only in this case
         // do we lazily populate the super_vtable_signatures.
         if (super_vtable_signatures.empty()) {
+          HashSet<uint32_t> seen_method_indices;
           for (size_t k = 0; k < super_vtable_length; ++k) {
             ArtMethod* super_method = super_vtable_accessor.GetVTableEntry(k);
             if (!super_method->IsPublic()) {
@@ -8913,7 +8903,13 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
                 ? class_linker_->object_virtual_method_hashes_[k]
                 : ComputeMethodHash(super_method);
             auto [it, inserted] = super_vtable_signatures.InsertWithHash(k, super_hash);
-            DCHECK(inserted || super_vtable_accessor.GetVTableEntry(*it) == super_method);
+            if (kIsDebugBuild) {
+              CHECK(inserted ||
+                    super_vtable_accessor.GetVTableEntry(*it) == super_method ||
+                    seen_method_indices.find(super_method->GetDexMethodIndex()) !=
+                        seen_method_indices.end());
+              seen_method_indices.insert(super_method->GetDexMethodIndex());
+            }
           }
         }
         auto it2 = super_vtable_signatures.FindWithHash(&interface_method, hash);

@@ -459,9 +459,6 @@ void CodeGenerator::CreateCommonInvokeLocationSummary(
     HInvokeStaticOrDirect* call = invoke->AsInvokeStaticOrDirect();
     MethodLoadKind method_load_kind = call->GetMethodLoadKind();
     CodePtrLocation code_ptr_location = call->GetCodePtrLocation();
-    if (code_ptr_location == CodePtrLocation::kCallCriticalNative) {
-      locations->AddTemp(Location::RequiresRegister());  // For target method.
-    }
     if (code_ptr_location == CodePtrLocation::kCallCriticalNative ||
         method_load_kind == MethodLoadKind::kRecursive) {
       // For `kCallCriticalNative` we need the current method as the hidden argument
@@ -1816,7 +1813,11 @@ void CodeGenerator::EmitJitRoots(uint8_t* buffer,
 }
 
 QuickEntrypointEnum CodeGenerator::GetArrayAllocationEntrypoint(HNewArray* new_array) {
-  switch (new_array->GetComponentSizeShift()) {
+  return GetArrayAllocationEntrypoint(new_array->GetComponentSizeShift());
+}
+
+QuickEntrypointEnum CodeGenerator::GetArrayAllocationEntrypoint(size_t component_size_shift) {
+  switch (component_size_shift) {
     case 0: return kQuickAllocArrayResolved8;
     case 1: return kQuickAllocArrayResolved16;
     case 2: return kQuickAllocArrayResolved32;

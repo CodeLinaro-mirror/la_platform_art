@@ -4208,6 +4208,14 @@ void LocationsBuilderRISCV64::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* i
     CriticalNativeCallingConventionVisitorRiscv64 calling_convention_visitor(
         /*for_register_allocation=*/ true);
     CodeGenerator::CreateCommonInvokeLocationSummary(instruction, &calling_convention_visitor);
+    if (instruction->GetMethodLoadKind() != MethodLoadKind::kBootImageLinkTimePcRelative) {
+      // Use the next argument register, if usable for C.LD, as the target method temp. Otherwise,
+      // we'll use RA. We prefer the low register temp that allows shorter encoding than RA.
+      Location maybe_temp = calling_convention_visitor.GetNextLocation(DataType::Type::kInt32);
+      if (maybe_temp.IsRegister() && maybe_temp.reg() <= A5) {
+        instruction->GetLocations()->AddTemp(maybe_temp);
+      }
+    }
   } else {
     HandleInvoke(instruction);
   }
@@ -6990,6 +6998,7 @@ void CodeGeneratorRISCV64::GenerateStaticOrDirectCall(HInvokeStaticOrDirect* inv
       DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
       if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
         // Do not materialize the method pointer, load directly the entrypoint.
+        DCHECK(callee_method.IsInvalid());
         CodeGeneratorRISCV64::PcRelativePatchInfo* info_high =
             NewBootImageJniEntrypointPatch(invoke->GetResolvedMethodReference());
         EmitPcRelativeAuipcPlaceholder(info_high, RA);
@@ -7000,7 +7009,13 @@ void CodeGeneratorRISCV64::GenerateStaticOrDirectCall(HInvokeStaticOrDirect* inv
       }
       FALLTHROUGH_INTENDED;
     default:
-      LoadMethod(invoke->GetMethodLoadKind(), temp, invoke);
+      if (callee_method.IsInvalid()) {
+        DCHECK_EQ(invoke->GetCodePtrLocation(), CodePtrLocation::kCallCriticalNative);
+        // Use RA for both the target method and then the code pointer. The code shall be two
+        // bytes longer because we'll have to use 32-bit instead of 16-bit encoding for one load.
+        callee_method = Location::RegisterLocation(RA);
+      }
+      LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
   }
 

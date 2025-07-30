@@ -27,7 +27,6 @@
 #include "class_root-inl.h"
 #include "class_table.h"
 #include "code_generator_utils.h"
-#include "com_android_art_flags.h"
 #include "dex/dex_file_types.h"
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
@@ -59,8 +58,6 @@ using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 using vixl::ExactAssemblyScope;
 using vixl::CodeBufferCheckScope;
 using vixl::EmissionCheckScope;
-
-namespace art_flags = com::android::art::flags;
 
 #ifdef __
 #error "ARM64 Codegen VIXL macro-assembler macro already defined."
@@ -1355,7 +1352,7 @@ void InstructionCodeGeneratorARM64::VisitMethodEntryHook(HMethodEntryHook* instr
 }
 
 void CodeGeneratorARM64::MaybeRecordTraceEvent(bool is_method_entry) {
-  if (!art_flags::always_enable_profile_code()) {
+  if (!GetCompilerOptions().EnableProfileCode()) {
     return;
   }
 
@@ -5070,6 +5067,7 @@ void CodeGeneratorARM64::GenerateStaticOrDirectCall(
       DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
       if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
         // Do not materialize the method pointer, load directly the entrypoint.
+        DCHECK(callee_method.IsInvalid());
         // Add ADRP with its PC-relative JNI entrypoint patch.
         vixl::aarch64::Label* adrp_label =
             NewBootImageJniEntrypointPatch(invoke->GetResolvedMethodReference());
@@ -5082,7 +5080,12 @@ void CodeGeneratorARM64::GenerateStaticOrDirectCall(
       }
       FALLTHROUGH_INTENDED;
     default:
-      LoadMethod(invoke->GetMethodLoadKind(), temp, invoke);
+      if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
+        // Use LR for both the target method and then the code pointer.
+        DCHECK(callee_method.IsInvalid());
+        callee_method = Location::RegisterLocation(lr.GetCode());
+      }
+      LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
   }
 
