@@ -274,17 +274,27 @@ class FastCompilerARM64 : public FastCompiler {
       uint32_t dest_reg, uint32_t src_reg, DataType::Type type, const Instruction* next);
   bool LoadMethod(Register reg, ArtMethod* method);
   void DoReadBarrierOn(Register reg, vixl::aarch64::Label* exit = nullptr, bool do_mr_check = true);
-  void DoWriteBarrierOn(Register holder, UseScratchRegisterScope& temps);
+  void DoWriteBarrierOn(Register holder,
+                        UseScratchRegisterScope& temps,
+                        bool overwrite_holder = false);
   bool CanGenerateCodeFor(ArtField* field, bool can_receiver_be_null)
       REQUIRES_SHARED(Locks::mutator_lock_);
   bool DoGet(const MemOperand& mem,
              uint16_t field_index,
-             Instruction::Code code,
+             Instruction::Code opcode,
              uint32_t dest_reg,
              bool can_receiver_be_null,
              bool is_object,
              uint32_t dex_pc,
              const Instruction* next);
+  bool DoPut(const MemOperand& mem,
+             Register holder,
+             ArtField* field,
+             Instruction::Code opcode,
+             int32_t source_reg,
+             bool can_receiver_be_null,
+             bool is_object,
+             uint32_t dex_pc);
   bool BuildArrayAccess(const Instruction& instruction,
                         uint32_t dex_pc,
                         bool is_put,
@@ -297,10 +307,11 @@ class FastCompilerARM64 : public FastCompiler {
   bool BuildInstanceFieldSet(const Instruction& instruction,
                              uint32_t dex_pc,
                              bool is_object);
-  bool BuildStaticFieldGet(const Instruction& instruction,
-                           uint32_t dex_pc,
-                           bool is_object,
-                           const Instruction* next);
+  bool BuildStaticFieldAccess(const Instruction& instruction,
+                              uint32_t dex_pc,
+                              bool is_object,
+                              bool is_put,
+                              const Instruction* next);
   void Div(Register dst, Register first, Register second, uint32_t dex_pc);
   void Rem(Register dst, Register first, Register second, uint32_t dex_pc);
 
@@ -614,25 +625,88 @@ bool FastCompilerARM64::MoveLocation(Location destination,
         // Note: the destination may be 64bits, but that's ok.
         __ Mov(dst, source.GetConstant()->AsIntConstant()->GetValue());
         return true;
-      } else if (source.GetConstant()->IsLongConstant()) {
-        DCHECK_EQ(dst_type, DataType::Type::kInt64);
-        DCHECK(dst.Is64Bits());
-        __ Mov(dst, source.GetConstant()->AsLongConstant()->GetValue());
-        return true;
       }
+      DCHECK(source.GetConstant()->IsLongConstant());
+      DCHECK_EQ(dst_type, DataType::Type::kInt64);
+      DCHECK(dst.Is64Bits());
+      __ Mov(dst, source.GetConstant()->AsLongConstant()->GetValue());
+      return true;
     }
     if (source.IsStackSlot() || source.IsDoubleStackSlot()) {
       DCHECK(dst.Is64Bits() == source.IsDoubleStackSlot());
       __ Ldr(dst, StackOperandFrom(source));
       return true;
     }
-  }
-  if (source.IsFpuRegister() || destination.IsFpuRegister()) {
-    unimplemented_reason_ = "MoveFpuLocation";
+    if (source.IsFpuRegister()) {
+      // FPU to core register move (conversion).
+      VRegister src = (dst_type == DataType::Type::kInt64)
+          ? DRegisterFrom(source)
+          : SRegisterFrom(source);
+      __ Fmov(dst, src);
+      return true;
+    }
+    unimplemented_reason_ = "UnimplementedSourceForRegisterDestination";
     return false;
   }
 
-  unimplemented_reason_ = "UnimplementedMoveLocation";
+  if (destination.IsFpuRegister()) {
+    VRegister dst = (dst_type == DataType::Type::kFloat64)
+        ? DRegisterFrom(destination)
+        : SRegisterFrom(destination);
+    if (source.IsFpuRegister()) {
+      VRegister src = (dst_type == DataType::Type::kFloat64)
+          ? DRegisterFrom(source)
+          : SRegisterFrom(source);
+      __ Fmov(dst, src);
+      return true;
+    }
+    if (source.IsStackSlot() || source.IsDoubleStackSlot()) {
+      __ Ldr(dst, StackOperandFrom(source));
+      return true;
+    }
+    if (source.IsRegister()) {
+      Register src = RegisterFrom(
+          source, dst.Is64Bits() ? DataType::Type::kInt64 : DataType::Type::kInt32);
+      __ Fmov(dst, src);
+      return true;
+    }
+    if (source.IsConstant()) {
+      if (source.GetConstant()->IsIntConstant()) {
+        // Note: the destination may be 64bits, but that's ok.
+        __ Fmov(dst, bit_cast<float, int32_t>(source.GetConstant()->AsIntConstant()->GetValue()));
+        return true;
+      }
+      DCHECK(source.GetConstant()->IsLongConstant());
+      DCHECK_EQ(dst_type, DataType::Type::kFloat64);
+      DCHECK(dst.Is64Bits());
+      __ Fmov(dst, bit_cast<double, int64_t>(source.GetConstant()->AsLongConstant()->GetValue()));
+      return true;
+    }
+    unimplemented_reason_ = "UnimplementedSourceForFPURegisterDestination";
+    return false;
+  }
+
+  if (destination.IsStackSlot() || destination.IsDoubleStackSlot()) {
+    if (source.IsRegister()) {
+      DataType::Type src_type = DataType::Is64BitType(dst_type)
+          ? DataType::Type::kInt64
+          : DataType::Type::kInt32;
+      Register src = RegisterFrom(source, src_type);
+      __ Str(src, StackOperandFrom(destination));
+      return true;
+    }
+    if (source.IsFpuRegister()) {
+      VRegister src = DataType::Is64BitType(dst_type)
+          ? DRegisterFrom(source)
+          : SRegisterFrom(source);
+      __ Str(src, StackOperandFrom(destination));
+      return true;
+    }
+    unimplemented_reason_ = "UnimplementedSourceForStackDestination";
+    return false;
+  }
+
+  unimplemented_reason_ = "UnimplementedDestinationLocation";
   return false;
 }
 
@@ -647,72 +721,82 @@ Location FastCompilerARM64::CreateNewRegisterLocation(uint32_t reg,
     InvokeDexCallingConventionVisitorARM64 convention;
     vreg_locations_[reg] = convention.GetReturnLocation(return_type_);
     return vreg_locations_[reg];
-  } else if (vreg_locations_[reg].IsStackSlot() ||
-             vreg_locations_[reg].IsDoubleStackSlot()) {
-    unimplemented_reason_ = "MoveStackSlot";
+  }
+
+  if (vreg_locations_[reg].IsStackSlot() || vreg_locations_[reg].IsDoubleStackSlot()) {
+    unimplemented_reason_ = "NewRegisterFromStackSlot";
     // Return a phony location.
     return DataType::IsFloatingPointType(type)
         ? Location::FpuRegisterLocation(1)
         : Location::RegisterLocation(1);
-  } else if (DataType::IsFloatingPointType(type)) {
+  }
+
+  if (DataType::IsFloatingPointType(type)) {
     if (vreg_locations_[reg].IsFpuRegister()) {
       // Re-use existing register.
       return vreg_locations_[reg];
-    } else if (has_frame_) {
-      // TODO: Regenerate the method with floating point support.
-      unimplemented_reason_ = "FpuRegisterAllocation";
-      vreg_locations_[reg] = Location::FpuRegisterLocation(1);
-      return vreg_locations_[reg];
-    } else {
-      vreg_locations_[reg] =
-          Location::FpuRegisterLocation(kAvailableTempFpuRegisters[reg].GetCode());
-      return vreg_locations_[reg];
     }
-  } else if (vreg_locations_[reg].IsRegister()) {
-    // Re-use existing register.
-    return vreg_locations_[reg];
-  } else {
-    // Get the associated register with `reg`.
     uint32_t register_code = has_frame_
-        ? kAvailableCalleeSaveRegisters[reg].GetCode()
-        : kAvailableTempRegisters[reg].GetCode();
-    vreg_locations_[reg] = Location::RegisterLocation(register_code);
+        ? kAvailableCalleeSaveFpuRegisters[reg].GetCode()
+        : kAvailableTempFpuRegisters[reg].GetCode();
+    vreg_locations_[reg] = Location::FpuRegisterLocation(register_code);
     return vreg_locations_[reg];
   }
+
+  if (vreg_locations_[reg].IsRegister()) {
+    // Re-use existing register.
+    return vreg_locations_[reg];
+  }
+
+  uint32_t register_code = has_frame_
+      ? kAvailableCalleeSaveRegisters[reg].GetCode()
+      : kAvailableTempRegisters[reg].GetCode();
+  vreg_locations_[reg] = Location::RegisterLocation(register_code);
+  return vreg_locations_[reg];
 }
 
 Location FastCompilerARM64::GetExistingRegisterLocation(uint32_t reg, DataType::Type type) {
-  if (vreg_locations_[reg].IsStackSlot() || vreg_locations_[reg].IsDoubleStackSlot()) {
-    unimplemented_reason_ = "MoveStackSlot";
+  if (vreg_locations_[reg].IsInvalid()) {
+    unimplemented_reason_ = "UnverifiedDeadCode";
     // Return a phony location.
     return DataType::IsFloatingPointType(type)
         ? Location::FpuRegisterLocation(1)
         : Location::RegisterLocation(1);
-  } else if (DataType::IsFloatingPointType(type)) {
+  }
+  if (vreg_locations_[reg].IsStackSlot() || vreg_locations_[reg].IsDoubleStackSlot()) {
+    unimplemented_reason_ = "ExistingRegisterFromStackSlot";
+    // Return a phony location.
+    return DataType::IsFloatingPointType(type)
+        ? Location::FpuRegisterLocation(1)
+        : Location::RegisterLocation(1);
+  }
+
+  if (DataType::IsFloatingPointType(type)) {
     if (vreg_locations_[reg].IsFpuRegister()) {
       return vreg_locations_[reg];
-    } else {
-      // TODO: Regenerate the method with floating point support.
-      unimplemented_reason_ = "FpuRegisterAllocation";
-      vreg_locations_[reg] = Location::FpuRegisterLocation(1);
-      return vreg_locations_[reg];
     }
-  } else if (vreg_locations_[reg].IsRegister()) {
-    return vreg_locations_[reg];
-  } else if (vreg_locations_[reg].IsConstant()) {
     uint32_t register_code = has_frame_
-        ? kAvailableCalleeSaveRegisters[reg].GetCode()
-        : kAvailableTempRegisters[reg].GetCode();
-    Location new_location = Location::RegisterLocation(register_code);
+        ? kAvailableCalleeSaveFpuRegisters[reg].GetCode()
+        : kAvailableTempFpuRegisters[reg].GetCode();
+    Location new_location = Location::FpuRegisterLocation(register_code);
     bool res = MoveLocation(new_location, vreg_locations_[reg], type);
     DCHECK(res);
     vreg_locations_[reg] = new_location;
     return new_location;
-  } else {
-    unimplemented_reason_ = "UnknownLocation";
-    vreg_locations_[reg] = Location::RegisterLocation(1);
-    return Location::RegisterLocation(1);
   }
+
+  if (vreg_locations_[reg].IsRegister()) {
+    return vreg_locations_[reg];
+  }
+
+  uint32_t register_code = has_frame_
+      ? kAvailableCalleeSaveRegisters[reg].GetCode()
+      : kAvailableTempRegisters[reg].GetCode();
+  Location new_location = Location::RegisterLocation(register_code);
+  bool res = MoveLocation(new_location, vreg_locations_[reg], type);
+  DCHECK(res);
+  vreg_locations_[reg] = new_location;
+  return new_location;
 }
 
 void FastCompilerARM64::RecordPcInfo(uint32_t dex_pc) {
@@ -813,11 +897,8 @@ bool FastCompilerARM64::EnsureHasFrame() {
   for (int i = 0; i < number_of_vregs; ++i) {
     // Assume any vreg will be held in a callee-save register.
     core_spill_mask_ |= (1 << kAvailableCalleeSaveRegisters[i].GetCode());
-    if (vreg_locations_[i].IsFpuRegister()) {
-      // TODO: Re-generate method with floating points.
-      unimplemented_reason_ = "FloatingPoint";
-      return false;
-    }
+    // TODO: do this lazily for floats, and recompile?
+    fpu_spill_mask_ |= (1 << kAvailableCalleeSaveFpuRegisters[i].GetCode());
   }
   core_spill_mask_ |= (1 << lr.GetCode());
 
@@ -871,7 +952,7 @@ bool FastCompilerARM64::EnsureHasFrame() {
     } else if (vreg_locations_[i].IsConstant() || vreg_locations_[i].IsInvalid()) {
       // Nothing to do.
     } else {
-      unimplemented_reason_ = "Unhandled location";
+      unimplemented_reason_ = "UnhandledLocation";
       return false;
     }
   }
@@ -1540,9 +1621,11 @@ void FastCompilerARM64::DoReadBarrierOn(Register reg,
   }
 }
 
-void FastCompilerARM64::DoWriteBarrierOn(Register holder, UseScratchRegisterScope& temps) {
+void FastCompilerARM64::DoWriteBarrierOn(Register holder,
+                                         UseScratchRegisterScope& temps,
+                                         bool overwrite_holder) {
   Register card = temps.AcquireX();
-  Register temp = temps.AcquireW();
+  Register temp = overwrite_holder ? holder : temps.AcquireW();
   __ Ldr(card, MemOperand(tr, Thread::CardTableOffset<kArm64PointerSize>().Int32Value()));
   __ Lsr(temp, holder, gc::accounting::CardTable::kCardShift);
   __ Strb(card, MemOperand(card, temp.X()));
@@ -1999,6 +2082,24 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
   }
   MemOperand mem = HeapOperand(holder, field->GetOffset());
 
+  return DoPut(mem,
+               holder,
+               field,
+               instruction.Opcode(),
+               source_reg,
+               can_receiver_be_null,
+               is_object,
+               dex_pc);
+}
+
+bool FastCompilerARM64::DoPut(const MemOperand& mem,
+                              Register holder,
+                              ArtField* field,
+                              Instruction::Code opcode,
+                              int32_t source_reg,
+                              bool can_receiver_be_null,
+                              bool is_object,
+                              uint32_t dex_pc) {
   // Need one temp if the stored value is a constant.
   UseScratchRegisterScope temps(GetVIXLAssembler());
   Location src = vreg_locations_[source_reg];
@@ -2023,7 +2124,7 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
     unimplemented_reason_ = "IPUTOnStackSlot";
     return false;
   }
-  if (instruction.Opcode() == Instruction::IPUT_OBJECT) {
+  if (is_object) {
     Register reg = WRegisterFrom(src);
     {
       // Ensure the pc position is recorded immediately after the store instruction.
@@ -2036,27 +2137,44 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
     // If we assign a constant (only null for iput-object), no need for the write
     // barrier.
     if (!assigning_constant) {
+      {
+        ScopedObjectAccess soa(Thread::Current());
+        if (method_->GetDeclaringClass()->HasTypeChecksFailure() &&
+            field->ResolveType() == nullptr) {
+          soa.Self()->ClearException();
+          unimplemented_reason_ = "UnresolvedFieldType";
+          return false;
+        }
+      }
+      // For static access, the holder is already in a temporary, and we can
+      // overwrite it.
+      bool overwrite_holder = (Instruction::FormatOf(opcode) == Instruction::k21c);
       vixl::aarch64::Label exit;
       __ Cbz(reg, &exit);
-      DoWriteBarrierOn(holder, temps);
+      DoWriteBarrierOn(holder, temps, overwrite_holder);
       __ Bind(&exit);
     }
     return true;
   }
   // Ensure the pc position is recorded immediately after the store instruction.
   EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
-  switch (instruction.Opcode()) {
+  switch (opcode) {
     case Instruction::IPUT_BOOLEAN:
-    case Instruction::IPUT_BYTE: {
+    case Instruction::IPUT_BYTE:
+    case Instruction::SPUT_BOOLEAN:
+    case Instruction::SPUT_BYTE: {
       __ Strb(WRegisterFrom(src), mem);
       break;
     }
     case Instruction::IPUT_CHAR:
-    case Instruction::IPUT_SHORT: {
+    case Instruction::IPUT_SHORT:
+    case Instruction::SPUT_CHAR:
+    case Instruction::SPUT_SHORT: {
       __ Strh(WRegisterFrom(src), mem);
       break;
     }
-    case Instruction::IPUT: {
+    case Instruction::IPUT:
+    case Instruction::SPUT: {
       if (src.IsFpuRegister()) {
         __ Str(SRegisterFrom(src), mem);
       } else {
@@ -2064,12 +2182,17 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
       }
       break;
     }
-    case Instruction::IPUT_WIDE: {
-      __ Str(XRegisterFrom(src), mem);
+    case Instruction::IPUT_WIDE:
+    case Instruction::SPUT_WIDE: {
+      if (src.IsFpuRegister()) {
+        __ Str(DRegisterFrom(src), mem);
+      } else {
+        __ Str(XRegisterFrom(src), mem);
+      }
       break;
     }
     default:
-      unimplemented_reason_ = instruction.Name();
+      unimplemented_reason_ = Instruction::Name(opcode);
       return false;
   }
   if (can_receiver_be_null) {
@@ -2078,12 +2201,13 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
   return true;
 }
 
-bool FastCompilerARM64::BuildStaticFieldGet(const Instruction& instruction,
-                                            uint32_t dex_pc,
-                                            bool is_object,
-                                            const Instruction* next) {
+bool FastCompilerARM64::BuildStaticFieldAccess(const Instruction& instruction,
+                                               uint32_t dex_pc,
+                                               bool is_object,
+                                               bool is_put,
+                                               const Instruction* next) {
   if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTSGet";
+    unimplemented_reason_ = "AOTStaticFieldAccess";
     return false;
   }
   // We need a frame for the read barrier.
@@ -2102,14 +2226,14 @@ bool FastCompilerARM64::BuildStaticFieldGet(const Instruction& instruction,
                                          field_index,
                                          method_,
                                          /* is_static= */ true,
-                                         /* is_put= */ false,
+                                         is_put,
                                          /* resolve_field_type= */ 0u);
     if (!CanGenerateCodeFor(field, /* can_receiver_be_null= */ false)) {
       return false;
     }
     Handle<mirror::Class> h_klass = handles_->NewHandle(field->GetDeclaringClass());
     if (!h_klass->IsVisiblyInitialized()) {
-      unimplemented_reason_ = "UninitializedSget";
+      unimplemented_reason_ = "UninitializedStaticAccess";
       return false;
     }
     __ Ldr(temp.W(), jit_patches_.DeduplicateJitClassLiteral(h_klass->GetDexFile(),
@@ -2120,17 +2244,24 @@ bool FastCompilerARM64::BuildStaticFieldGet(const Instruction& instruction,
   __ Ldr(temp.W(), MemOperand(temp.X()));
   DoReadBarrierOn(temp);
   MemOperand mem = HeapOperand(temp.W(), field->GetOffset());
-  if (!DoGet(mem,
-             field_index,
-             instruction.Opcode(),
-             source_or_dest_reg,
-             /* can_receiver_be_null= */ false,
-             is_object,
-             dex_pc,
-             next)) {
-    return false;
+  if (is_put) {
+    return DoPut(mem,
+                 temp,
+                 field,
+                 instruction.Opcode(),
+                 source_or_dest_reg,
+                 /* can_receiver_be_null= */ false,
+                 is_object,
+                 dex_pc);
   }
-  return true;
+  return DoGet(mem,
+               field_index,
+               instruction.Opcode(),
+               source_or_dest_reg,
+               /* can_receiver_be_null= */ false,
+               is_object,
+               dex_pc,
+               next);
 }
 
 void FastCompilerARM64::Div(Register dst, Register first, Register second, uint32_t dex_pc) {
@@ -2933,17 +3064,19 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     case Instruction::SGET_BYTE:
     case Instruction::SGET_CHAR:
     case Instruction::SGET_SHORT: {
-      return BuildStaticFieldGet(instruction, dex_pc, is_object, next);
+      return BuildStaticFieldAccess(instruction, dex_pc, is_object, /* is_put= */ false, next);
     }
 
+    case Instruction::SPUT_OBJECT:
+      is_object = true;
+      FALLTHROUGH_INTENDED;
     case Instruction::SPUT:
     case Instruction::SPUT_WIDE:
-    case Instruction::SPUT_OBJECT:
     case Instruction::SPUT_BOOLEAN:
     case Instruction::SPUT_BYTE:
     case Instruction::SPUT_CHAR:
     case Instruction::SPUT_SHORT: {
-      break;
+      return BuildStaticFieldAccess(instruction, dex_pc, is_object, /* is_put= */ true, next);
     }
 
 #define ARRAY_XX(kind, type)                                                         \
