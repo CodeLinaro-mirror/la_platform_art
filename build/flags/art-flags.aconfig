@@ -48,7 +48,6 @@ flag {
   }
 }
 
-# TODO(b/352723620): Ramp this fully, then add tests with it.
 flag {
   name: "test"
   namespace: "art_mainline"
@@ -155,4 +154,22 @@ flag {
   bug: "434137291"
   is_fixed_read_only: true
   is_exported: true
+}
+
+flag {
+  name: "hiddenapi_jni_api_callers"
+  namespace: "art_mainline"
+  description: "Make hiddenapi accurately identify native JNI API callers"
+  bug: "403305904"
+  is_fixed_read_only: true
+  is_exported: false
+}
+
+flag {
+  name: "hiddenapi_platform_enforcement"
+  namespace: "art_mainline"
+  description: "Enforce core platform (ART+Conscrypt) APIs from platform callers"
+  bug: "377676642"
+  is_fixed_read_only: true
+  is_exported: false
 }
