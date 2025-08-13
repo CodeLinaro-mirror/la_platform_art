@@ -565,6 +565,7 @@ bool FastCompilerARM64::ProcessInstructions() {
   DexInstructionIterator it = GetCodeItemAccessor().begin();
   DexInstructionIterator end = GetCodeItemAccessor().end();
   DCHECK(it != end);
+  bool flow_continues = false;
   do {
     DexInstructionPcPair pair = *it;
     ++it;
@@ -583,8 +584,10 @@ bool FastCompilerARM64::ProcessInstructions() {
     }
     vixl::aarch64::Label* label = GetLabelOf(pair.DexPc());
     if (label->IsLinked()) {
-      // Emulate a branch to this pc.
-      PrepareToBranch(pair.DexPc());
+      if (flow_continues) {
+        // Emulate a branch to this pc.
+        PrepareToBranch(pair.DexPc());
+      }
       // Set new masks based on all incoming edges.
       is_non_null_mask_ = is_non_null_masks_[pair.DexPc()];
       object_register_mask_ = object_register_masks_[pair.DexPc()];
@@ -624,6 +627,10 @@ bool FastCompilerARM64::ProcessInstructions() {
         << " " << pair.Inst().Name() << "@" << pair.DexPc();
 
     DCHECK(!HitUnimplemented()) << GetUnimplementedReason();
+
+    // For the next instruction, let it know if the previous instruction was
+    // flowing through.
+    flow_continues = pair.Inst().CanFlowThrough();
   } while (it != end);
   return true;
 }
@@ -867,7 +874,6 @@ void FastCompilerARM64::RecordPcInfo(uint32_t dex_pc) {
         }
 
         case Location::kRegister: {
-          int id = location.reg();
           stack_map_stream->AddDexRegisterEntry(Kind::kInRegister, location.reg());
           DCHECK(!compiler_options_.GetDebuggable());
           // Note: if we were using the fast compiler for debuggable, we would
@@ -927,8 +933,10 @@ bool FastCompilerARM64::EnsureHasFrame() {
                                                           core_spill_mask_,
                                                           fpu_spill_mask_,
                                                           GetCodeItemAccessor().RegistersSize(),
-                                                          /* is_compiling_baseline= */ true,
-                                                          /* is_debuggable= */ false);
+                                                          /* is_compiling_baseline= */ false,
+                                                          /* is_debuggable= */ false,
+                                                          /* has_should_deoptimize_flag= */ false,
+                                                          /* is_fast= */ true);
   MacroAssembler* masm = GetVIXLAssembler();
   {
     UseScratchRegisterScope temps(masm);
@@ -981,12 +989,11 @@ bool FastCompilerARM64::EnsureHasFrame() {
   // Increment hotness. We use the ArtMethod's counter as we're not allocating a
   // `ProfilingInfo` object in the fast baseline compiler.
   if (!Runtime::Current()->IsAotCompiler()) {
-    uint64_t address = reinterpret_cast64<uint64_t>(method_);
     UseScratchRegisterScope temps(masm);
     Register counter = temps.AcquireW();
     vixl::aarch64::Label increment, done;
     uint32_t entrypoint_offset =
-        GetThreadOffset<kArm64PointerSize>(kQuickCompileOptimized).Int32Value();
+        GetThreadOffset<kArm64PointerSize>(kQuickCompileBaseline).Int32Value();
 
     __ Ldrh(counter, MemOperand(kArtMethodRegister, ArtMethod::HotnessCountOffset().Int32Value()));
     __ Cbnz(counter, &increment);
@@ -3325,7 +3332,9 @@ bool FastCompilerARM64::Compile() {
                                   /* fp_spill_mask= */ 0u,
                                   GetCodeItemAccessor().RegistersSize(),
                                   /* is_compiling_baseline= */ true,
-                                  /* is_debuggable= */ false);
+                                  /* is_debuggable= */ false,
+                                  /* has_should_deoptimize_flag= */ false,
+                                  /* is_fast= */ true);
   }
 
   // Catch stack maps are pushed at the end.
@@ -3355,20 +3364,22 @@ bool FastCompilerARM64::Compile() {
       VLOG(jit) << "Dumping generated fast baseline code for " << method_->PrettyMethod();
     }
     FILE* file = tmpfile();
-    MacroAssembler* masm = GetVIXLAssembler();
-    PrintDisassembler print_disasm(file);
-    vixl::aarch64::Instruction* dis_start =
-        masm->GetBuffer()->GetStartAddress<vixl::aarch64::Instruction*>();
-    vixl::aarch64::Instruction* dis_end =
-        masm->GetBuffer()->GetEndAddress<vixl::aarch64::Instruction*>();
-    print_disasm.DisassembleBuffer(dis_start, dis_end);
-    fseek(file, 0L, SEEK_SET);
-    char buffer[1024];
-    const char* line;
-    while ((line = fgets(buffer, sizeof(buffer), file)) != nullptr) {
-      VLOG(jit) << std::string(line);
+    if (file != nullptr) {
+      MacroAssembler* masm = GetVIXLAssembler();
+      PrintDisassembler print_disasm(file);
+      vixl::aarch64::Instruction* dis_start =
+          masm->GetBuffer()->GetStartAddress<vixl::aarch64::Instruction*>();
+      vixl::aarch64::Instruction* dis_end =
+          masm->GetBuffer()->GetEndAddress<vixl::aarch64::Instruction*>();
+      print_disasm.DisassembleBuffer(dis_start, dis_end);
+      fseek(file, 0L, SEEK_SET);
+      char buffer[1024];
+      const char* line;
+      while ((line = fgets(buffer, sizeof(buffer), file)) != nullptr) {
+        VLOG(jit) << std::string(line);
+      }
+      fclose(file);
     }
-    fclose(file);
   }
   return true;
 }

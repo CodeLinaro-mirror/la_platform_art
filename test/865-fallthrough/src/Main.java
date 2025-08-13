@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 The Android Open Source Project
+ * Copyright (C) 2025 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,25 +14,18 @@
  * limitations under the License.
  */
 
-#ifndef ART_RUNTIME_COMPILATION_KIND_H_
-#define ART_RUNTIME_COMPILATION_KIND_H_
+public class Main {
 
-#include <iosfwd>
-#include <stdint.h>
+  public static void main(String[] args) throws Exception {
+    Class<?> cls = Class.forName("TestCase");
+    Object o1 = cls.newInstance();
+    Object o2 = cls.getDeclaredMethod("test", int.class).invoke(o1, 0);
+    if (o1 != o2) {
+      throw new Error("Different objects");
+    }
+  }
 
-#include "base/macros.h"
-
-namespace art HIDDEN {
-
-enum class CompilationKind {
-  kOsr = 0,
-  kFast = 1,
-  kBaseline = 2,
-  kOptimized = 3,
-};
-
-std::ostream& operator<<(std::ostream& os, CompilationKind rhs);
-
-}  // namespace art
-
-#endif  // ART_RUNTIME_COMPILATION_KIND_H_
+  public static void invokeGc() {
+    Runtime.getRuntime().gc();
+  }
+}

@@ -2103,7 +2103,7 @@ IterationRange<HSTLInstructionIterator<InnerIter>> MakeSTLInstructionIteratorRan
 class HVariableInputSizeInstruction : public HInstruction {
  public:
   using HInstruction::GetInputRecords;  // Keep the const version visible.
-  ArrayRef<HUserRecord<HInstruction*>> GetInputRecords() override {
+  ArrayRef<HUserRecord<HInstruction*>> GetInputRecords() final {
     return ArrayRef<HUserRecord<HInstruction*>>(inputs_);
   }
 
@@ -4196,25 +4196,6 @@ class HInvokeStaticOrDirect final : public HInvoke {
 
   DispatchInfo GetDispatchInfo() const {
     return dispatch_info_;
-  }
-
-  using HInstruction::GetInputRecords;  // Keep the const version visible.
-  ArrayRef<HUserRecord<HInstruction*>> GetInputRecords() override {
-    ArrayRef<HUserRecord<HInstruction*>> input_records = HInvoke::GetInputRecords();
-    if (kIsDebugBuild && IsStaticWithExplicitClinitCheck()) {
-      DCHECK(!input_records.empty());
-      DCHECK_GT(input_records.size(), GetNumberOfArguments());
-      HInstruction* last_input = input_records.back().GetInstruction();
-      // Note: `last_input` may be null during arguments setup.
-      if (last_input != nullptr) {
-        // `last_input` is the last input of a static invoke marked as having
-        // an explicit clinit check. It must either be:
-        // - an art::HClinitCheck instruction, set by art::HGraphBuilder; or
-        // - an art::HLoadClass instruction, set by art::PrepareForRegisterAllocation.
-        DCHECK(last_input->IsClinitCheck() || last_input->IsLoadClass()) << last_input->DebugName();
-      }
-    }
-    return input_records;
   }
 
   bool CanDoImplicitNullCheckOn([[maybe_unused]] HInstruction* obj) const override {
@@ -7711,27 +7692,6 @@ class HGraphVisitor : public ValueObject {
   DISALLOW_COPY_AND_ASSIGN(HGraphVisitor);
 };
 
-class HGraphDelegateVisitor : public HGraphVisitor {
- public:
-  explicit HGraphDelegateVisitor(HGraph* graph, OptimizingCompilerStats* stats = nullptr)
-      : HGraphVisitor(graph, stats) {}
-  virtual ~HGraphDelegateVisitor() {}
-
-  // Visit functions that delegate to super class.
-#define DECLARE_VISIT_ABSTRACT_INSTRUCTION(name, super)               \
-  virtual void Visit##name(H##name* instr) { Visit##super(instr); }
-  FOR_EACH_ABSTRACT_INSTRUCTION(DECLARE_VISIT_ABSTRACT_INSTRUCTION)
-#undef DECLARE_VISIT_ABSTRACT_INSTRUCTION
-
-#define DECLARE_VISIT_CONCRETE_INSTRUCTION(name, super)               \
-  void Visit##name(H##name* instr) override { Visit##super(instr); }
-  FOR_EACH_CONCRETE_INSTRUCTION(DECLARE_VISIT_CONCRETE_INSTRUCTION)
-#undef DECLARE_VISIT_CONCRETE_INSTRUCTION
-
- private:
-  DISALLOW_COPY_AND_ASSIGN(HGraphDelegateVisitor);
-};
-
 // Graph visitor class template that's using the Curiously Recurring Template Pattern to avoid
 // virtual dispatch in the visitor design pattern and allows inlining individual visit functions
 // if the compiler deems it beneficial. For further optimizations, see `Dispatch()`.
@@ -7802,6 +7762,13 @@ class CRTPGraphVisitor {
       default:
         LOG(FATAL) << "UNREACHABLE";  // Should be optimized away in both debug and release build.
         UNREACHABLE();
+    }
+  }
+
+  // Visit the graph following basic block insertion order.
+  void VisitInsertionOrder() {
+    for (HBasicBlock* block : graph_->GetActiveBlocks()) {
+      down_cast<T*>(this)->VisitBasicBlock(block);
     }
   }
 
@@ -7925,12 +7892,13 @@ HInstruction* ReplaceInstrOrPhiByClone(HInstruction* instr);
 // Create a clone for each clonable instructions/phis and replace the original with the clone.
 //
 // Used for testing individual instruction cloner.
-class CloneAndReplaceInstructionVisitor final : public HGraphDelegateVisitor {
+class CloneAndReplaceInstructionVisitor final
+    : public CRTPGraphVisitor<CloneAndReplaceInstructionVisitor> {
  public:
   explicit CloneAndReplaceInstructionVisitor(HGraph* graph)
-      : HGraphDelegateVisitor(graph), instr_replaced_by_clones_count_(0) {}
+      : CRTPGraphVisitor(graph), instr_replaced_by_clones_count_(0) {}
 
-  void VisitInstruction(HInstruction* instruction) override {
+  void VisitInstruction(HInstruction* instruction) {
     if (instruction->IsClonable()) {
       ReplaceInstrOrPhiByClone(instruction);
       instr_replaced_by_clones_count_++;
