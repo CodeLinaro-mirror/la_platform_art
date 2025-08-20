@@ -1737,13 +1737,14 @@ static bool PatchDexCacheLocations(Handle<mirror::ObjectArray<mirror::DexCache>>
         dex_cache->GetLocation(/*allow_location_mismatch=*/true)->ToModifiedUtf8();
     const DexFile* dex_file = dex_cache->GetDexFile();
     if (dex_file_location != dex_file->GetLocation()) {
-      ObjPtr<mirror::String> location = intern_table->InternWeak(dex_file->GetLocation().c_str());
+      ObjPtr<mirror::String> location =
+          mirror::String::AllocFromModifiedUtf8(self, dex_file->GetLocation().c_str());
       if (location == nullptr) {
         self->AssertPendingOOMException();
-        *error_msg = "Failed to intern string for dex cache location";
+        *error_msg = "Failed to allocate string for dex cache location";
         return false;
       }
-      dex_cache->SetLocation(location);
+      dex_cache->SetLocation(intern_table->InternWeak(location));
     }
   }
   return true;
@@ -2801,14 +2802,15 @@ ObjPtr<mirror::DexCache> ClassLinker::AllocDexCache(Thread* self, const DexFile&
     self->AssertPendingOOMException();
     return nullptr;
   }
-  // Use InternWeak() so that the location String can be collected when the ClassLoader
-  // with this DexCache is collected.
-  ObjPtr<mirror::String> location = intern_table_->InternWeak(dex_file.GetLocation().c_str());
+  ObjPtr<mirror::String> location =
+      mirror::String::AllocFromModifiedUtf8(self, dex_file.GetLocation().c_str());
   if (location == nullptr) {
     self->AssertPendingOOMException();
     return nullptr;
   }
-  dex_cache->SetLocation(location);
+  // Use InternWeak() so that the location String can be collected when the ClassLoader
+  // with this DexCache is collected.
+  dex_cache->SetLocation(intern_table_->InternWeak(location));
   return dex_cache.Get();
 }
 
@@ -4928,6 +4930,20 @@ ObjPtr<mirror::Class> ClassLinker::CreateArrayClass(Thread* self,
     component_type.Assign(
         LookupClass(self, component_descriptor, component_hash, class_loader.Get()));
     if (component_type == nullptr || Runtime::Current()->IsAotCompiler()) {
+      DCHECK(self->IsExceptionPending());
+      return nullptr;
+    } else if (!component_type->IsErroneousUnresolved()) {
+      // FindClass failed, but subsequent LookupClass returned a class that is not erroneous and
+      // unresolved. This might happen in few cases when classes are loaded by multiple threads:
+      // * if current thread is a runtime thread and there is a custom class loader in the chain
+      // * if there is a custom class loader that fails to load a class but succeeds later
+      // * if more dex files are registered in between FindClass and LookupClass calls
+      // In any of those cases the class returned from LookupClass might be temporary and should
+      // not be used as component class without waiting for resolution, which might fail and
+      // require further checks.
+      //
+      // The initial call to FindClass failed for a reason other than loading an erroneous class,
+      // it is ok to fail array class creation.
       DCHECK(self->IsExceptionPending());
       return nullptr;
     } else {
