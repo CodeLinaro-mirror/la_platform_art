@@ -319,6 +319,8 @@ class RegisterAllocatorLinearScan::LinearScan {
 
   // Temporary array, allocated ahead of time for simplicity.
   size_t* registers_array_;
+
+  ArrayRef<HInstruction* const> safepoints_;
 };
 
 RegisterAllocatorLinearScan::RegisterAllocatorLinearScan(ScopedArenaAllocator* allocator,
@@ -485,7 +487,8 @@ RegisterAllocatorLinearScan::LinearScan::LinearScan(
       inactive_(allocator->Adapter(kArenaAllocRegisterAllocator)),
       instructions_from_positions_(register_allocator->liveness_.GetInstructionsFromPositions()),
       registers_array_(
-          allocator->AllocArray<size_t>(number_of_registers_, kArenaAllocRegisterAllocator)) {
+          allocator->AllocArray<size_t>(number_of_registers_, kArenaAllocRegisterAllocator)),
+      safepoints_(register_allocator->safepoints_) {
   // Add intervals representing groups of physical registers blocked for calls,
   // catch blocks and irreducible loop headers.
   LiveInterval* block_registers_intervals[] = {
@@ -538,13 +541,16 @@ void RegisterAllocatorLinearScan::ProcessInstruction(HInstruction* instruction) 
     block_registers_for_call_interval_->AddRange(position, position + kLivenessPositionsToBlock);
   }
   CheckForTempLiveIntervals(instruction, will_call);
+  size_t num_safepoints_after = safepoints_.size();
   CheckForSafepoint(instruction);
   CheckForFixedInputs(instruction, will_call);
 
   LiveInterval* current = instruction->GetLiveInterval();
-  if (current == nullptr)
+  if (current == nullptr) {
     return;
+  }
 
+  current->SetNumSafepointsAfter(num_safepoints_after);
   const bool core_register = !DataType::IsFloatingPointType(instruction->GetType());
   ScopedArenaVector<LiveInterval*>& unhandled =
       core_register ? unhandled_core_intervals_ : unhandled_fp_intervals_;
@@ -555,7 +561,6 @@ void RegisterAllocatorLinearScan::ProcessInstruction(HInstruction* instruction) 
     current->AddHighInterval();
   }
 
-  AddSafepointsFor(instruction);
   current->ResetSearchCache();
   CheckForFixedOutput(instruction, will_call);
 
@@ -656,35 +661,6 @@ void RegisterAllocatorLinearScan::CheckForFixedInputs(HInstruction* instruction,
   }
 }
 
-void RegisterAllocatorLinearScan::AddSafepointsFor(HInstruction* instruction) {
-  LiveInterval* current = instruction->GetLiveInterval();
-  SafepointPositionList list;
-  auto before = list.before_begin();
-  for (size_t safepoint_index = safepoints_.size(); safepoint_index > 0; --safepoint_index) {
-    HInstruction* safepoint = safepoints_[safepoint_index - 1u];
-    size_t safepoint_position = SafepointPosition::ComputePosition(safepoint);
-
-    // Test that safepoints are ordered in the optimal way.
-    DCHECK(safepoint_index == safepoints_.size() ||
-           safepoints_[safepoint_index]->GetLifetimePosition() < safepoint_position);
-
-    if (safepoint_position == current->GetStart()) {
-      // The safepoint is for this instruction, so the location of the instruction
-      // does not need to be saved.
-      DCHECK_EQ(safepoint_index, safepoints_.size());
-      DCHECK_EQ(safepoint, instruction);
-      continue;
-    } else if (current->IsDeadAt(safepoint_position)) {
-      break;
-    } else if (!current->Covers(safepoint_position)) {
-      // Hole in the interval.
-      continue;
-    }
-    before = list.insert_after(before, *current->CreateSafepointPosition(safepoint));
-  }
-  current->SetSafepointPositions(std::move(list));
-}
-
 void RegisterAllocatorLinearScan::CheckForFixedOutput(HInstruction* instruction, bool will_call) {
   LocationSummary* locations = instruction->GetLocations();
   size_t position = instruction->GetLifetimePosition();
@@ -697,17 +673,26 @@ void RegisterAllocatorLinearScan::CheckForFixedOutput(HInstruction* instruction,
   //
   // The backwards walking ensures the ranges are ordered on increasing start positions.
   Location output = locations->Out();
-  if (output.IsUnallocated() && output.GetPolicy() == Location::kSameAsFirstInput) {
-    Location first = locations->InAt(0);
-    if (first.IsRegister() || first.IsFpuRegister()) {
-      current->SetFrom(position + kLivenessPositionOfFixedOutput);
-      current->SetRegister(first.reg());
-    } else if (first.IsPair()) {
-      current->SetFrom(position + kLivenessPositionOfFixedOutput);
-      current->SetRegister(first.low());
-      LiveInterval* high = current->GetHighInterval();
-      high->SetRegister(first.high());
-      high->SetFrom(position + kLivenessPositionOfFixedOutput);
+  if (output.IsUnallocated()) {
+    if (output.GetPolicy() == Location::kSameAsFirstInput) {
+      DCHECK(locations->OutputCanOverlapWithInputs());
+      Location first = locations->InAt(0);
+      if (first.IsRegister() || first.IsFpuRegister()) {
+        current->SetFrom(position + kLivenessPositionOfFixedOutput);
+        current->SetRegister(first.reg());
+      } else if (first.IsPair()) {
+        current->SetFrom(position + kLivenessPositionOfFixedOutput);
+        current->SetRegister(first.low());
+        LiveInterval* high = current->GetHighInterval();
+        high->SetRegister(first.high());
+        high->SetFrom(position + kLivenessPositionOfFixedOutput);
+      }
+    } else if (com::android::art::flags::reg_alloc_no_output_overlap() &&
+               !locations->OutputCanOverlapWithInputs()) {
+      current->SetFrom(position + kLivenessPositionOfNonOverlappingOutput);
+      if (current->HasHighInterval()) {
+        current->GetHighInterval()->SetFrom(position + kLivenessPositionOfNonOverlappingOutput);
+      }
     }
   } else if (output.IsRegister() || output.IsFpuRegister()) {
     // Shift the interval's start by one to account for the blocked register.
@@ -730,7 +715,7 @@ void RegisterAllocatorLinearScan::CheckForFixedOutput(HInstruction* instruction,
   } else if (output.IsStackSlot() || output.IsDoubleStackSlot()) {
     current->SetSpillSlot(output.GetStackIndex());
   } else {
-    DCHECK(output.IsUnallocated() || output.IsConstant());
+    DCHECK(output.IsConstant());
   }
 }
 
@@ -1071,29 +1056,31 @@ bool RegisterAllocatorLinearScan::LinearScan::TryAllocateFreeReg(LiveInterval* c
     }
   }
 
-  // An interval that starts an instruction (that is, it is not split), may
-  // re-use the registers used by the inputs of that instruciton, based on the
-  // location summary.
-  HInstruction* defined_by = current->GetDefinedBy();
-  if (defined_by != nullptr && !current->IsSplit()) {
-    LocationSummary* locations = defined_by->GetLocations();
-    if (!locations->OutputCanOverlapWithInputs() && locations->Out().IsUnallocated()) {
-      HInputsRef inputs = defined_by->GetInputs();
-      for (size_t i = 0; i < inputs.size(); ++i) {
-        if (locations->InAt(i).IsValid()) {
-          // Take the last interval of the input. It is the location of that interval
-          // that will be used at `defined_by`.
-          LiveInterval* interval = inputs[i]->GetLiveInterval()->GetLastSibling();
-          // Note that interval may have not been processed yet.
-          // TODO: Handle non-split intervals last in the work list.
-          if (interval->HasRegister() && interval->SameRegisterKind(*current)) {
-            // The input must be live until the end of `defined_by`, to comply to
-            // the linear scan algorithm. So we use `defined_by`'s end lifetime
-            // position to check whether the input is dead or is inactive after
-            // `defined_by`.
-            DCHECK(interval->CoversSlow(defined_by->GetLifetimePosition()));
-            size_t position = defined_by->GetLifetimePosition() + kLivenessPositionOfNormalUse;
-            FreeIfNotCoverAt(interval, position, free_until);
+  if (!com::android::art::flags::reg_alloc_no_output_overlap()) {
+    // An interval that starts an instruction (that is, it is not split), may
+    // re-use the registers used by the inputs of that instruciton, based on the
+    // location summary.
+    HInstruction* defined_by = current->GetDefinedBy();
+    if (defined_by != nullptr && !current->IsSplit()) {
+      LocationSummary* locations = defined_by->GetLocations();
+      if (!locations->OutputCanOverlapWithInputs() && locations->Out().IsUnallocated()) {
+        HInputsRef inputs = defined_by->GetInputs();
+        for (size_t i = 0; i < inputs.size(); ++i) {
+          if (locations->InAt(i).IsValid()) {
+            // Take the last interval of the input. It is the location of that interval
+            // that will be used at `defined_by`.
+            LiveInterval* interval = inputs[i]->GetLiveInterval()->GetLastSibling();
+            // Note that interval may have not been processed yet.
+            // TODO: Handle non-split intervals last in the work list.
+            if (interval->HasRegister() && interval->SameRegisterKind(*current)) {
+              // The input must be live until the end of `defined_by`, to comply to
+              // the linear scan algorithm. So we use `defined_by`'s end lifetime
+              // position to check whether the input is dead or is inactive after
+              // `defined_by`.
+              DCHECK(interval->CoversSlow(defined_by->GetLifetimePosition()));
+              size_t position = defined_by->GetLifetimePosition() + kLivenessPositionOfNormalUse;
+              FreeIfNotCoverAt(interval, position, free_until);
+            }
           }
         }
       }
@@ -1218,7 +1205,7 @@ int RegisterAllocatorLinearScan::LinearScan::FindAvailableRegister(ArrayRef<size
   // We special case intervals that do not span a safepoint to try to find a caller-save
   // register if one is available. We iterate from 0 to the number of registers,
   // so if there are caller-save registers available at the end, we continue the iteration.
-  bool prefers_caller_save = !current->HasWillCallSafepoint();
+  bool prefers_caller_save_checked = false;
   int reg = kNoRegister;
   for (size_t i : Range(number_of_registers_)) {
     if (IsBlocked(i)) {
@@ -1228,7 +1215,12 @@ int RegisterAllocatorLinearScan::LinearScan::FindAvailableRegister(ArrayRef<size
 
     // Best case: we found a register fully available.
     if (next_use[i] == kMaxLifetimePosition) {
-      if (prefers_caller_save && !IsCallerSaveRegister(i)) {
+      // If we have previously checked that we prefer a caller-save register for this interval,
+      // the `!HasWillCallSafepoint()` must be true, otherwise we would have left the loop.
+      DCHECK_IMPLIES(prefers_caller_save_checked, !current->HasWillCallSafepoint(safepoints_));
+      if (!IsCallerSaveRegister(i) &&
+          (prefers_caller_save_checked || !current->HasWillCallSafepoint(safepoints_))) {
+        prefers_caller_save_checked = true;
         // We can get shorter encodings on some platforms by using
         // small register numbers. So only update the candidate if the previous
         // one was not available for the whole method.
@@ -1237,11 +1229,10 @@ int RegisterAllocatorLinearScan::LinearScan::FindAvailableRegister(ArrayRef<size
         }
         // Continue the iteration in the hope of finding a caller save register.
         continue;
-      } else {
-        reg = i;
-        // We know the register is good enough. Return it.
-        break;
       }
+      // We know the register is good enough. Return it.
+      reg = i;
+      break;
     }
 
     // If we had no register before, take this one as a reference.
@@ -1329,10 +1320,10 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
   ArrayRef<size_t> next_use = GetRegistersArray();
   std::fill_n(next_use.begin(), next_use.size(), kMaxLifetimePosition);
 
-  // For each active interval, find the next use of its register after the
-  // start of current.
+  // For each active interval, find the next use of its register after the start of `current`.
+  size_t start = current->GetStart();
   for (LiveInterval* active : active_) {
-    size_t use = current->GetStart();
+    size_t use = start;
     if (active->HasRegister()) {
       size_t reg = active->GetRegister();
       bool has_use_after = true;
@@ -1376,7 +1367,7 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
           next_use[reg] = std::min(next_intersection, next_use[reg]);
         }
       } else {
-        size_t use = inactive->FirstUseAfter(current->GetStart());
+        size_t use = inactive->FirstUseAfter(start);
         if (use != kNoLifetime) {
           next_use[inactive->GetRegister()] = std::min(use, next_use[inactive->GetRegister()]);
         }
@@ -1405,7 +1396,7 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
   DCHECK_NE(reg, kNoRegister);
   if (should_spill) {
     DCHECK(!current->IsHighInterval());
-    bool is_allocation_at_use_site = (current->GetStart() >= (first_register_use - 1));
+    bool is_allocation_at_use_site = (start >= (first_register_use - 1));
     if (is_allocation_at_use_site) {
       if (!current->IsLowInterval()) {
         DumpInterval(std::cerr, current);
@@ -1425,9 +1416,7 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
       // non-pair intervals or unaligned pair intervals blocking the allocation.
       // We split the first interval found, and put ourselves first in the
       // `unhandled_` list.
-      bool success = TrySplitNonPairOrUnalignedPairIntervalAt(current->GetStart(),
-                                                              first_register_use,
-                                                              next_use);
+      bool success = TrySplitNonPairOrUnalignedPairIntervalAt(start, first_register_use, next_use);
       DCHECK(success);
       LiveInterval* existing = unhandled_.back();
       DCHECK(existing->IsHighInterval());
@@ -1437,7 +1426,7 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
       // If the first use of that instruction is after the last use of the found
       // register, we split this interval just before its first register use.
       AllocateSpillSlotFor(current);
-      LiveInterval* split = SplitBetween(current, current->GetStart(), first_register_use - 1);
+      LiveInterval* split = SplitBetween(current, start, first_register_use - 1);
       DCHECK(current != split);
       AddSorted(&unhandled_, split);
     }
@@ -1452,12 +1441,35 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
       DCHECK_IMPLIES(active->IsFixed(), (GetRegisterMask(active) & (1u << reg)) == 0u);
       if (active->GetRegister() == reg) {
         DCHECK(!active->IsFixed());
-        LiveInterval* split = Split(active, current->GetStart());
+        LiveInterval* split = Split(active, start);
         if (split != active) {
           handled_.push_back(active);
         }
         RemoveIntervalAndPotentialOtherHalf(&active_, it);
-        AddSorted(&unhandled_, split);
+        if (com::android::art::flags::reg_alloc_no_output_overlap() &&
+            start % kLivenessPositionsPerInstruction == kLivenessPositionOfNonOverlappingOutput) {
+          // If we're splitting an active interval in the middle of instruction for non-overlapping
+          // output, we cannot insert parallel moves in the middle of that instruction. Going back
+          // to the start of the instruction would be difficult (bringing back already handled
+          // inputs that die at the instruction, treating the output as live before its lifetime
+          // starts), so we force spilling the active interval, avoiding a register for the second
+          // half of the instruction's lifetime. If it has a register use later, we split it twice.
+          // Note: This can result in suboptimal register allocation only if register pairs are
+          // involved. For single-register intervals, the `split` would be spilled later anyway.
+          DCHECK(split != active);
+          DCHECK_EQ(start, split->GetStart());
+          AllocateSpillSlotFor(split->IsHighInterval() ? split->GetLowInterval() : split);
+          handled_.push_back(split);
+          size_t register_use = split->FirstRegisterUseAfter(start);
+          if (register_use != kNoLifetime) {
+            LiveInterval* second_split = SplitBetween(split, start, register_use - 1);
+            DCHECK(second_split != split);
+            DCHECK_LT(start, second_split->GetStart());
+            AddSorted(&unhandled_, second_split);
+          }
+        } else {
+          AddSorted(&unhandled_, split);
+        }
         break;
       }
     }
@@ -1484,7 +1496,7 @@ bool RegisterAllocatorLinearScan::LinearScan::AllocateBlockedReg(LiveInterval* c
             } else {
               // Split at the start of `current`, which will lead to splitting
               // at the end of the lifetime hole of `inactive`.
-              LiveInterval* split = Split(inactive, current->GetStart());
+              LiveInterval* split = Split(inactive, start);
               // If it's inactive, it must start before the current interval.
               DCHECK_NE(split, inactive);
               it = RemoveIntervalAndPotentialOtherHalf(&inactive_, it);
