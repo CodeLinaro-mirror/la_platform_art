@@ -468,7 +468,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
     return GetLabelOf(block)->Position();
   }
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
   void Finalize() override;
@@ -514,8 +514,6 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   void Initialize() override {
     block_labels_ = CommonInitializeLabels<Label>();
   }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.

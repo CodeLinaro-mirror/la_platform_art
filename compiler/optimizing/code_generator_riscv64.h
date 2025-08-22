@@ -483,7 +483,7 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
 
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, XRegister klass);
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
 
   size_t SaveCoreRegister(size_t stack_index, uint32_t reg_id) override;
   size_t RestoreCoreRegister(size_t stack_index, uint32_t reg_id) override;
@@ -515,8 +515,6 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
                                            SlowPathCode* slow_path);
 
   ParallelMoveResolver* GetMoveResolver() override { return &move_resolver_; }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   void IncreaseFrame(size_t adjustment) override;
   void DecreaseFrame(size_t adjustment) override;

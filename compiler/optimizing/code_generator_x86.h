@@ -485,7 +485,7 @@ class CodeGeneratorX86 : public CodeGenerator {
     return GetLabelOf(block)->Position();
   }
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
 
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
@@ -603,10 +603,6 @@ class CodeGeneratorX86 : public CodeGenerator {
 
   void Initialize() override {
     block_labels_ = CommonInitializeLabels<Label>();
-  }
-
-  bool NeedsTwoRegisters(DataType::Type type) const override {
-    return type == DataType::Type::kInt64;
   }
 
   bool ShouldSplitLongMoves() const override { return true; }

@@ -735,7 +735,7 @@ class CodeGeneratorARM64 : public CodeGenerator {
 
   // Register allocation.
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
 
   size_t SaveCoreRegister(size_t stack_index, uint32_t reg_id) override;
   size_t RestoreCoreRegister(size_t stack_index, uint32_t reg_id) override;
@@ -820,8 +820,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
                                            SlowPathCode* slow_path);
 
   ParallelMoveResolverARM64* GetMoveResolver() override { return &move_resolver_; }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.

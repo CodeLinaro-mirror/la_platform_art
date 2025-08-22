@@ -590,7 +590,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void FixJumpTables();
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
 
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
@@ -660,10 +660,6 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void Finalize() override;
-
-  bool NeedsTwoRegisters(DataType::Type type) const override {
-    return type == DataType::Type::kFloat64 || type == DataType::Type::kInt64;
-  }
 
   void ComputeSpillMask() override;
 
