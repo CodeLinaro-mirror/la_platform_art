@@ -51,54 +51,21 @@ FuzzerCompiledMethodStorage storage;
 extern "C" int LLVMFuzzerInitialize([[maybe_unused]] int* argc, [[maybe_unused]] char*** argv) {
   callbacks.reset(new FuzzerCompilerCallbacks());
   FuzzerInitialize(callbacks.get());
-  compiler_options = CreateCompilerOptions();
+  compiler_options = CreateCompilerOptions(/*is_baseline=*/ false);
   compiler.reset(CreateCompiler(*compiler_options, &storage));
   return 0;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-  // Note that we ignore the resulting DEX file from `VerifyDexFile` since we want to copy `data` to
-  // manage it ourselves.
-  if (VerifyDexFile(data, size, "fuzz.dex") == nullptr) {
-    // DEX file couldn't be verified, don't save it in the corpus.
-    return -1;
-  }
-
-  // Copy data to keep it alive. Use unique_ptr so that we don't leak.
-  data_to_delete.emplace_back(new uint8_t[size]);
-  uint8_t* new_data = data_to_delete.back().get();
-  memcpy(new_data, data, size);
-
-  dex_files_to_delete.emplace_back(
-      new StandardDexFile(new_data,
-                          /*location=*/"fuzz.dex",
-                          /*location_checksum=*/0,
-                          /*oat_dex_file=*/nullptr,
-                          std::make_shared<MemoryDexFileContainer>(new_data, size)));
-  StandardDexFile* dex_file = dex_files_to_delete.back().get();
-
-  Runtime* runtime = Runtime::Current();
-  CHECK(runtime != nullptr);
-
-  jobject class_loader = RegisterDexFileAndGetClassLoader(runtime, dex_file);
-
-  VerifyClasses(class_loader, dex_file);
-  const bool at_least_one_method_called_the_compiler =
-      CompileClasses(class_loader, dex_file, compiler.get(), callbacks.get(), kDebugPrints);
-  callbacks->Reset();
-  IterationCleanup(class_loader, dex_file);
-
-  if (skipped_gc_iterations == kMaxSkipGCIterations) {
-    runtime->GetHeap()->CollectGarbage(/* clear_soft_references */ true);
-    skipped_gc_iterations = 0;
-    data_to_delete.clear();
-    dex_files_to_delete.clear();
-  } else {
-    skipped_gc_iterations++;
-  }
-
-  // Save only if at least one method compiled
-  return at_least_one_method_called_the_compiler ? 0 : -1;
+  return CompilerFuzzerTestOneInput(data,
+                                    size,
+                                    compiler.get(),
+                                    callbacks.get(),
+                                    &skipped_gc_iterations,
+                                    kMaxSkipGCIterations,
+                                    kDebugPrints,
+                                    data_to_delete,
+                                    dex_files_to_delete);
 }
 
 }  // namespace fuzzer
