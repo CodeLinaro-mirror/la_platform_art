@@ -67,6 +67,13 @@ class RegisterAllocatorTest : public CommonCompilerTest, public OptimizingUnitTe
                                                 /* log_fatal_on_failure= */ false);
   }
 
+  void OverrideOutput(LocationSummary* locations,
+                      Location out,
+                      Location::OutputOverlap output_overlaps = Location::kOutputOverlap) {
+    locations->output_ = out;
+    locations->output_overlaps_ = output_overlaps;
+  }
+
   template <typename RegType>
   void BlockCoreRegistersExcept(CodeGenerator* codegen, std::initializer_list<RegType> allowed) {
     size_t number_of_core_registers = codegen->GetNumberOfCoreRegisters();
@@ -425,7 +432,7 @@ void RegisterAllocatorTest::TestFreeUntil(bool special_first) {
   HAdd* add = MakeBinOp<HAdd>(block, DataType::Type::kInt32, const0, const0);
   HInstruction* placeholder1 = MakeUnOp<HNeg>(block, DataType::Type::kInt32, const0);
   HInstruction* placeholder2 = MakeUnOp<HNeg>(block, DataType::Type::kInt32, const0);
-  HInstruction* ret = MakeReturn(block, add);
+  MakeReturn(block, add);
 
   graph_->ComputeDominanceInformation();
   x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
@@ -451,6 +458,9 @@ void RegisterAllocatorTest::TestFreeUntil(bool special_first) {
     placeholder->SetBlock(block);
   }
 
+  // Set just one register available to make all intervals compete for the same.
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
+
   RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
 
   // Test two variants, so that we hit the desired configuration once, no matter the order
@@ -459,9 +469,6 @@ void RegisterAllocatorTest::TestFreeUntil(bool special_first) {
   size_t special_pos = special_first ? blocking_pos1 : blocking_pos2;
   register_allocator.block_registers_for_call_interval_->AddRange(call_pos, call_pos + 1);
   register_allocator.block_registers_special_interval_->AddRange(special_pos, special_pos + 1);
-
-  // Set just one register available to make all intervals compete for the same.
-  BlockCoreRegistersExcept(&codegen, {x86::EAX});
 
   register_allocator.AllocateRegistersInternal();
 
@@ -666,7 +673,7 @@ TEST_F(RegisterAllocatorTest, SameAsFirstInputHint) {
 
     // check that both adds get the same register.
     // Don't use UpdateOutput because output is already allocated.
-    first_sub->InputAt(0)->GetLocations()->output_ = Location::RegisterLocation(2);
+    OverrideOutput(first_sub->InputAt(0)->GetLocations(), Location::RegisterLocation(2));
     ASSERT_EQ(first_sub->GetLocations()->Out().GetPolicy(), Location::kSameAsFirstInput);
     ASSERT_EQ(second_sub->GetLocations()->Out().GetPolicy(), Location::kSameAsFirstInput);
 
@@ -777,11 +784,11 @@ void RegisterAllocatorTest::TestSpillInactive() {
   // Populate the instructions in the liveness object, to please the register allocator.
   liveness.instructions_from_lifetime_position_.assign(16, user);
 
-  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
-  register_allocator.unhandled_core_intervals_.assign({fourth, third, second, first});
-
   // Set just one register available to make all intervals compete for the same.
   BlockCoreRegistersExcept(&codegen, {x86::EAX});
+
+  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
+  register_allocator.unhandled_core_intervals_.assign({fourth, third, second, first});
 
   // We have set up all intervals manually and we want `AllocateRegistersInternal()` to run
   // the linear scan without processing instructions - check that the linear order is empty.
@@ -844,8 +851,10 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlots) {
   // Set just two registers available to make it easy to force spills.
   // Choose EAX and EDX which are used by type conversion from Int32 to Int64, so that
   // we can use the type conversion to spill all live intervals wherever we want.
-  // Note that the `obj` parameter comes in the blocked ECX which works fine for the test.
   BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::EDX});
+
+  // Change the `obj` parameter to come in EDX.
+  OverrideOutput(obj->GetLocations(), Location::RegisterLocation(x86::EDX));
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -907,7 +916,7 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotGaps) {
       GetAllocator(), deopt_cond, DeoptimizationKind::kDebugging, /*dex_pc=*/ 0u);
   AddOrInsertInstruction(return_block, deopt);
   ManuallyBuildEnvFor(deopt, {phi1});
-  HReturn* ret = MakeReturn(return_block, phi2);
+  MakeReturn(return_block, phi2);
 
   graph_->BuildDominatorTree();
   x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
@@ -916,6 +925,13 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotGaps) {
 
   // Set just one register available to make all intervals compete for the same.
   BlockCoreRegistersExcept(&codegen, {x86::EAX});
+  // Rewrite condition locations to work with the single register EAX.
+  for (HCondition* c : {cond, deopt_cond}) {
+    ASSERT_TRUE(c->GetLocations()->Out().Equals(Location::RegisterLocation(x86::ECX)));
+    OverrideOutput(c->GetLocations(), Location::RegisterLocation(x86::EAX));
+    c->GetLocations()->SetInAt(0, Location::Any());
+    ASSERT_TRUE(c->GetLocations()->InAt(1).Equals(Location::Any()));
+  }
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -935,6 +951,9 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotGaps) {
 TEST_F(RegisterAllocatorTest, ReuseSpillSlotsUnavailableWithSplitPhiInterval) {
   if (!com::android::art::flags::reg_alloc_spill_slot_reuse()) {
     GTEST_SKIP() << "Improved spill slot reuse disabled.";
+  }
+  if (!com::android::art::flags::reg_alloc_no_output_overlap()) {
+    GTEST_SKIP() << "Improved `Location::kNoOutputOverlap` handling disabled.";
   }
   HBasicBlock* return_block = InitEntryMainExitGraph();
   auto [start, left, right] = CreateDiamondPattern(return_block);
@@ -977,7 +996,7 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotsUnavailableWithSplitPhiInterval) {
   // Use `HSub` which can have the second operand on the stack for x86.
   HSub* sub1 = MakeBinOp<HSub>(return_block, DataType::Type::kInt32, get_phi, neg_neg);
   // Add an invoke that forces the `get_phi` interval to be split when initially allocated.
-  HInvoke* invoke = MakeInvokeStatic(return_block, DataType::Type::kVoid, {}, {});
+  MakeInvokeStatic(return_block, DataType::Type::kVoid, {}, {});
   // Add another register use for the `get_phi` after the `invoke`.
   HSub* sub2 = MakeBinOp<HSub>(return_block, DataType::Type::kInt32, get_phi, sub1);
 
@@ -992,8 +1011,9 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotsUnavailableWithSplitPhiInterval) {
   liveness.Analyze();
 
   // Set just one register available to make all intervals compete for the same.
-  // Note that the `obj` parameter comes in the blocked ECX which works fine for the test.
   BlockCoreRegistersExcept(&codegen, {x86::EAX});
+  // Change the `obj` parameter to come in EAX.
+  OverrideOutput(obj->GetLocations(), Location::RegisterLocation(x86::EAX));
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -1140,10 +1160,10 @@ void RegisterAllocatorTest::TestNoOutputOverlap() {
   ASSERT_FALSE(add->GetLocations()->OutputCanOverlapWithInputs());
   ASSERT_FALSE(add2->GetLocations()->OutputCanOverlapWithInputs());
 
-  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
-
   // Set just one register available to make all intervals compete for the same.
   BlockCoreRegistersExcept(&codegen, {x86::EAX});
+
+  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
 
   register_allocator.AllocateRegistersInternal();
 
@@ -1218,11 +1238,11 @@ void RegisterAllocatorTest::TestNoOutputOverlapAndTemp() {
   ASSERT_EQ(0, add->GetLocations()->GetTempCount());
   add->GetLocations()->AddTemp(Location::RequiresRegister());
 
-  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
-
   // Set just two registers available to avoid adding more instructions
   // to reproduce the situation where we could try to split the temp.
   BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::ECX});
+
+  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
 
   register_allocator.AllocateRegistersInternal();
 
