@@ -73,6 +73,8 @@ class ArtdInjector {
 
   virtual int Kill(pid_t pid, int sig) { return kill(pid, sig); }
 
+  android::base::Result<struct stat> Fstat(const File& file);
+
   virtual int Fstat(int fd, struct stat* statbuf) { return fstat(fd, statbuf); }
 
   virtual int Poll(struct pollfd* fds, nfds_t nfds, int timeout) {
@@ -249,6 +251,7 @@ class Artd : public aidl::com::android::server::art::BnArtd {
       const aidl::com::android::server::art::DexoptOptions& in_dexoptOptions,
       const std::shared_ptr<aidl::com::android::server::art::IArtdCancellationSignal>&
           in_cancellationSignal,
+      const ndk::ScopedFileDescriptor& in_loggingFd,
       aidl::com::android::server::art::ArtdDexoptResult* _aidl_return) override;
 
   ndk::ScopedAStatus createCancellationSignal(
@@ -309,6 +312,12 @@ class Artd : public aidl::com::android::server::art::BnArtd {
 
   ndk::ScopedAStatus checkPreRebootSystemRequirements(const std::string& in_chrootDir,
                                                       bool* _aidl_return) override;
+
+  ndk::ScopedAStatus checkPreRebootStagedFilesStatus(
+      std::optional<aidl::com::android::server::art::PreRebootStagedFilesStatus>* _aidl_return)
+      override;
+
+  ndk::ScopedAStatus deletePreRebootStagedMetadata() override;
 
   ndk::ScopedAStatus preRebootInit(
       const std::shared_ptr<aidl::com::android::server::art::IArtdCancellationSignal>&
@@ -372,8 +381,6 @@ class Artd : public aidl::com::android::server::art::BnArtd {
   void AddPerfConfigFlags(aidl::com::android::server::art::PriorityClass priority_class,
                           /*out*/ art::tools::CmdlineBuilder& art_exec_args,
                           /*out*/ art::tools::CmdlineBuilder& args);
-
-  android::base::Result<struct stat> Fstat(const art::File& file) const;
 
   // Creates a new dir at `source` and bind-mounts it at `target`.
   android::base::Result<void> BindMountNewDir(const std::string& source,
