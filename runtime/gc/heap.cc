@@ -4284,7 +4284,14 @@ size_t Heap::GetDefaultMemoryGcCostFactor() {
 
   // We don't know how much memory or compute resources the device has. Pick
   // something suitable for 2025 era phones and hope for the best.
-  return static_cast<size_t>(32 * MB);
+  // The default value was set to 32MB initially to match how aggressive GC
+  // was without time based GC triggering in lab tests. In a field study we
+  // saw GC was 44% more aggressive than before, so we increased the default
+  // value to compensate. In theory GC effort is inversely proportional to the
+  // square root of this tuning knob. The 2.25x increase in the tuning knob
+  // value from 32MB to 72MB should result in √(2.25) = 1.5x, or 50% less
+  // aggressive GC behavior.
+  return static_cast<size_t>(72 * MB);
 }
 
 class Heap::TimeBasedGcThresholdCheckTask : public HeapTask {
@@ -4303,18 +4310,21 @@ void Heap::RequestTimeBasedGcThresholdCheck(Thread* self) {
   }
 
   uint64_t target_time = NanoTime();
-  MutexLock mu(self, *pending_task_lock_);
+  TimeBasedGcThresholdCheckTask* added_task = nullptr;
+  {
+    MutexLock mu(self, *pending_task_lock_);
+    next_time_based_gc_threshold_check_ = target_time;
+    bytes_allocated_at_last_gc_threshold_check_ = 0;
 
-  next_time_based_gc_threshold_check_ = target_time;
-  bytes_allocated_at_last_gc_threshold_check_ = 0;
-
-  if (pending_time_based_gc_threshold_check_ == nullptr) {
-    pending_time_based_gc_threshold_check_ = new TimeBasedGcThresholdCheckTask(target_time);
-    task_processor_->AddTask(self, pending_time_based_gc_threshold_check_);
-    return;
+    if (pending_time_based_gc_threshold_check_ != nullptr) {
+      task_processor_->UpdateTargetRunTime(
+          self, pending_time_based_gc_threshold_check_, target_time);
+      return;
+    }
+    added_task = new TimeBasedGcThresholdCheckTask(target_time);
+    pending_time_based_gc_threshold_check_ = added_task;
   }
-
-  task_processor_->UpdateTargetRunTime(self, pending_time_based_gc_threshold_check_, target_time);
+  task_processor_->AddTask(self, added_task);
 }
 
 void Heap::TimeBasedGcThresholdCheck(Thread* self) {
@@ -4340,11 +4350,11 @@ void Heap::TimeBasedGcThresholdCheck(Thread* self) {
     return;
   }
 
-  MutexLock mu(self, *pending_task_lock_);
   if (bytes_allocated_since_last_gc_kb == 0 || !CanAddHeapTask(self) ||
       !task_processor_->IsRunning()) {
     // The timeout threshold will not be reached until another allocation
     // takes place.
+    MutexLock mu(self, *pending_task_lock_);
     next_time_based_gc_threshold_check_ = std::numeric_limits<uint64_t>::max();
     pending_time_based_gc_threshold_check_ = nullptr;
     return;
@@ -4371,15 +4381,21 @@ void Heap::TimeBasedGcThresholdCheck(Thread* self) {
     time_delta_ms = static_cast<uint64_t>(std::sqrt(time_since_last_gc_ms * time_delta_ms));
   }
   uint64_t target_time = last_gc_start_time_ + MsToNs(time_delta_ms);
-  next_time_based_gc_threshold_check_ = target_time;
-  bytes_allocated_at_last_gc_threshold_check_ = bytes_allocated;
 
-  // Throttle threshold checks to avoid spamming them. Being within 10ms of
-  // the pure time trigger is plenty good.
-  target_time = std::max(target_time, now + MsToNs(10));
+  TimeBasedGcThresholdCheckTask* added_task = nullptr;
+  {
+    MutexLock mu(self, *pending_task_lock_);
+    next_time_based_gc_threshold_check_ = target_time;
+    bytes_allocated_at_last_gc_threshold_check_ = bytes_allocated;
 
-  pending_time_based_gc_threshold_check_ = new TimeBasedGcThresholdCheckTask(target_time);
-  task_processor_->AddTask(self, pending_time_based_gc_threshold_check_);
+    // Throttle threshold checks to avoid spamming them. Being within 10ms of
+    // the pure time trigger is plenty good.
+    target_time = std::max(target_time, now + MsToNs(10));
+
+    added_task = new TimeBasedGcThresholdCheckTask(target_time);
+    pending_time_based_gc_threshold_check_ = added_task;
+  }
+  task_processor_->AddTask(self, added_task);
 }
 
 // For GC triggering purposes, we count old (pre-last-GC) and new native allocations as
