@@ -380,6 +380,9 @@ cc_library_headers {
         windows: {
             enabled: true,
         },
+        darwin: {
+            enabled: true,
+        },
     },
 }
 
