@@ -1073,7 +1073,8 @@
           "2286-invokevirtual-invokeexact",
           "2287-no-temp-component-class",
           "2288-checker-smali-string-builder-wrong-init",
-          "2289-smali-invalid-rti"
+          "2289-smali-invalid-rti",
+          "2292-checker-smali-peek-poke-truncation"
         ],
         "variant": "jvm",
         "bug": "b/73888836",
@@ -1257,9 +1258,14 @@
         "description": ["Trace prevents class unloading."]
     },
     {
-        "tests": "677-fsi",
+        "tests": ["677-fsi"],
         "variant": "no-image | no-prebuild | jvm",
         "description": ["Test requires a successful dex2oat invocation"]
+    },
+    {
+        "tests": ["184-dex2oat-dlc"],
+        "variant": "no-image | no-prebuild | debuggable | jvm",
+        "description": ["Test requires successful dex2oat invocations and image loading"]
     },
     {
         "tests": ["990-field-trace",
