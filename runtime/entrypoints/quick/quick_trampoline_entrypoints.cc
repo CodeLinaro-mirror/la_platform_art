@@ -61,6 +61,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
 #include "thread-inl.h"
+#include "trace.h"
 #include "trace_profile.h"
 #include "var_handles.h"
 #include "well_known_classes.h"
@@ -2161,6 +2162,29 @@ extern uint64_t GenericJniMethodEnd(Thread* self,
                                     uint64_t result_f,
                                     ArtMethod* called);
 
+extern "C" uint64_t art_quick_generic_jni_trampoline_simulator(uint64_t, void*, void*);
+
+// The native part of the Simulator's GenericJNI trampoline. For more info check
+// artQuickGenericJniTrampoline.
+extern "C" uint64_t artQuickGenericJniTrampolineSimulator(uint64_t native_code_ptr,
+                                                          void* simulated_reserved_area,
+                                                          void* out_fp_result)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  return art_quick_generic_jni_trampoline_simulator(native_code_ptr,
+                                                    simulated_reserved_area,
+                                                    out_fp_result);
+}
+
+// This is a placeholder function which is never executed; its address is used to intercept
+// native call as part of genericJNI trampoline.
+extern "C" NO_RETURN void artArm64SimulatorGenericJNIPlaceholder(
+    [[maybe_unused]] uint64_t native_code_ptr,
+    [[maybe_unused]] ArtMethod** simulated_reserved_area,
+    [[maybe_unused]] Thread* self) {
+  LOG(FATAL) << "Unreachable";
+  UNREACHABLE();
+}
+
 /*
  * Is called after the native JNI code. Responsible for cleanup (handle scope, saved state) and
  * unlocking.
@@ -2814,6 +2838,11 @@ extern "C" Context* artMethodExitHook(Thread* self,
 extern "C" void artRecordLongRunningMethodTraceEvent(ArtMethod* method, Thread* self, bool is_entry)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   TraceProfiler::FlushBufferAndRecordTraceEvent(method, self, is_entry);
+}
+
+extern "C" void artRecordMethodTraceEvent(ArtMethod* method, Thread* self, bool is_entry)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  TraceLowOverhead::LogMethodTraceEvent(self, method, is_entry);
 }
 
 }  // namespace art
