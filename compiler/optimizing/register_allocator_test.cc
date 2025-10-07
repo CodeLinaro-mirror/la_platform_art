@@ -40,6 +40,9 @@ namespace art HIDDEN {
 
 class RegisterAllocatorTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  protected:
+  // Define a shortcut for the `kLivenessPositionsPerInstruction`.
+  static constexpr size_t kLppi = kLivenessPositionsPerInstruction;
+
   void SetUp() override {
     CommonCompilerTest::SetUp();
     // This test is using the x86 ISA.
@@ -64,8 +67,21 @@ class RegisterAllocatorTest : public CommonCompilerTest, public OptimizingUnitTe
                                                 /* log_fatal_on_failure= */ false);
   }
 
+  template <typename RegType>
+  void BlockCoreRegistersExcept(CodeGenerator* codegen, std::initializer_list<RegType> allowed) {
+    size_t number_of_core_registers = codegen->GetNumberOfCoreRegisters();
+    uint32_t blocked_core_registers = MaxInt<uint32_t>(number_of_core_registers);
+    for (x86::Register reg : allowed) {
+      CHECK_LT(reg, number_of_core_registers);
+      blocked_core_registers &= ~(1u << reg);
+    }
+    codegen->blocked_core_registers_ = blocked_core_registers;
+  }
+
   void TestFreeUntil(bool special_first);
   void TestSpillInactive();
+  void TestNoOutputOverlap();
+  void TestNoOutputOverlapAndTemp();
 
   std::unique_ptr<CompilerOptions> compiler_options_;
 };
@@ -445,13 +461,12 @@ void RegisterAllocatorTest::TestFreeUntil(bool special_first) {
   register_allocator.block_registers_special_interval_->AddRange(special_pos, special_pos + 1);
 
   // Set just one register available to make all intervals compete for the same.
-  bool* blocked_registers = codegen.GetBlockedCoreRegisters();
-  std::fill_n(blocked_registers + 1, codegen.GetNumberOfCoreRegisters() - 1, true);
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
 
   register_allocator.AllocateRegistersInternal();
 
   std::pair<size_t, int> expected_add_start_and_reg[] = {
-    {add->GetLifetimePosition(), 0},
+    {add->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput, 0},
     {blocking_pos1, -1},
   };
   LiveInterval* li = add->GetLiveInterval();
@@ -697,9 +712,6 @@ TEST_F(RegisterAllocatorTest, ExpectedExactInRegisterAndSameOutputHint) {
 // position.
 // This test only applies to the linear scan allocator.
 void RegisterAllocatorTest::TestSpillInactive() {
-  // Define a shortcut for the `kLivenessPositionsPerInstruction`.
-  static constexpr size_t kLppi = kLivenessPositionsPerInstruction;
-
   HBasicBlock* block = InitEntryMainExitGraphWithReturnVoid();
   HInstruction* one = MakeParam(DataType::Type::kInt32);
   HInstruction* two = MakeParam(DataType::Type::kInt32);
@@ -765,8 +777,7 @@ void RegisterAllocatorTest::TestSpillInactive() {
   register_allocator.unhandled_core_intervals_.assign({fourth, third, second, first});
 
   // Set just one register available to make all intervals compete for the same.
-  bool* blocked_registers = codegen.GetBlockedCoreRegisters();
-  std::fill_n(blocked_registers + 1, codegen.GetNumberOfCoreRegisters() - 1, true);
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
 
   // We have set up all intervals manually and we want `AllocateRegistersInternal()` to run
   // the linear scan without processing instructions - check that the linear order is empty.
@@ -830,9 +841,7 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlots) {
   // Choose EAX and EDX which are used by type conversion from Int32 to Int64, so that
   // we can use the type conversion to spill all live intervals wherever we want.
   // Note that the `obj` parameter comes in the blocked ECX which works fine for the test.
-  bool* blocked_registers = codegen.GetBlockedCoreRegisters();
-  std::fill_n(blocked_registers, codegen.GetNumberOfCoreRegisters(), true);
-  blocked_registers[x86::EAX] = blocked_registers[x86::EDX] = false;
+  BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::EDX});
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -902,8 +911,7 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotGaps) {
   liveness.Analyze();
 
   // Set just one register available to make all intervals compete for the same.
-  bool* blocked_registers = codegen.GetBlockedCoreRegisters();
-  std::fill_n(blocked_registers + 1, codegen.GetNumberOfCoreRegisters() - 1, true);
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -981,8 +989,7 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotsUnavailableWithSplitPhiInterval) {
 
   // Set just one register available to make all intervals compete for the same.
   // Note that the `obj` parameter comes in the blocked ECX which works fine for the test.
-  bool* blocked_registers = codegen.GetBlockedCoreRegisters();
-  std::fill_n(blocked_registers + 1, codegen.GetNumberOfCoreRegisters() - 1, true);
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
 
   std::unique_ptr<RegisterAllocator> register_allocator =
       RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
@@ -999,6 +1006,326 @@ TEST_F(RegisterAllocatorTest, ReuseSpillSlotsUnavailableWithSplitPhiInterval) {
   ASSERT_TRUE(get_phi->GetLiveInterval()->HasSpillSlot());
   ASSERT_NE(left_get->GetLiveInterval()->GetSpillSlot(),
             get_phi->GetLiveInterval()->GetSpillSlot());
+}
+
+// Regression test for splitting a live range that's recorded as a search hint in the
+// `SpillSlotData`. Previously, a new range was created for the first part of the live
+// range and the original `LiveRange` object had its start adjusted but that means the
+// search hint was pointing to the second part of the split live range and we missed
+// overlaps when trying to reuse a spill slot. Bug: 426785078
+TEST_F(RegisterAllocatorTest, SplitSpillSlotLiveRangeHint) {
+  if (!com::android::art::flags::reg_alloc_spill_slot_reuse()) {
+    GTEST_SKIP() << "Improved spill slot reuse disabled.";
+  }
+  // Create a graph with a three-way switch to blocks `left`, `mid` and `right`,
+  // and a diamond pattern in the `left` block with branch blocks `left_left`
+  // and `left_right` and merging to `left_end`. The linear order shall have
+  // the block `right` followed by `mid` and `mid` followed by `left`.
+  HBasicBlock* return_block = InitEntryMainExitGraph();
+  auto [start, left_end, mid] = CreateDiamondPattern(return_block);
+  HBasicBlock* right = AddNewBlock();
+  start->AddSuccessor(right);
+  right->AddSuccessor(return_block);
+  auto [left, left_left, left_right] = CreateDiamondPattern(left_end);
+
+  // Create `iget_*` instructions in `start`, `right`, `mid` and `left_right`
+  // (listed in linear order). Merge `iget_start` and `iget_left_right` with
+  // a `phi_left_end` in `left_end` and merge `phi_left_end`, `iget_mid` and
+  // `iget_right` with the final `phi` in `return_block`. Use invokes to force
+  // spilling `iget_*`s; in `left_right` use `HMin` instead to avoid blocking
+  // registers too early. When the `iget_start` is spilled, the spill slot is
+  // propagated to the Phis as a hint that's seen by all the other `iget_*`s.
+  //
+  // For `iget_start`, add a register use in `left`, an `HDeoptimize` in
+  // `left_end` to extend the `iget_start` lifetime across `left_right` and
+  // most of `left_end` and an invoke in `left_end` before the `HDeoptimize`
+  // which blocks registers and forces the splitting of the `iget_start`
+  // interval when allocating a register for the use in `left`.
+
+  HInstruction* obj = MakeParam(DataType::Type::kReference);
+  HInstruction* const1 = graph_->GetIntConstant(1);
+
+  HInstruction* iget_start = MakeIFieldGet(start, obj, DataType::Type::kInt32, MemberOffset(40));
+  HInstruction* switch_input = MakeIFieldGet(start, obj, DataType::Type::kInt32, MemberOffset(32));
+  MakeInvokeStatic(start, DataType::Type::kVoid, {});  // Spill all.
+  start->AddInstruction(
+      new (GetAllocator()) HPackedSwitch(/*start_value=*/ 0, /*num_entries=*/ 2, switch_input));
+
+  HInstruction* iget_right = MakeIFieldGet(right, obj, DataType::Type::kInt32, MemberOffset(44));
+  MakeInvokeStatic(right, DataType::Type::kVoid, {});  // Spill all.
+  MakeGoto(right);  // This block was constructed with `AddNewBlock()` without `HGoto`.
+
+  HInstruction* iget_mid = MakeIFieldGet(mid, obj, DataType::Type::kInt32, MemberOffset(48));
+  MakeInvokeStatic(mid, DataType::Type::kVoid, {});  // Spill all.
+
+  HSub* sub = MakeBinOp<HSub>(left, DataType::Type::kInt32, iget_start, const1);
+  HInstruction* left_cond = MakeIFieldGet(left, obj, DataType::Type::kBool, MemberOffset(36));
+  MakeIf(left, left_cond);
+
+  HInstruction* iget_left_right =
+      MakeIFieldGet(left_right, obj, DataType::Type::kInt32, MemberOffset(40));
+  // Force spilling `iget_left_right` without using an invoke.
+  HMin* min = MakeBinOp<HMin>(left_right, DataType::Type::kInt32, sub, const1);
+
+  HPhi* phi_left_end = MakePhi(left_end, {iget_start, iget_left_right});
+  HPhi* phi_min = MakePhi(left_end, {sub, min});
+  // Block registers to cause splitting of the `iget_start` interval when allocating
+  // a register at the start of the `left` block.
+  MakeInvokeStatic(left_end, DataType::Type::kVoid, {phi_min});  // Use `phi_min`, spill all.
+  HInstruction* deopt_cond = MakeIFieldGet(left_end, obj, DataType::Type::kBool, MemberOffset(37));
+  HDeoptimize* deopt = new (GetAllocator()) HDeoptimize(
+      GetAllocator(), deopt_cond, DeoptimizationKind::kFullFrame, kNoDexPc);
+  AddOrInsertInstruction(left_end, deopt);
+  ManuallyBuildEnvFor(deopt, {iget_start});  // Keep `iget_start` alive up to this point.
+
+  HPhi* phi = MakePhi(return_block, {phi_left_end, iget_mid, iget_right});
+  MakeReturn(return_block, phi);
+
+  graph_->ComputeDominanceInformation();
+  x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
+  SsaLivenessAnalysis liveness(graph_, &codegen, GetScopedAllocator());
+  liveness.Analyze();
+
+  ASSERT_LT(right->GetLifetimeStart(), mid->GetLifetimeStart());
+  ASSERT_LT(mid->GetLifetimeStart(), left->GetLifetimeStart());
+
+  // Set just two register available, including the `obj` input register ECX.
+  BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::ECX});
+
+  // Before the bug was fixed, the interval validation at the end of `AllocateRegisters()`
+  // would report a spill slot conflict for the `iget_left_right` because it was allocated
+  // the same spill slot as `iget_start` despite overlapping lifetime. This would cause
+  // clobbering of `iget_start` for its use in the `HDeoptimize` environment.
+  std::unique_ptr<RegisterAllocator> register_allocator =
+      RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
+  register_allocator->AllocateRegisters();
+
+  // While `iget_right` and `iget_mid` use the same spill slot as `iget_start` thanks to the
+  // hint, the `iget_left_right` must use a different spill slot due to lifetime overlap.
+  for (HInstruction* iget : {iget_start, iget_right, iget_mid, iget_left_right}) {
+    ASSERT_TRUE(iget->GetLiveInterval()->HasSpillSlot());
+  }
+  int iget_start_spill_slot = iget_start->GetLiveInterval()->GetSpillSlot();
+  EXPECT_EQ(iget_start_spill_slot, iget_right->GetLiveInterval()->GetSpillSlot());
+  EXPECT_EQ(iget_start_spill_slot, iget_mid->GetLiveInterval()->GetSpillSlot());
+  EXPECT_NE(iget_start_spill_slot, iget_left_right->GetLiveInterval()->GetSpillSlot());
+}
+
+void RegisterAllocatorTest::TestNoOutputOverlap() {
+  if (!com::android::art::flags::reg_alloc_no_output_overlap()) {
+    GTEST_SKIP() << "Improved `Location::kNoOutputOverlap` handling disabled.";
+  }
+  HBasicBlock* block = InitEntryMainExitGraph();
+  HInstruction* const1 = graph_->GetIntConstant(1);
+  HNeg* neg = MakeUnOp<HNeg>(block, DataType::Type::kInt32, const1);
+  HAdd* add = MakeBinOp<HAdd>(block, DataType::Type::kInt32, neg, const1);
+  // Add another use of `neg` after `add`. Previously this would have prevented
+  // using the register allocated for `neg` for the `add` output.
+  HAdd* add2 = MakeBinOp<HAdd>(block, DataType::Type::kInt32, neg, const1);
+  // Insert `HNop` to test the end of the range of the unused instruction `add2`.
+  AddOrInsertInstruction(
+      block, new (GetAllocator()) HNop(/*dex_pc=*/ 0u, /*needs_environment=*/ false));
+  HReturn* ret = MakeReturn(block, add);
+
+  graph_->ComputeDominanceInformation();
+  x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
+  SsaLivenessAnalysis liveness(graph_, &codegen, GetScopedAllocator());
+  liveness.Analyze();
+
+  ASSERT_TRUE(neg->GetLocations()->OutputCanOverlapWithInputs());
+  ASSERT_FALSE(add->GetLocations()->OutputCanOverlapWithInputs());
+  ASSERT_FALSE(add2->GetLocations()->OutputCanOverlapWithInputs());
+
+  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
+
+  // Set just one register available to make all intervals compete for the same.
+  BlockCoreRegistersExcept(&codegen, {x86::EAX});
+
+  register_allocator.AllocateRegistersInternal();
+
+  // Check that the register 0 was allocated at the right positions for `neg`, `add` and `add2`.
+  static constexpr int kExpectedRegister = 0;
+  LiveInterval* neg_li = neg->GetLiveInterval();
+  ASSERT_EQ(neg->GetLifetimePosition(), neg_li->GetStart());
+  ASSERT_EQ(kExpectedRegister, neg_li->GetRegister());
+  LiveInterval* add_li = add->GetLiveInterval();
+  ASSERT_EQ(add->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput,
+            add_li->GetStart());
+  ASSERT_EQ(kExpectedRegister, add_li->GetRegister());
+  LiveInterval* add2_li = add2->GetLiveInterval();
+  ASSERT_EQ(add2->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput,
+            add2_li->GetStart());
+  ASSERT_EQ(kExpectedRegister, add2_li->GetRegister());
+
+  // Check the splits of the `neg` interval.
+  ASSERT_EQ(add_li->GetStart(), neg_li->GetEnd());
+  LiveInterval* neg_li2 = neg_li->GetNextSibling();
+  ASSERT_TRUE(neg_li2 != nullptr);
+  ASSERT_EQ(add_li->GetStart(), neg_li2->GetStart());
+  ASSERT_EQ(kNoRegister, neg_li2->GetRegister());
+  ASSERT_EQ(add2->GetLifetimePosition(), neg_li2->GetEnd());
+  LiveInterval* neg_li3 = neg_li2->GetNextSibling();
+  ASSERT_TRUE(neg_li3 != nullptr);
+  ASSERT_EQ(add2->GetLifetimePosition(), neg_li3->GetStart());
+  ASSERT_EQ(kExpectedRegister, neg_li3->GetRegister());
+  ASSERT_EQ(add2->GetLifetimePosition() + kLivenessPositionOfNormalUse, neg_li3->GetEnd());
+  ASSERT_TRUE(neg_li3->GetNextSibling() == nullptr);
+
+  // Check the splits of the `add` interval.
+  ASSERT_EQ(add2->GetLifetimePosition(), add_li->GetEnd());
+  LiveInterval* add_li2 = add_li->GetNextSibling();
+  ASSERT_TRUE(add_li2 != nullptr);
+  ASSERT_EQ(add2->GetLifetimePosition(), add_li2->GetStart());
+  ASSERT_EQ(kNoRegister, add_li2->GetRegister());
+  ASSERT_EQ(ret->GetLifetimePosition(), add_li2->GetEnd());
+  ASSERT_TRUE(add_li2->GetNextSibling() == nullptr);
+
+  // Check that the interval for the unused `add2` was not split and ends after the `add2`.
+  ASSERT_TRUE(add2_li->GetNextSibling() == nullptr);
+  ASSERT_EQ(add2->GetLifetimePosition() + kLppi, add2_li->GetEnd());
+}
+
+TEST_F(RegisterAllocatorTest, NoOutputOverlap) {
+  TestNoOutputOverlap();
+}
+
+void RegisterAllocatorTest::TestNoOutputOverlapAndTemp() {
+  if (!com::android::art::flags::reg_alloc_no_output_overlap()) {
+    GTEST_SKIP() << "Improved `Location::kNoOutputOverlap` handling disabled.";
+  }
+  HBasicBlock* block = InitEntryMainExitGraph();
+  HInstruction* const1 = graph_->GetIntConstant(1);
+  HNeg* neg = MakeUnOp<HNeg>(block, DataType::Type::kInt32, const1);
+  HAdd* add = MakeBinOp<HAdd>(block, DataType::Type::kInt32, neg, const1);
+  HSub* sub = MakeBinOp<HSub>(block, DataType::Type::kInt32, add, neg);
+
+  graph_->ComputeDominanceInformation();
+  x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
+  SsaLivenessAnalysis liveness(graph_, &codegen, GetScopedAllocator());
+  liveness.Analyze();
+
+  ASSERT_TRUE(neg->GetLocations()->OutputCanOverlapWithInputs());
+  ASSERT_FALSE(add->GetLocations()->OutputCanOverlapWithInputs());
+  ASSERT_TRUE(sub->GetLocations()->OutputCanOverlapWithInputs());
+  ASSERT_TRUE(sub->GetLocations()->InAt(1).Equals(Location::Any()));
+
+  // Add a temp for `add`. We want to test that the temp interval shall not be split.
+  // Trying to split it would trigger a `DCHECK(!IsTemp())`.
+  ASSERT_EQ(0, add->GetLocations()->GetTempCount());
+  add->GetLocations()->AddTemp(Location::RequiresRegister());
+
+  RegisterAllocatorLinearScan register_allocator(GetScopedAllocator(), &codegen, liveness);
+
+  // Set just two registers available to avoid adding more instructions
+  // to reproduce the situation where we could try to split the temp.
+  BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::ECX});
+
+  register_allocator.AllocateRegistersInternal();
+
+  // Check the splits of the `neg` interval.
+  LiveInterval* neg_li = neg->GetLiveInterval();
+  ASSERT_EQ(neg->GetLifetimePosition(), neg_li->GetStart());
+  ASSERT_TRUE(neg_li->HasRegister());
+  ASSERT_EQ(add->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput, neg_li->GetEnd());
+  LiveInterval* neg_li2 = neg_li->GetNextSibling();
+  ASSERT_TRUE(neg_li2 != nullptr);
+  ASSERT_EQ(neg_li->GetEnd(), neg_li2->GetStart());
+  ASSERT_EQ(kNoRegister, neg_li2->GetRegister());
+  ASSERT_EQ(sub->GetLifetimePosition() + kLivenessPositionOfNormalUse, neg_li2->GetEnd());
+  ASSERT_TRUE(neg_li2->GetNextSibling() == nullptr);
+}
+
+TEST_F(RegisterAllocatorTest, NoOutputOverlapAndTemp) {
+  TestNoOutputOverlapAndTemp();
+}
+
+TEST_F(RegisterAllocatorTest, NoOutputOverlapImmediateSpill) {
+  if (!com::android::art::flags::reg_alloc_no_output_overlap()) {
+    GTEST_SKIP() << "Improved `Location::kNoOutputOverlap` handling disabled.";
+  }
+  HBasicBlock* block = InitEntryMainExitGraph();
+  HInstruction* param = MakeParam(DataType::Type::kReference);
+  HInvoke* invoke = MakeInvokeStatic(block, DataType::Type::kVoid, {});  // Spill `param`.
+  // After the `invoke`, all registers are free and the `param` input to `get1` is allocated
+  // register 0. With only registers 0-2 available, the only available pair is 0-1, so the
+  // `get1` with no-output-overlap is allocated that pair. Now we need to do something about
+  // the `param` but trying to allocate another register now is not easy. We cannot put moves
+  // in the middle of an instruction, so we'd have to split the interval at the start of the
+  // instruction and move back to that position, potentially bringing back already handled
+  // intervals for inputs that die at this instruction and somehow handle the output as live
+  // at the start of the instructions even though if its lifetime has not yet started. It's
+  // much easier to just force spilling active intervals when we need to take their register
+  // for the no-output-overlap output.
+  //
+  // This test case exposes a situation that led to a compiler crash during development when
+  // we didn't force the spill and ended up with two parallel moves for `param` at the start
+  // of `get1`, hitting a debug-mode check that prevents such move collisions.
+  HInstruction* get1 = MakeIFieldGet(block, param, DataType::Type::kInt64, MemberOffset(32));
+  HInstruction* get2 = MakeIFieldGet(block, param, DataType::Type::kInt32, MemberOffset(40));
+  HInstruction* conv = MakeUnOp<HTypeConversion>(block, DataType::Type::kInt32, get1);
+  HAdd* add = MakeBinOp<HAdd>(block, DataType::Type::kInt32, conv, get2);
+  MakeReturn(block, add);
+
+  graph_->BuildDominatorTree();
+  x86::CodeGeneratorX86 codegen(graph_, *compiler_options_);
+  SsaLivenessAnalysis liveness(graph_, &codegen, GetScopedAllocator());
+  liveness.Analyze();
+
+  // There is no instruction that would get the locations required for this test on x86.
+  // We need no output overlap for an instruction that takes a single-register input and
+  // produces two-register output. This happens for 64-bit `HInstanceFieldGet` on arm32.
+  // Note: The processing of "no output overlap" happens at the start of the register
+  // allocation. It could conceivably be moved to the liveness analysis which would make
+  // this adjustment too late and we'd need to intercept the location creation which is
+  // doable as long as the `CodeGeneratorX86` is not `final`.
+  LocationSummary* get1_locs = get1->GetLocations();
+  ASSERT_TRUE(get1_locs->OutputCanOverlapWithInputs());
+  ASSERT_TRUE(get1_locs->Out().Equals(Location::RequiresRegister()));
+  get1_locs->UpdateOut(Location());  // Invalidate output to work around `DCHECK()` in `SetOut()`.
+  get1_locs->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+
+  // Make three registers available.
+  BlockCoreRegistersExcept(&codegen, {x86::EAX, x86::ECX, x86::EDX});
+
+  std::unique_ptr<RegisterAllocator> register_allocator =
+      RegisterAllocator::Create(GetScopedAllocator(), &codegen, liveness);
+  register_allocator->AllocateRegisters();
+
+  // Check the splits of the `param`.
+  LiveInterval* param_li = param->GetLiveInterval();
+  ASSERT_TRUE(param_li != nullptr);
+  ASSERT_TRUE(param_li->HasSpillSlot());
+  EXPECT_GT(block->GetLifetimeStart(), param_li->GetStart());
+  EXPECT_EQ(block->GetLifetimeStart(), param_li->GetEnd());
+  EXPECT_EQ(1, param_li->GetRegister());  // Initial argument register.
+  LiveInterval* param_li2 = param_li->GetNextSibling();
+  ASSERT_TRUE(param_li2 != nullptr);
+  EXPECT_EQ(block->GetLifetimeStart(), param_li2->GetStart());
+  EXPECT_EQ(invoke->GetLifetimePosition(), param_li2->GetEnd());
+  EXPECT_EQ(0, param_li2->GetRegister());  // Moved to register 0.
+  LiveInterval* param_li3 = param_li2->GetNextSibling();
+  ASSERT_TRUE(param_li3 != nullptr);
+  EXPECT_EQ(invoke->GetLifetimePosition(), param_li3->GetStart());
+  EXPECT_EQ(get1->GetLifetimePosition(), param_li3->GetEnd());
+  EXPECT_FALSE(param_li3->HasRegister());  // No register.
+  LiveInterval* param_li4 = param_li3->GetNextSibling();
+  ASSERT_TRUE(param_li4 != nullptr);
+  EXPECT_EQ(get1->GetLifetimePosition(), param_li4->GetStart());
+  EXPECT_EQ(get1->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput,
+            param_li4->GetEnd());
+  EXPECT_EQ(0, param_li4->GetRegister());  // Allocated register 0.
+  LiveInterval* param_li5 = param_li4->GetNextSibling();
+  ASSERT_TRUE(param_li5 != nullptr);
+  EXPECT_EQ(get1->GetLifetimePosition() + kLivenessPositionOfNonOverlappingOutput,
+            param_li5->GetStart());
+  EXPECT_EQ(get2->GetLifetimePosition(), param_li5->GetEnd());
+  EXPECT_FALSE(param_li5->HasRegister());  // No register.
+  LiveInterval* param_li6 = param_li5->GetNextSibling();
+  ASSERT_TRUE(param_li6 != nullptr);
+  EXPECT_EQ(get2->GetLifetimePosition(), param_li6->GetStart());
+  EXPECT_EQ(get2->GetLifetimePosition() + kLivenessPositionOfNormalUse, param_li6->GetEnd());
+  EXPECT_EQ(2, param_li6->GetRegister());  // Allocated register 2, avoiding `get1` result in 0-1.
+  ASSERT_TRUE(param_li6->GetNextSibling() == nullptr);
 }
 
 }  // namespace art

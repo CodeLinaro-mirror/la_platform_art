@@ -221,7 +221,8 @@ uint64_t CodeGenerator::GetJitMethodTypeRootIndex(ProtoReference proto_reference
   return code_generation_data_->GetJitMethodTypeRootIndex(proto_reference);
 }
 
-void CodeGenerator::EmitJitRootPatches([[maybe_unused]] uint8_t* code,
+void CodeGenerator::EmitJitRootPatches([[maybe_unused]] uint8_t* buffer,
+                                       [[maybe_unused]] const uint8_t* code_address,
                                        [[maybe_unused]] const uint8_t* roots_data) {
   DCHECK(code_generation_data_ != nullptr);
   DCHECK_EQ(code_generation_data_->GetNumberOfJitStringRoots(), 0u);
@@ -458,9 +459,6 @@ void CodeGenerator::CreateCommonInvokeLocationSummary(
     HInvokeStaticOrDirect* call = invoke->AsInvokeStaticOrDirect();
     MethodLoadKind method_load_kind = call->GetMethodLoadKind();
     CodePtrLocation code_ptr_location = call->GetCodePtrLocation();
-    if (code_ptr_location == CodePtrLocation::kCallCriticalNative) {
-      locations->AddTemp(Location::RequiresRegister());  // For target method.
-    }
     if (code_ptr_location == CodePtrLocation::kCallCriticalNative ||
         method_load_kind == MethodLoadKind::kRecursive) {
       // For `kCallCriticalNative` we need the current method as the hidden argument
@@ -896,29 +894,6 @@ uint32_t CodeGenerator::GetBootImageOffsetOfIntrinsicDeclaringClass(HInvoke* inv
   return GetBootImageOffsetImpl(declaring_class.Ptr(), ImageHeader::kSectionObjects);
 }
 
-void CodeGenerator::BlockIfInRegister(Location location, bool is_out) const {
-  // The DCHECKS below check that a register is not specified twice in
-  // the summary. The out location can overlap with an input, so we need
-  // to special case it.
-  if (location.IsRegister()) {
-    DCHECK(is_out || !blocked_core_registers_[location.reg()]);
-    blocked_core_registers_[location.reg()] = true;
-  } else if (location.IsFpuRegister()) {
-    DCHECK(is_out || !blocked_fpu_registers_[location.reg()]);
-    blocked_fpu_registers_[location.reg()] = true;
-  } else if (location.IsFpuRegisterPair()) {
-    DCHECK(is_out || !blocked_fpu_registers_[location.AsFpuRegisterPairLow<int>()]);
-    blocked_fpu_registers_[location.AsFpuRegisterPairLow<int>()] = true;
-    DCHECK(is_out || !blocked_fpu_registers_[location.AsFpuRegisterPairHigh<int>()]);
-    blocked_fpu_registers_[location.AsFpuRegisterPairHigh<int>()] = true;
-  } else if (location.IsRegisterPair()) {
-    DCHECK(is_out || !blocked_core_registers_[location.AsRegisterPairLow<int>()]);
-    blocked_core_registers_[location.AsRegisterPairLow<int>()] = true;
-    DCHECK(is_out || !blocked_core_registers_[location.AsRegisterPairHigh<int>()]);
-    blocked_core_registers_[location.AsRegisterPairHigh<int>()] = true;
-  }
-}
-
 std::unique_ptr<CodeGenerator> CodeGenerator::Create(HGraph* graph,
                                                      const CompilerOptions& compiler_options,
                                                      OptimizingCompilerStats* stats) {
@@ -977,10 +952,9 @@ CodeGenerator::CodeGenerator(HGraph* graph,
       fpu_spill_mask_(0),
       first_register_slot_in_slow_path_(0),
       allocated_registers_(RegisterSet::Empty()),
-      blocked_core_registers_(graph->GetAllocator()->AllocArray<bool>(number_of_core_registers,
-                                                                      kArenaAllocCodeGenerator)),
-      blocked_fpu_registers_(graph->GetAllocator()->AllocArray<bool>(number_of_fpu_registers,
-                                                                     kArenaAllocCodeGenerator)),
+      data_types_requiring_register_pair_(0u),
+      blocked_core_registers_(0u),
+      blocked_fpu_registers_(0u),
       number_of_core_registers_(number_of_core_registers),
       number_of_fpu_registers_(number_of_fpu_registers),
       number_of_register_pairs_(number_of_register_pairs),
@@ -999,6 +973,9 @@ CodeGenerator::CodeGenerator(HGraph* graph,
       requires_current_method_(GetGraph()->IsCompilingBaseline()),
       code_generation_data_(),
       unimplemented_intrinsics_(unimplemented_intrinsics) {
+  DCHECK_LE(number_of_core_registers_, BitSizeOf<uint32_t>());
+  DCHECK_LE(number_of_fpu_registers_, BitSizeOf<uint32_t>());
+
   if (GetGraph()->IsCompilingOsr()) {
     // Make OSR methods have all registers spilled, this simplifies the logic of
     // jumping to the compiled code directly.
@@ -1806,15 +1783,20 @@ LocationSummary* CodeGenerator::CreateSystemArrayCopyLocationSummary(
   return locations;
 }
 
-void CodeGenerator::EmitJitRoots(uint8_t* code,
+void CodeGenerator::EmitJitRoots(uint8_t* buffer,
+                                 const uint8_t* code_address,
                                  const uint8_t* roots_data,
                                  /*out*/std::vector<Handle<mirror::Object>>* roots) {
   code_generation_data_->EmitJitRoots(roots);
-  EmitJitRootPatches(code, roots_data);
+  EmitJitRootPatches(buffer, code_address, roots_data);
 }
 
 QuickEntrypointEnum CodeGenerator::GetArrayAllocationEntrypoint(HNewArray* new_array) {
-  switch (new_array->GetComponentSizeShift()) {
+  return GetArrayAllocationEntrypoint(new_array->GetComponentSizeShift());
+}
+
+QuickEntrypointEnum CodeGenerator::GetArrayAllocationEntrypoint(size_t component_size_shift) {
+  switch (component_size_shift) {
     case 0: return kQuickAllocArrayResolved8;
     case 1: return kQuickAllocArrayResolved16;
     case 2: return kQuickAllocArrayResolved32;

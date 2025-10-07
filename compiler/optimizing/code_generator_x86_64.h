@@ -468,7 +468,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
     return GetLabelOf(block)->Position();
   }
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
   void Finalize() override;
@@ -514,8 +514,6 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   void Initialize() override {
     block_labels_ = CommonInitializeLabels<Label>();
   }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.
@@ -567,12 +565,14 @@ class CodeGeneratorX86_64 : public CodeGenerator {
 
   void EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* linker_patches) override;
 
-  void PatchJitRootUse(uint8_t* code,
+  void PatchJitRootUse(uint8_t* buffer,
+                       const uint8_t* code_address,
                        const uint8_t* roots_data,
                        const PatchInfo<Label>& info,
                        uint64_t index_in_table) const;
 
-  void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
+  void EmitJitRootPatches(
+      uint8_t* buffer, const uint8_t* code_address, const uint8_t* roots_data) override;
 
   // Fast path implementation of ReadBarrier::Barrier for a heap
   // reference field load when Baker's read barriers are used.

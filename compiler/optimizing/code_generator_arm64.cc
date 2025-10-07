@@ -27,7 +27,6 @@
 #include "class_root-inl.h"
 #include "class_table.h"
 #include "code_generator_utils.h"
-#include "com_android_art_flags.h"
 #include "dex/dex_file_types.h"
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
@@ -59,8 +58,6 @@ using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 using vixl::ExactAssemblyScope;
 using vixl::CodeBufferCheckScope;
 using vixl::EmissionCheckScope;
-
-namespace art_flags = com::android::art::flags;
 
 #ifdef __
 #error "ARM64 Codegen VIXL macro-assembler macro already defined."
@@ -1057,8 +1054,8 @@ CodeGeneratorARM64::CodeGeneratorARM64(HGraph* graph,
                     kNumberOfAllocatableRegisters,
                     kNumberOfAllocatableFPRegisters,
                     kNumberOfAllocatableRegisterPairs,
-                    callee_saved_core_registers.GetList(),
-                    callee_saved_fp_registers.GetList(),
+                    dchecked_integral_cast<uint32_t>(callee_saved_core_registers.GetList()),
+                    dchecked_integral_cast<uint32_t>(callee_saved_fp_registers.GetList()),
                     compiler_options,
                     stats,
                     ArrayRef<const bool>(detail::kIsIntrinsicUnimplemented)),
@@ -1089,6 +1086,7 @@ CodeGeneratorARM64::CodeGeneratorARM64(HGraph* graph,
       jit_patches_(&assembler_, graph->GetAllocator()),
       jit_baker_read_barrier_slow_paths_(std::less<uint32_t>(),
                                          graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
+  SetupBlockedRegisters();
   // Save the link register (containing the return address) to mimic Quick.
   AddAllocatedRegister(LocationFrom(lr));
 
@@ -1355,7 +1353,18 @@ void InstructionCodeGeneratorARM64::VisitMethodEntryHook(HMethodEntryHook* instr
 }
 
 void CodeGeneratorARM64::MaybeRecordTraceEvent(bool is_method_entry) {
-  if (!art_flags::always_enable_profile_code()) {
+  // This threshold is chosen arbitrarily. There was no thorough experimentation
+  // to arrive at this number.
+  static constexpr int kSmallFunctionThreshold = 32;
+  if (!GetCompilerOptions().EnableProfileCode()) {
+    return;
+  }
+
+  HGraph* graph = GetGraph();
+  // Don't instrument methods that are unlikely to be long running
+  if (!graph->HasLoops() &&
+      !graph->HasMonitorOperations() &&
+      graph->CountNumberOfInstructions() <= kSmallFunctionThreshold) {
     return;
   }
 
@@ -1677,11 +1686,12 @@ void CodeGeneratorARM64::CheckGCCardIsValid(Register object) {
   __ Bind(&done);
 }
 
-void CodeGeneratorARM64::SetupBlockedRegisters() const {
+inline void CodeGeneratorARM64::SetupBlockedRegisters() {
   // Blocked core registers:
   //      lr        : Runtime reserved.
-  //      tr        : Runtime reserved.
-  //      mr        : Runtime reserved.
+  //      tr (x19)  : Runtime reserved.
+  //      mr (x20)  : Runtime reserved.
+  //      x21       : Runtime reserved for implicit suspend check.
   //      ip1       : VIXL core temp.
   //      ip0       : VIXL core temp.
   //      x18       : Platform register.
@@ -1690,25 +1700,17 @@ void CodeGeneratorARM64::SetupBlockedRegisters() const {
   //      d31       : VIXL fp temp.
   CPURegList reserved_core_registers = vixl_reserved_core_registers;
   reserved_core_registers.Combine(runtime_reserved_core_registers);
-  while (!reserved_core_registers.IsEmpty()) {
-    blocked_core_registers_[reserved_core_registers.PopLowestIndex().GetCode()] = true;
-  }
-  blocked_core_registers_[X18] = true;
+  reserved_core_registers.Combine(vixl::aarch64::x18);
+  blocked_core_registers_ = dchecked_integral_cast<uint32_t>(reserved_core_registers.GetList());
 
   CPURegList reserved_fp_registers = vixl_reserved_fp_registers;
-  while (!reserved_fp_registers.IsEmpty()) {
-    blocked_fpu_registers_[reserved_fp_registers.PopLowestIndex().GetCode()] = true;
-  }
-
   if (GetGraph()->IsDebuggable()) {
     // Stubs do not save callee-save floating point registers. If the graph
     // is debuggable, we need to deal with these registers differently. For
     // now, just block them.
-    CPURegList reserved_fp_registers_debuggable = callee_saved_fp_registers;
-    while (!reserved_fp_registers_debuggable.IsEmpty()) {
-      blocked_fpu_registers_[reserved_fp_registers_debuggable.PopLowestIndex().GetCode()] = true;
-    }
+    reserved_fp_registers.Combine(callee_saved_fp_registers);
   }
+  blocked_fpu_registers_ = dchecked_integral_cast<uint32_t>(reserved_fp_registers.GetList());
 }
 
 size_t CodeGeneratorARM64::SaveCoreRegister(size_t stack_index, uint32_t reg_id) {
@@ -1928,19 +1930,26 @@ void CodeGeneratorARM64::MoveLocation(Location destination,
 void CodeGeneratorARM64::Load(DataType::Type type,
                               CPURegister dst,
                               const MemOperand& src) {
+  Load(GetVIXLAssembler(), type, dst, src);
+}
+
+void CodeGeneratorARM64::Load(vixl::aarch64::MacroAssembler* assembler,
+                              DataType::Type type,
+                              CPURegister dst,
+                              const MemOperand& src) {
   switch (type) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
-      __ Ldrb(Register(dst), src);
+      assembler->Ldrb(Register(dst), src);
       break;
     case DataType::Type::kInt8:
-      __ Ldrsb(Register(dst), src);
+      assembler->Ldrsb(Register(dst), src);
       break;
     case DataType::Type::kUint16:
-      __ Ldrh(Register(dst), src);
+      assembler->Ldrh(Register(dst), src);
       break;
     case DataType::Type::kInt16:
-      __ Ldrsh(Register(dst), src);
+      assembler->Ldrsh(Register(dst), src);
       break;
     case DataType::Type::kInt32:
     case DataType::Type::kReference:
@@ -1948,7 +1957,7 @@ void CodeGeneratorARM64::Load(DataType::Type type,
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64:
       DCHECK_EQ(dst.Is64Bits(), DataType::Is64BitType(type));
-      __ Ldr(dst, src);
+      assembler->Ldr(dst, src);
       break;
     case DataType::Type::kUint32:
     case DataType::Type::kUint64:
@@ -2041,15 +2050,22 @@ void CodeGeneratorARM64::LoadAcquire(HInstruction* instruction,
 void CodeGeneratorARM64::Store(DataType::Type type,
                                CPURegister src,
                                const MemOperand& dst) {
+  Store(GetVIXLAssembler(), type, src, dst);
+}
+
+void CodeGeneratorARM64::Store(vixl::aarch64::MacroAssembler* assembler,
+                               DataType::Type type,
+                               CPURegister src,
+                               const MemOperand& dst) {
   switch (type) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
-      __ Strb(Register(src), dst);
+      assembler->Strb(Register(src), dst);
       break;
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
-      __ Strh(Register(src), dst);
+      assembler->Strh(Register(src), dst);
       break;
     case DataType::Type::kInt32:
     case DataType::Type::kReference:
@@ -2057,7 +2073,7 @@ void CodeGeneratorARM64::Store(DataType::Type type,
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64:
       DCHECK_EQ(src.Is64Bits(), DataType::Is64BitType(type));
-      __ Str(src, dst);
+      assembler->Str(src, dst);
       break;
     case DataType::Type::kUint32:
     case DataType::Type::kUint64:
@@ -5070,6 +5086,7 @@ void CodeGeneratorARM64::GenerateStaticOrDirectCall(
       DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
       if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
         // Do not materialize the method pointer, load directly the entrypoint.
+        DCHECK(callee_method.IsInvalid());
         // Add ADRP with its PC-relative JNI entrypoint patch.
         vixl::aarch64::Label* adrp_label =
             NewBootImageJniEntrypointPatch(invoke->GetResolvedMethodReference());
@@ -5082,7 +5099,12 @@ void CodeGeneratorARM64::GenerateStaticOrDirectCall(
       }
       FALLTHROUGH_INTENDED;
     default:
-      LoadMethod(invoke->GetMethodLoadKind(), temp, invoke);
+      if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
+        // Use LR for both the target method and then the code pointer.
+        DCHECK(callee_method.IsInvalid());
+        callee_method = Location::RegisterLocation(lr.GetCode());
+      }
+      LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
   }
 
@@ -5396,8 +5418,10 @@ vixl::aarch64::Label* CodeGeneratorARM64::NewPcRelativePatch(
   return label;
 }
 
-void CodeGeneratorARM64::EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) {
-  jit_patches_.EmitJitRootPatches(code, roots_data, *GetCodeGenerationData());
+void CodeGeneratorARM64::EmitJitRootPatches(uint8_t* buffer,
+                                            [[maybe_unused]] const uint8_t* code_address,
+                                            const uint8_t* roots_data) {
+  jit_patches_.EmitJitRootPatches(buffer, roots_data, *GetCodeGenerationData());
 }
 
 void CodeGeneratorARM64::EmitAdrpPlaceholder(vixl::aarch64::Label* fixup_label,

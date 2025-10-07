@@ -935,7 +935,7 @@ cc_defaults {
         "661-oat-writer-layout/oat_writer_layout.cc",
         "664-aget-verifier/aget-verifier.cc",
         "667-jit-jni-stub/jit_jni_stub_test.cc",
-        "674-hiddenapi/hiddenapi.cc",
+        "674-hiddenapi/core.cc",
         "692-vdex-inmem-loader/vdex_inmem_loader.cc",
         "720-thread-priority/thread_priority.cc",
         "800-smali/jni.cc",
@@ -1012,6 +1012,7 @@ cc_defaults {
     name: "libarttest_external-defaults",
     defaults: ["art_test_defaults"],
     srcs: [
+        "674-hiddenapi/app.cc",
         "817-hiddenapi/test_native.cc",
         "common/libarttest_external.cc",
     ],
@@ -1464,6 +1465,7 @@ filegroup {
         ":art-gtest-jars-ManyMethods",
         ":art-gtest-jars-MethodTypes",
         ":art-gtest-jars-MultiDex",
+        ":art-gtest-jars-MultiDexContainer",
         ":art-gtest-jars-MultiDexModifiedSecondary",
         ":art-gtest-jars-MyClass",
         ":art-gtest-jars-MyClassNatives",
@@ -1839,6 +1841,22 @@ java_genrule {
     defaults: ["art-gtest-jars-align-defaults"],
     srcs: [":art-gtest-jars-MultiDexUncompressed"],
     out: ["art-gtest-jars-MultiDexUncompressedAligned.jar"],
+}
+
+// A copy of MultiDex with a single, containerized classes.dex.
+java_library {
+    name: "art-gtest-jars-MultiDexContainer",
+    srcs: ["MultiDex/**/*.java"],
+    defaults: ["art-gtest-jars-defaults"],
+    min_sdk_version: "19",
+    dxflags: [
+        // Container usage is the default for minSdkVersion >= 36, but
+        // `--main-dex-list` is only supported for earlier SDK versions. For
+        // now, simply force container usage for testing purposes.
+        "-JDcom.android.tools.r8.dexContainerExperiment",
+        "--main-dex-list",
+        "art/test/MultiDexModifiedSecondary/main.list",
+    ],
 }
 
 java_library {

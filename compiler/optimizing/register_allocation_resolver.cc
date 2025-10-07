@@ -44,7 +44,7 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
                      + catch_phi_spill_slots;
 
   // Update safepoints and calculate the size of the spills.
-  UpdateSafepointLiveRegisters();
+  UpdateSafepointLiveRegisters(safepoints);
   size_t maximum_safepoint_spill_size = CalculateMaximumSafepointSpillSize(safepoints);
 
   // Computes frame size and spill mask.
@@ -125,7 +125,7 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
       current->SetSpillSlot(slot * kVRegSize);
     }
 
-    Location source = current->ToLocation();
+    Location source = GetLocation(current);
 
     if (location.IsUnallocated()) {
       if (location.GetPolicy() == Location::kSameAsFirstInput) {
@@ -143,7 +143,7 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
 
   // Connect siblings and resolve inputs.
   for (HInstruction* instruction : liveness_.GetInstructionsFromSsaIndexes()) {
-    ConnectSiblings(instruction->GetLiveInterval());
+    ConnectSiblings(instruction->GetLiveInterval(), safepoints);
   }
 
   // Resolve non-linear control flow across branches. Order does not matter.
@@ -184,11 +184,11 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
       for (HInstructionIterator inst_it(block->GetPhis()); !inst_it.Done(); inst_it.Advance()) {
         HPhi* phi = inst_it.Current()->AsPhi();
         HInputsRef inputs = phi->GetInputs();
-        Location destination = phi->GetLiveInterval()->ToLocation();
+        Location destination = GetLocation(phi->GetLiveInterval());
         for (auto [predecessor, input_index] : ZipCount(block->GetPredecessors())) {
           DCHECK_EQ(predecessor->GetNormalSuccessors().size(), 1u);
-          Location source = inputs[input_index]->GetLiveInterval()->GetLocationAt(
-              predecessor->GetLifetimeEnd() - 1);
+          Location source = GetLocationAt(inputs[input_index]->GetLiveInterval(),
+                                          predecessor->GetLifetimeEnd() - 1);
           InsertParallelMoveAtExitOf(predecessor, phi, source, destination);
         }
       }
@@ -226,41 +226,37 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
   }
 }
 
-void RegisterAllocationResolver::UpdateSafepointLiveRegisters() {
+void RegisterAllocationResolver::UpdateSafepointLiveRegisters(
+    ArrayRef<HInstruction* const> safepoints) {
   for (HInstruction* instruction : liveness_.GetInstructionsFromSsaIndexes()) {
+    size_t remaining_safepoints = instruction->GetLiveInterval()->GetNumSafepointsAfter();
+    uint32_t RegisterSet::* register_field_accessor =
+        RegisterSet::GetRegisterFieldAccessor(instruction->GetLiveInterval()->IsFloatingPoint());
     for (LiveInterval* current = instruction->GetLiveInterval();
          current != nullptr;
          current = current->GetNextSibling()) {
       if (!current->HasRegister()) {
         continue;
       }
-      Location source = current->ToLocation();
-      for (const SafepointPosition& safepoint_position : current->GetSafepoints()) {
-        DCHECK(current->CoversSlow(safepoint_position.GetPosition()));
-        LocationSummary* locations = safepoint_position.GetLocations();
-        switch (source.GetKind()) {
-          case Location::kRegister:
-          case Location::kFpuRegister: {
-            locations->AddLiveRegister(source);
-            break;
-          }
-          case Location::kRegisterPair:
-          case Location::kFpuRegisterPair: {
-            locations->AddLiveRegister(source.ToLow());
-            locations->AddLiveRegister(source.ToHigh());
-            break;
-          }
-          case Location::kStackSlot:  // Fall-through
-          case Location::kDoubleStackSlot:  // Fall-through
-          case Location::kConstant: {
-            // Nothing to do.
-            break;
-          }
-          default: {
-            LOG(FATAL) << "Unexpected location for object";
-          }
-        }
+
+      DCHECK_LT(static_cast<size_t>(current->GetRegister()), BitSizeOf<uint32_t>());
+      uint32_t register_mask = 1u << current->GetRegister();
+      DCHECK_EQ(current->HasHighInterval(), current->GetHighOrLowInterval() != nullptr);
+      if (current->GetHighOrLowInterval() != nullptr) {
+        DCHECK(current->GetHighInterval()->HasRegister());
+        DCHECK_LT(static_cast<size_t>(current->GetHighInterval()->GetRegister()),
+                  BitSizeOf<uint32_t>());
+        register_mask |= 1u << current->GetHighInterval()->GetRegister();
       }
+
+      remaining_safepoints = current->ForCoveredSafepoints(
+          safepoints,
+          remaining_safepoints,
+          [&](HInstruction* safepoint) ALWAYS_INLINE {
+            RegisterSet* live_registers = safepoint->GetLocations()->GetLiveRegisters();
+            (live_registers->*register_field_accessor) |= register_mask;
+            return true;
+          });
     }
   }
 }
@@ -289,7 +285,8 @@ size_t RegisterAllocationResolver::CalculateMaximumSafepointSpillSize(
   return maximum_safepoint_spill_size;
 }
 
-void RegisterAllocationResolver::ConnectSiblings(LiveInterval* interval) {
+void RegisterAllocationResolver::ConnectSiblings(LiveInterval* interval,
+                                                 ArrayRef<HInstruction* const> safepoints) {
   LiveInterval* current = interval;
   if (current->HasSpillSlot()
       && current->HasRegister()
@@ -303,17 +300,18 @@ void RegisterAllocationResolver::ConnectSiblings(LiveInterval* interval) {
     CHECK_IMPLIES(loc.IsSIMDStackSlot(),
                   (codegen_->GetSIMDRegisterWidth() / kVRegSize == num_of_slots))
         << "Unexpected number of spill slots";
-    InsertMoveAfter(interval->GetDefinedBy(), interval->ToLocation(), loc);
+    InsertMoveAfter(interval->GetDefinedBy(), GetLocation(interval), loc);
   }
   UsePositionList::const_iterator use_it = current->GetUses().begin();
   const UsePositionList::const_iterator use_end = current->GetUses().end();
   EnvUsePositionList::const_iterator env_use_it = current->GetEnvironmentUses().begin();
   const EnvUsePositionList::const_iterator env_use_end = current->GetEnvironmentUses().end();
+  size_t remaining_safepoints = current->GetNumSafepointsAfter();
 
   // Walk over all siblings, updating locations of use positions, and
   // connecting them when they are adjacent.
   do {
-    Location source = current->ToLocation();
+    Location source = GetLocation(current);
 
     // Walk over all uses covered by this interval, and update the location
     // information.
@@ -371,27 +369,27 @@ void RegisterAllocationResolver::ConnectSiblings(LiveInterval* interval) {
     if (next_sibling != nullptr
         && next_sibling->HasRegister()
         && current->GetEnd() == next_sibling->GetStart()) {
-      Location destination = next_sibling->ToLocation();
+      Location destination = GetLocation(next_sibling);
       InsertParallelMoveAt(current->GetEnd(), interval->GetDefinedBy(), source, destination);
     }
 
-    for (const SafepointPosition& safepoint_position : current->GetSafepoints()) {
-      DCHECK(current->CoversSlow(safepoint_position.GetPosition()));
-
-      if (current->GetType() == DataType::Type::kReference) {
-        DCHECK(interval->GetDefinedBy()->IsActualObject())
-            << interval->GetDefinedBy()->DebugName()
-            << '(' << interval->GetDefinedBy()->GetId() << ')'
-            << "@" << safepoint_position.GetInstruction()->DebugName()
-            << '(' << safepoint_position.GetInstruction()->GetId() << ')';
-        LocationSummary* locations = safepoint_position.GetLocations();
-        if (current->GetParent()->HasSpillSlot()) {
-          locations->SetStackBit(current->GetParent()->GetSpillSlot() / kVRegSize);
-        }
-        if (source.GetKind() == Location::kRegister) {
-          locations->SetRegisterBit(source.reg());
-        }
-      }
+    if (current->GetType() == DataType::Type::kReference) {
+      DCHECK(interval->GetDefinedBy()->IsActualObject())
+          << interval->GetDefinedBy()->DebugName()
+          << '(' << interval->GetDefinedBy()->GetId() << ')';
+      remaining_safepoints = current->ForCoveredSafepoints(
+          safepoints,
+          remaining_safepoints,
+          [&](HInstruction* safepoint) ALWAYS_INLINE {
+            LocationSummary* locations = safepoint->GetLocations();
+            if (current->GetParent()->HasSpillSlot()) {
+              locations->SetStackBit(current->GetParent()->GetSpillSlot() / kVRegSize);
+            }
+            if (source.GetKind() == Location::kRegister) {
+              locations->SetRegisterBit(source.reg());
+            }
+            return true;
+          });
     }
     current = next_sibling;
   } while (current != nullptr);
@@ -468,7 +466,7 @@ void RegisterAllocationResolver::ConnectSplitSiblings(LiveInterval* interval,
     DCHECK(source != nullptr);
     DCHECK(source->CoversSlow(source_position));
     DCHECK(destination->CoversSlow(destination_position));
-    location_source = source->ToLocation();
+    location_source = GetLocation(source);
   }
 
   // If `from` has only one successor, we can put the moves at the exit of it. Otherwise
@@ -477,13 +475,13 @@ void RegisterAllocationResolver::ConnectSplitSiblings(LiveInterval* interval,
     InsertParallelMoveAtExitOf(from,
                                defined_by,
                                location_source,
-                               destination->ToLocation());
+                               GetLocation(destination));
   } else {
     DCHECK_EQ(to->GetPredecessors().size(), 1u);
     InsertParallelMoveAtEntryOf(to,
                                 defined_by,
                                 location_source,
-                                destination->ToLocation());
+                                GetLocation(destination));
   }
 }
 
@@ -694,6 +692,43 @@ void RegisterAllocationResolver::InsertMoveAfter(HInstruction* instruction,
     instruction->GetBlock()->InsertInstructionBefore(move, instruction->GetNext());
   }
   AddMove(move, source, destination, instruction, instruction->GetType());
+}
+
+Location RegisterAllocationResolver::GetLocation(LiveInterval* interval) {
+  DCHECK(!interval->IsHighInterval());
+  if (interval->HasRegister()) {
+    if (interval->IsFloatingPoint()) {
+      if (interval->HasHighInterval()) {
+        return Location::FpuRegisterPairLocation(interval->GetRegister(),
+                                                 interval->GetHighInterval()->GetRegister());
+      } else {
+        return Location::FpuRegisterLocation(interval->GetRegister());
+      }
+    } else {
+      if (interval->HasHighInterval()) {
+        return Location::RegisterPairLocation(interval->GetRegister(),
+                                              interval->GetHighInterval()->GetRegister());
+      } else {
+        return Location::RegisterLocation(interval->GetRegister());
+      }
+    }
+  } else {
+    HInstruction* defined_by = interval->GetParent()->GetDefinedBy();
+    if (defined_by->IsConstant()) {
+      return defined_by->GetLocations()->Out();
+    } else if (interval->GetParent()->HasSpillSlot()) {
+      return Location::StackSlotByNumOfSlots(interval->NumberOfSpillSlotsNeeded(),
+                                             interval->GetParent()->GetSpillSlot());
+    } else {
+      return Location();
+    }
+  }
+}
+
+Location RegisterAllocationResolver::GetLocationAt(LiveInterval* interval, size_t position) {
+  LiveInterval* sibling = interval->GetSiblingAt(position);
+  DCHECK(sibling != nullptr);
+  return GetLocation(sibling);
 }
 
 }  // namespace art

@@ -996,6 +996,9 @@
           "842-vdex-hard-failure",
           "850-checker-branches",
           "852-invoke-super",
+          "864-catch",
+          "864-move-object",
+          "865-fallthrough",
           "900-hello-plugin",
           "901-hello-ti-agent",
           "903-hello-tagging",
@@ -1065,7 +1068,8 @@
           "2267-class-implements-itself",
           "2276-const-method-type-gc-cleanup",
           "2281-method-handle-invoke-static-class-unload",
-          "2286-invokevirtual-invokeexact"
+          "2286-invokevirtual-invokeexact",
+          "2287-no-temp-component-class"
         ],
         "variant": "jvm",
         "bug": "b/73888836",
@@ -1623,12 +1627,20 @@
       "env_vars": {"ART_TEST_ON_VM": "true"}
     },
     {
+      "tests": ["137-cfi"],
+      "description": ["Fails on SBC"],
+      "env_vars": {"ART_TEST_ON_SBC": "true"}
+    },
+    {
       "tests": ["2390-virtual-thread-carrier-leak",
                 "2390-virtual-thread-context-leak",
                 "2390-virtual-thread-parking-error-leak",
                 "2391-virtual-thread-sleeps",
                 "2392-virtual-thread-pinning-jni",
-                "2393-virtual-thread-pinning-monitor"],
+                "2393-virtual-thread-pinning-monitor",
+                "2394-continuation-yields",
+                "2395-virtual-thread-reentrantlock",
+                "2395-virtual-thread-sleep-api"],
       "variant": "jvm",
       "description": ["Tests for ART-specific Virtual Thread APIs."]
     },

@@ -25,6 +25,7 @@
 #include "array-inl.h"
 #include "art_field-inl.h"
 #include "art_method-inl.h"
+#include "base/inlined_vector.h"
 #include "base/logging.h"  // For VLOG.
 #include "base/pointer_size.h"
 #include "base/sdk_version.h"
@@ -576,7 +577,27 @@ ArtMethod* Class::FindInterfaceMethod(std::string_view name,
 ArtMethod* Class::FindInterfaceMethod(ObjPtr<DexCache> dex_cache,
                                       uint32_t dex_method_idx,
                                       PointerSize pointer_size) {
-  // We always search by name and signature, ignoring the type index in the MethodId.
+  // First try to find a declared method by dex_method_idx if we have a dex_cache match.
+  if (GetDexCache() == dex_cache) {
+    ArtMethod* method = nullptr;
+    if (pointer_size == kRuntimePointerSize) {
+      method = FindDeclaredClassMethod</* kOnlyLookAtIndex= */ false, kRuntimePointerSize>(
+          dex_method_idx);
+    } else {
+      constexpr PointerSize kOtherPointerSize =
+          (kRuntimePointerSize == PointerSize::k64) ? PointerSize::k32 : PointerSize::k64;
+      method = FindDeclaredClassMethod</* kOnlyLookAtIndex */ false, kOtherPointerSize>(
+          dex_method_idx);
+    }
+    if (method != nullptr) {
+      // This method is only called for interface classes, except from
+      // `ClassLinker::FindIncompatibleMethod` where we have not found one.
+      DCHECK(IsInterface());
+      return method;
+    }
+  }
+
+  // Otherwise search by name and signature, ignoring the type index in the MethodId.
   const DexFile& dex_file = *dex_cache->GetDexFile();
   const dex::MethodId& method_id = dex_file.GetMethodId(dex_method_idx);
   std::string_view name = dex_file.GetStringView(method_id.name_idx_);
@@ -777,11 +798,11 @@ std::tuple<bool, uint32_t> ClassMemberBinarySearch(uint32_t begin,
   return {success, mid};
 }
 
-static std::tuple<bool, ArtMethod*> FindDeclaredClassMethod(ObjPtr<mirror::Class> klass,
-                                                            const DexFile& dex_file,
-                                                            std::string_view name,
-                                                            Signature signature,
-                                                            PointerSize pointer_size)
+static std::tuple<bool, ArtMethod*> FindDeclaredClassMethodInternal(ObjPtr<mirror::Class> klass,
+                                                                    const DexFile& dex_file,
+                                                                    std::string_view name,
+                                                                    Signature signature,
+                                                                    PointerSize pointer_size)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(&klass->GetDexFile() == &dex_file);
   DCHECK(!name.empty());
@@ -834,12 +855,18 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
   // First try to find a declared method by dex_method_idx if we have a dex_cache match.
   ObjPtr<DexCache> this_dex_cache = GetDexCache();
   if (this_dex_cache == dex_cache) {
-    // Lookup is always performed in the class referenced by the MethodId.
-    DCHECK_EQ(dex_type_idx_, GetDexFile().GetMethodId(dex_method_idx).class_idx_.index_);
-    for (ArtMethod& method : GetDeclaredMethodsSlice(pointer_size)) {
-      if (method.GetDexMethodIndex() == dex_method_idx) {
-        return &method;
-      }
+    ArtMethod* method = nullptr;
+    if (pointer_size == kRuntimePointerSize) {
+      method = FindDeclaredClassMethod</* kOnlyLookAtIndex= */ false, kRuntimePointerSize>(
+          dex_method_idx);
+    } else {
+      constexpr PointerSize kOtherPointerSize =
+          (kRuntimePointerSize == PointerSize::k64) ? PointerSize::k32 : PointerSize::k64;
+      method =
+          FindDeclaredClassMethod</* kOnlyLookAtIndex= */ false, kOtherPointerSize>(dex_method_idx);
+    }
+    if (method != nullptr) {
+      return method;
     }
   }
 
@@ -853,7 +880,7 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
   if (this_dex_cache != dex_cache && !GetDeclaredMethodsSlice(pointer_size).empty()) {
     DCHECK(name.empty());
     name = dex_file.GetMethodNameView(method_id);
-    auto [success, method] = FindDeclaredClassMethod(
+    auto [success, method] = FindDeclaredClassMethodInternal(
         this, *this_dex_cache->GetDexFile(), name, signature, pointer_size);
     DCHECK_EQ(success, method != nullptr);
     if (success) {
@@ -885,7 +912,7 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
       if (name.empty()) {
         name = dex_file.GetMethodNameView(method_id);
       }
-      auto [success, method] = FindDeclaredClassMethod(
+      auto [success, method] = FindDeclaredClassMethodInternal(
           klass, *klass_dex_cache->GetDexFile(), name, signature, pointer_size);
       DCHECK_EQ(success, method != nullptr);
       if (success) {
@@ -1189,41 +1216,38 @@ ObjPtr<mirror::ObjectArray<mirror::Field>> Class::GetDeclaredFields(
     ThrowRuntimeException("Obsolete Object!");
     return nullptr;
   }
-  StackHandleScope<1> hs(self);
-  IterationRange<StrideIterator<ArtField>> fields = GetFields();
-  size_t array_size = NumFields();
+  // Collect all discoverable fields.
   auto hiddenapi_context = hiddenapi::GetReflectionCallerAccessContext(self);
-  // Lets go subtract all the non discoverable fields.
-  for (ArtField& field : fields) {
-    if (!IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      --array_size;
+  static constexpr size_t kMaxStackEntries = 8u;
+  InlinedVector<ArtField*, kMaxStackEntries> fields;
+  for (ArtField& field : GetFields()) {
+    if (IsDiscoverable(public_only, hiddenapi_context, &field)) {
+      fields.push_back(&field);
     }
   }
-  size_t array_idx = 0;
+  StackHandleScope<1> hs(self);
   auto object_array = hs.NewHandle(mirror::ObjectArray<mirror::Field>::Alloc(
-      self, GetClassRoot<mirror::ObjectArray<mirror::Field>>(), array_size));
+      self, GetClassRoot<mirror::ObjectArray<mirror::Field>>(), fields.size()));
   if (object_array == nullptr) {
     return nullptr;
   }
-  for (ArtField& field : fields) {
-    if (IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      ObjPtr<mirror::Field> reflect_field =
-          mirror::Field::CreateFromArtField(self, &field, force_resolve);
-      if (reflect_field == nullptr) {
-        if (kIsDebugBuild) {
-          self->AssertPendingException();
-        }
-        // Maybe null due to OOME or type resolving exception.
-        return nullptr;
+  size_t array_idx = 0;
+  for (ArtField* field : fields.GetArray()) {
+    ObjPtr<mirror::Field> reflect_field =
+        mirror::Field::CreateFromArtField(self, field, force_resolve);
+    if (reflect_field == nullptr) {
+      if (kIsDebugBuild) {
+        self->AssertPendingException();
       }
-      // We're initializing a newly allocated object, so we do not need to record that under
-      // a transaction. If the transaction is aborted, the whole object shall be unreachable.
-      object_array->SetWithoutChecks</*kTransactionActive=*/ false,
-                                     /*kCheckTransaction=*/ false>(
-                                         array_idx++, reflect_field);
+      // Maybe null due to OOME or type resolving exception.
+      return nullptr;
     }
+    // We're initializing a newly allocated object, so we do not need to record that under
+    // a transaction. If the transaction is aborted, the whole object shall be unreachable.
+    object_array->SetWithoutChecks<
+        /*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(array_idx++, reflect_field);
   }
-  DCHECK_EQ(array_idx, array_size);
+  DCHECK_EQ(array_idx, fields.size());
   return object_array.Get();
 }
 
@@ -2350,6 +2374,16 @@ size_t Class::GetProxyThrowsIndex(ArtMethod* method) REQUIRES_SHARED(Locks::muta
     }
   }
   return static_cast<size_t>(-1);
+}
+
+template <PointerSize kPointerSize>
+ArtMethod* Class::FindDeclaredClassMethodSlow(uint32_t dex_method_idx) {
+  for (ArtMethod& m : GetDeclaredMethods(kPointerSize)) {
+    if (m.GetDexMethodIndex() == dex_method_idx) {
+      return &m;
+    }
+  }
+  return nullptr;
 }
 
 

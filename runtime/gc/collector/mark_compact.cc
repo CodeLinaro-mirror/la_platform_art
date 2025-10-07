@@ -52,6 +52,7 @@
 #include "mark_compact-inl.h"
 #include "mirror/object-refvisitor-inl.h"
 #include "read_barrier_config.h"
+#include "scoped_thread_priority_change.h"
 #include "scoped_thread_state_change-inl.h"
 #include "sigchain.h"
 #include "thread_list.h"
@@ -60,6 +61,7 @@
 #include "android-modules-utils/sdk_level.h"
 #include "com_android_art.h"
 #include "com_android_art_flags.h"
+#include "com_android_art_rw_flags.h"
 #endif
 
 // See aosp/2996596 for where these values came from.
@@ -322,7 +324,7 @@ bool ShouldUseGenerationalGC() {
 // Inter-Processor Interrupts (IPI), which are used for TLB flush, are very slow on
 // virtual devices, like cuttlefish. Therefore, we don't use MOVE ioctl on such devices.
 static const bool gMoveIoctlRequested =
-    com::android::art::flags::use_uffd_move_ioctl() &&
+    com::android::art::rw::flags::use_uffd_move_ioctl_cmc_gc() &&
     android::base::GetProperty("ro.hardware.virtual_device", "") != "1" &&
     GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true);
 #else
@@ -873,10 +875,14 @@ void MarkCompact::RunPhases() {
   Runtime* runtime = Runtime::Current();
   GetHeap()->PreGcVerification(this);
   InitializePhase();
+  ScopedPriorityChange spc(self);
   {
     ReaderMutexLock mu(self, *Locks::mutator_lock_);
     TraceFaults();
     MarkingPhase();
+    // From here, until we re-enable full weak-reference access, we are potentially blocking high
+    // priority threads.
+    spc.SetToNormalOrBetter();
   }
   {
     // Marking pause
@@ -890,8 +896,14 @@ void MarkCompact::RunPhases() {
   bool perform_compaction;
   {
     ReaderMutexLock mu(self, *Locks::mutator_lock_);
-    ReclaimPhase();
+    ReclaimPhase(&spc);  // Resets priority.
+    // It may be better to remain at the higher priority, and raise it only once. But given
+    // that both PrepareForCompaction() and Sweep() may take some time and do not block other
+    // threads, we start out with the conservative option.
     perform_compaction = PrepareForCompaction();
+    if (perform_compaction) {
+      spc.SetToNormalOrBetter();  // With mutator_lock_ still held.
+    }
   }
   if (perform_compaction) {
     // Compaction pause
@@ -900,9 +912,12 @@ void MarkCompact::RunPhases() {
     runtime->GetThreadList()->FlipThreadRoots(
         &visitor, &callback, this, GetHeap()->GetGcPauseListener());
 
-    if (IsValidFd(uffd_)) {
+    {
       ReaderMutexLock mu(self, *Locks::mutator_lock_);
-      CompactionPhase();
+      spc.Reset();
+      if (IsValidFd(uffd_)) {
+        CompactionPhase();
+      }
     }
   } else {
     if (use_generational_) {
@@ -1652,7 +1667,7 @@ void MarkCompact::SweepLargeObjects(bool swap_bitmaps) {
   }
 }
 
-void MarkCompact::ReclaimPhase() {
+void MarkCompact::ReclaimPhase(ScopedPriorityChange* spc) {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
   DCHECK(thread_running_gc_ == Thread::Current());
   Runtime* const runtime = Runtime::Current();
@@ -1662,6 +1677,7 @@ void MarkCompact::ReclaimPhase() {
   // references during the compaction pause.
   SweepSystemWeaks(thread_running_gc_, runtime, /*paused*/ false);
   runtime->AllowNewSystemWeaks();
+  spc->Reset();
   // Clean up class loaders after system weaks are swept since that is how we know if class
   // unloading occurred.
   runtime->GetClassLinker()->CleanupClassLoaders();
@@ -2963,7 +2979,6 @@ size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_ei
                                .len = len,
                                .mode = 0,
                                .move = 0};
-  uint32_t ebusy_iters = 0;
   while (ioctl(uffd_, UFFDIO_MOVE, &uffd_move) != 0) {
     if (errno == EEXIST) {
       DCHECK_EQ(uffd_move.move, -EEXIST);
@@ -3000,18 +3015,15 @@ size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_ei
       // as they are jank sensitive as well as maybe runnable and hence waiting
       // may delay responding to suspension requests. With COPY ioctl we can be
       // sure that it will succeed.
-      // GC-thread, on the other hand, can wait. The exception being when it
-      // causes SIGBUS during thread-flips. Also, waiting for really long is
-      // undesirable.
-      Thread* self = Thread::Current();
-      if (self == thread_running_gc_ && conc_compaction_started_ && ebusy_iters < 10) {
-        DCHECK_NE(self->GetState(), ThreadState::kRunnable);
-        BackOff</*kYieldMax=*/5, /*kSleepUs=*/1000>(ebusy_iters++);
-        uffd_move.move = 0;
-      } else {
-        uffd_move.move = CopyIoctl(dst, src, gPageSize, true, tolerate_einval);
-        break;
+      uffd_move.move =
+          CopyIoctl(dst, src, gPageSize, /*return_on_contention=*/true, tolerate_einval);
+      if (Thread::Current() == thread_running_gc_ && conc_compaction_started_) {
+        // Release the page in case of gc-thread after jank-critical thread-flip
+        // has finished to avoid RSS increase.
+        int ret = madvise(src, gPageSize, MADV_DONTNEED);
+        DCHECK(ret == 0) << "MoveIoctl: madvise of from-space page failed: " << strerror(errno);
       }
+      break;
     } else {
       CHECK_EQ(uffd_move.move, -errno);
       LOG(FATAL) << "ioctl_userfaultfd: move failed: " << strerror(errno) << ". src:" << src
@@ -4657,6 +4669,12 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
         // SIGBUS handler. But it's safe as the GC thread is holding the lock for
         // entire compaction phase ensuring that bitmap accessed don't get modified.
         FakeMutexLock mu(*Locks::heap_bitmap_lock_);
+        // Avoid using MOVE ioctl when we are not using a src page from the from-space.
+        // This helps reduce vma (anon_vma to be precise) lock contention in the kernel,
+        // which is likely to occur during the initial stage of compaction phase as quite
+        // a few mutator and GC threads could simultaneously cause userfaults. This is
+        // also not useful from memory perspective as we are not recycling free pages.
+        bool use_move_ioctl = use_move_ioctl_;
         if (fault_page < black_dense_end_) {
           if (use_generational_) {
             UpdateNonMovingPage</*kSetupForGenerational=*/true, /*kObjInBlackDense=*/true>(
@@ -4681,6 +4699,8 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
               uint8_t* free_page = GetFreePagesForMapping(gPageSize, /*atomic=*/true);
               if (free_page != nullptr) {
                 buf = free_page + from_space_slide_diff_;
+              } else {
+                use_move_ioctl = false;
               }
             }
             // The page has to be compacted.
@@ -4713,6 +4733,7 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                            pre_compact_page,
                            buf,
                            /*needs_memset_zero=*/true);
+            use_move_ioctl = false;
           }
         }
         // Nobody else would simultaneously modify this page's state so an
@@ -4723,7 +4744,7 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
         // to immediately map the page, so that info is not needed.
         moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapping),
                                              std::memory_order_release);
-        if (use_move_ioctl_) {
+        if (use_move_ioctl) {
           MoveIoctl(fault_page, buf, gPageSize, tolerate_enoent);
         } else {
           CopyIoctl(fault_page, buf, gPageSize, /*return_on_contention=*/false, tolerate_enoent);
@@ -5300,7 +5321,6 @@ class MarkCompact::CheckpointMarkThreadRoots : public Closure {
   explicit CheckpointMarkThreadRoots(MarkCompact* mark_compact) : mark_compact_(mark_compact) {}
 
   void Run(Thread* thread) override NO_THREAD_SAFETY_ANALYSIS {
-    ScopedTrace trace("Marking thread roots");
     // Note: self is not necessarily equal to thread since thread may be
     // suspended.
     Thread* const self = Thread::Current();

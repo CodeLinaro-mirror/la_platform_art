@@ -457,6 +457,14 @@ class RegisterSet : public ValueObject {
   static RegisterSet Empty() { return RegisterSet(); }
   static RegisterSet AllFpu() { return RegisterSet(0, -1); }
 
+  void AddCoreRegisters(uint32_t registers) {
+    core_registers_ |= registers;
+  }
+
+  void AddFpuRegisters(uint32_t registers) {
+    floating_point_registers_ |= registers;
+  }
+
   void Add(Location loc) {
     if (loc.IsRegister()) {
       core_registers_ |= (1 << loc.reg());
@@ -514,6 +522,10 @@ class RegisterSet : public ValueObject {
 
   uint32_t GetFloatingPointRegisters() const {
     return floating_point_registers_;
+  }
+
+  static uint32_t RegisterSet::* GetRegisterFieldAccessor(bool fp) {
+    return fp ? &RegisterSet::floating_point_registers_ : &RegisterSet::core_registers_;
   }
 
  private:
@@ -701,11 +713,6 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
   bool RegisterContainsObject(uint32_t reg_id) {
     DCHECK(CanCall());
     return RegisterSet::Contains(call_data_->register_mask, reg_id);
-  }
-
-  void AddLiveRegister(Location location) {
-    DCHECK(CanCall());
-    call_data_->live_registers.Add(location);
   }
 
   BitVector* GetStackMask() const {

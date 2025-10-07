@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-package: "com.android.art.native.flags"
-container: "com.android.art"
+.class public LTestCase;
+.super Ljava/lang/Object;
 
-# No flags here can be used in java. It should only contain read-write flags in this file.
-# Read-only flags should go into the art-flags.aconfig file instead.
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
 
-flag {
-  name: "test_rw_flag"
-  namespace: "core_libraries"
-  description: "Permanent test read-write flag."
-  bug: "391379705"
-  is_fixed_read_only: false
-  is_exported: false
-}
+.method public static testMove16(Ljava/lang/Object;)Ljava/lang/Object;
+    .registers 2
+    move-object/from16 v0, p0
+    return-object v0
+.end method
+
+.method public static testMoveFrom16(Ljava/lang/Object;)Ljava/lang/Object;
+    .registers 2
+    move-object/16 v0, p0
+    return-object v0
+.end method

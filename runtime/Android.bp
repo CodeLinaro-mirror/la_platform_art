@@ -238,6 +238,7 @@ cc_defaults {
 cc_defaults {
     name: "libart-runtime_common_defaults",
     defaults: ["libart_common_defaults"],
+    sdclang: false,
     srcs: [
         "app_info.cc",
         "art_field.cc",
@@ -376,6 +377,7 @@ cc_defaults {
         "native/java_lang_reflect_Proxy.cc",
         "native/java_util_concurrent_atomic_AtomicLong.cc",
         "native/jdk_internal_misc_Unsafe.cc",
+        "native/jdk_internal_vm_Continuation.cc",
         "native/libcore_io_Memory.cc",
         "native/libcore_util_CharsetUtils.cc",
         "native/org_apache_harmony_dalvik_ddmc_DdmServer.cc",
@@ -413,6 +415,7 @@ cc_defaults {
         "runtime_image.cc",
         "runtime_intrinsics.cc",
         "runtime_options.cc",
+        "scoped_thread_priority_change.cc",
         "scoped_thread_state_change.cc",
         "signal_catcher.cc",
         "stack.cc",
@@ -426,6 +429,7 @@ cc_defaults {
         "trace_profile.cc",
         "var_handles.cc",
         "vdex_file.cc",
+        "virtual_thread_common.cc",
         "verifier/class_verifier.cc",
         "verifier/instruction_flags.cc",
         "verifier/method_verifier.cc",
@@ -892,6 +896,7 @@ art_cc_library_static {
 art_cc_library {
     name: "libart",
     defaults: ["libart_defaults"],
+    sdclang: false,
     whole_static_libs: [
         "libart-compiler",
         "libart-runtime",
@@ -1082,6 +1087,7 @@ art_cc_defaults {
         ":art-gtest-jars-MainUncompressedAligned",
         ":art-gtest-jars-MethodTypes",
         ":art-gtest-jars-MultiDex",
+        ":art-gtest-jars-MultiDexContainer",
         ":art-gtest-jars-MultiDexModifiedSecondary",
         ":art-gtest-jars-MultiDexUncompressedAligned",
         ":art-gtest-jars-MyClass",
@@ -1224,6 +1230,10 @@ art_cc_test {
             ],
         },
     },
+    // These gtests run in debug mode
+    static_libs: [
+        "libart_fuzzerd-common",
+    ],
 }
 
 // Standalone version of ART gtest `art_runtime_tests`, not bundled with the ART APEX on target.
@@ -1239,6 +1249,10 @@ art_cc_test {
             required: ["dex2oat"],
         },
     },
+    // Standalone gtests run in release mode
+    static_libs: [
+        "libart_fuzzer-common",
+    ],
     // Some tests are currently failing (observed on
     // `aosp_cf_x86_64_phone-userdebug`); use a special test configuration for
     // `art_standalone_runtime_tests` to filter them out for now.

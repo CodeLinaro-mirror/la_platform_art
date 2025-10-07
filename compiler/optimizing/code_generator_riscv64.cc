@@ -4208,6 +4208,14 @@ void LocationsBuilderRISCV64::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* i
     CriticalNativeCallingConventionVisitorRiscv64 calling_convention_visitor(
         /*for_register_allocation=*/ true);
     CodeGenerator::CreateCommonInvokeLocationSummary(instruction, &calling_convention_visitor);
+    if (instruction->GetMethodLoadKind() != MethodLoadKind::kBootImageLinkTimePcRelative) {
+      // Use the next argument register, if usable for C.LD, as the target method temp. Otherwise,
+      // we'll use RA. We prefer the low register temp that allows shorter encoding than RA.
+      Location maybe_temp = calling_convention_visitor.GetNextLocation(DataType::Type::kInt32);
+      if (maybe_temp.IsRegister() && maybe_temp.reg() <= A5) {
+        instruction->GetLocations()->AddTemp(maybe_temp);
+      }
+    }
   } else {
     HandleInvoke(instruction);
   }
@@ -5448,6 +5456,85 @@ void InstructionCodeGeneratorRISCV64::VisitRiscv64ShiftAdd(HRiscv64ShiftAdd* ins
   }
 }
 
+void LocationsBuilderRISCV64::HandleBitManipulations(HBinaryOperation* instruction) {
+  DCHECK(instruction->IsRiscv64BitSet() || instruction->IsRiscv64BitExtract() ||
+         instruction->IsRiscv64BitClear() || instruction->IsRiscv64BitInvert());
+  DCHECK(instruction->GetResultType() == DataType::Type::kInt64);
+
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
+  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(1, Location::RegisterOrConstant(instruction->InputAt(1)));
+  locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+}
+
+void InstructionCodeGeneratorRISCV64::HandleBitManipulations(HBinaryOperation* instruction) {
+  DCHECK(instruction->IsRiscv64BitSet() || instruction->IsRiscv64BitExtract() ||
+         instruction->IsRiscv64BitClear() || instruction->IsRiscv64BitInvert());
+  DCHECK(instruction->GetResultType() == DataType::Type::kInt64);
+
+  LocationSummary* locations = instruction->GetLocations();
+  XRegister rd = locations->Out().AsRegister<XRegister>();
+  XRegister rs1 = locations->InAt(0).AsRegister<XRegister>();
+  Location rs2_location = locations->InAt(1);
+
+  if (rs2_location.IsConstant()) {
+    int64_t imm = CodeGenerator::GetInt64ValueOf(rs2_location.GetConstant());
+    uint32_t shamt = imm & kMaxLongShiftDistance;
+    if (instruction->IsRiscv64BitSet()) {
+      __ Bseti(rd, rs1, shamt);
+    } else if (instruction->IsRiscv64BitExtract()) {
+      __ Bexti(rd, rs1, shamt);
+    } else if (instruction->IsRiscv64BitClear()) {
+      __ Bclri(rd, rs1, shamt);
+    } else if (instruction->IsRiscv64BitInvert()) {
+      __ Binvi(rd, rs1, shamt);
+    }
+  } else {
+    XRegister rs2 = rs2_location.AsRegister<XRegister>();
+    if (instruction->IsRiscv64BitSet()) {
+      __ Bset(rd, rs1, rs2);
+    } else if (instruction->IsRiscv64BitExtract()) {
+      __ Bext(rd, rs1, rs2);
+    } else if (instruction->IsRiscv64BitClear()) {
+      __ Bclr(rd, rs1, rs2);
+    } else if (instruction->IsRiscv64BitInvert()) {
+      __ Binv(rd, rs1, rs2);
+    }
+  }
+}
+
+void LocationsBuilderRISCV64::VisitRiscv64BitSet(HRiscv64BitSet* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitRiscv64BitSet(HRiscv64BitSet* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void LocationsBuilderRISCV64::VisitRiscv64BitExtract(HRiscv64BitExtract* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitRiscv64BitExtract(HRiscv64BitExtract* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void LocationsBuilderRISCV64::VisitRiscv64BitClear(HRiscv64BitClear* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitRiscv64BitClear(HRiscv64BitClear* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void LocationsBuilderRISCV64::VisitRiscv64BitInvert(HRiscv64BitInvert* instruction) {
+  HandleBitManipulations(instruction);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitRiscv64BitInvert(HRiscv64BitInvert* instruction) {
+  HandleBitManipulations(instruction);
+}
+
 void LocationsBuilderRISCV64::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
   DCHECK(codegen_->GetInstructionSetFeatures().HasZbb());
   DCHECK(DataType::IsIntegralType(instruction->GetType())) << instruction->GetType();
@@ -5975,6 +6062,7 @@ CodeGeneratorRISCV64::CodeGeneratorRISCV64(HGraph* graph,
                           graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       jit_class_patches_(TypeReferenceValueComparator(),
                          graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
+  SetupBlockedRegisters();
   // Always mark the RA register to be saved.
   AddAllocatedRegister(Location::RegisterLocation(RA));
 }
@@ -6386,27 +6474,19 @@ void CodeGeneratorRISCV64::AddLocationAsTemp(Location location, LocationSummary*
   }
 }
 
-void CodeGeneratorRISCV64::SetupBlockedRegisters() const {
-  // ZERO, GP, SP, RA, TP and TR(S1) are reserved and can't be allocated.
-  blocked_core_registers_[Zero] = true;
-  blocked_core_registers_[GP] = true;
-  blocked_core_registers_[SP] = true;
-  blocked_core_registers_[RA] = true;
-  blocked_core_registers_[TP] = true;
-  blocked_core_registers_[TR] = true;  // ART Thread register.
-
-  // TMP(T6), TMP2(T5) and FTMP(FT11) are used as temporary/scratch registers.
-  blocked_core_registers_[TMP] = true;
-  blocked_core_registers_[TMP2] = true;
-  blocked_fpu_registers_[FTMP] = true;
+inline void CodeGeneratorRISCV64::SetupBlockedRegisters() {
+  blocked_core_registers_ =
+      // ZERO, GP, SP, RA, TP and TR(S1, ART Thread register) are reserved and can't be allocated.
+      (1u << Zero) | (1u << GP) | (1u << SP) | (1u << RA) | (1u << TP) | (1u << TR) |
+      // TMP(T6) and TMP2(T5) are used as temporary/scratch registers.
+      (1u << TMP) | (1u << TMP2);
+  blocked_fpu_registers_ = 1u << FTMP;  // FTMP(FT11) is used as temporary/scratch register.
 
   if (GetGraph()->IsDebuggable()) {
     // Stubs do not save callee-save floating point registers. If the graph
     // is debuggable, we need to deal with these registers differently. For
     // now, just block them.
-    for (size_t i = 0; i < arraysize(kFpuCalleeSaves); ++i) {
-      blocked_fpu_registers_[kFpuCalleeSaves[i]] = true;
-    }
+    blocked_fpu_registers_ |= ComputeRegisterMask(kFpuCalleeSaves, arraysize(kFpuCalleeSaves));
   }
 }
 
@@ -6724,18 +6804,19 @@ void CodeGeneratorRISCV64::PatchJitRootUse(uint8_t* code,
   reinterpret_cast<uint32_t*>(code + literal_offset)[0] = dchecked_integral_cast<uint32_t>(address);
 }
 
-void CodeGeneratorRISCV64::EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) {
+void CodeGeneratorRISCV64::EmitJitRootPatches(
+    uint8_t* buffer, [[maybe_unused]] const uint8_t* code_address, const uint8_t* roots_data) {
   for (const auto& entry : jit_string_patches_) {
     const StringReference& string_reference = entry.first;
     Literal* table_entry_literal = entry.second;
     uint64_t index_in_table = GetJitStringRootIndex(string_reference);
-    PatchJitRootUse(code, roots_data, table_entry_literal, index_in_table);
+    PatchJitRootUse(buffer, roots_data, table_entry_literal, index_in_table);
   }
   for (const auto& entry : jit_class_patches_) {
     const TypeReference& type_reference = entry.first;
     Literal* table_entry_literal = entry.second;
     uint64_t index_in_table = GetJitClassRootIndex(type_reference);
-    PatchJitRootUse(code, roots_data, table_entry_literal, index_in_table);
+    PatchJitRootUse(buffer, roots_data, table_entry_literal, index_in_table);
   }
 }
 
@@ -6989,6 +7070,7 @@ void CodeGeneratorRISCV64::GenerateStaticOrDirectCall(HInvokeStaticOrDirect* inv
       DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
       if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
         // Do not materialize the method pointer, load directly the entrypoint.
+        DCHECK(callee_method.IsInvalid());
         CodeGeneratorRISCV64::PcRelativePatchInfo* info_high =
             NewBootImageJniEntrypointPatch(invoke->GetResolvedMethodReference());
         EmitPcRelativeAuipcPlaceholder(info_high, RA);
@@ -6999,7 +7081,13 @@ void CodeGeneratorRISCV64::GenerateStaticOrDirectCall(HInvokeStaticOrDirect* inv
       }
       FALLTHROUGH_INTENDED;
     default:
-      LoadMethod(invoke->GetMethodLoadKind(), temp, invoke);
+      if (callee_method.IsInvalid()) {
+        DCHECK_EQ(invoke->GetCodePtrLocation(), CodePtrLocation::kCallCriticalNative);
+        // Use RA for both the target method and then the code pointer. The code shall be two
+        // bytes longer because we'll have to use 32-bit instead of 16-bit encoding for one load.
+        callee_method = Location::RegisterLocation(RA);
+      }
+      LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
   }
 

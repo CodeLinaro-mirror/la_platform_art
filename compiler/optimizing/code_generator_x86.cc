@@ -1144,9 +1144,9 @@ CodeGeneratorX86::CodeGeneratorX86(HGraph* graph,
                     kNumberOfCpuRegisters,
                     kNumberOfXmmRegisters,
                     kNumberOfRegisterPairs,
-                    ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves))
-                        | (1 << kFakeReturnRegister),
-                    0,
+                    ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves)) |
+                        (1 << kFakeReturnRegister),
+                    0u,
                     compiler_options,
                     stats,
                     ArrayRef<const bool>(detail::kIsIntrinsicUnimplemented)),
@@ -1174,13 +1174,18 @@ CodeGeneratorX86::CodeGeneratorX86(HGraph* graph,
       fixups_to_jump_tables_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       method_address_offset_(std::less<uint32_t>(),
                              graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
+  // `long`s require register pairs.
+  data_types_requiring_register_pair_ = 1u << enum_cast<>(DataType::Type::kInt64);
+
+  SetupBlockedRegisters();
   // Use a fake return address register to mimic Quick.
   AddAllocatedRegister(Location::RegisterLocation(kFakeReturnRegister));
 }
 
-void CodeGeneratorX86::SetupBlockedRegisters() const {
+inline void CodeGeneratorX86::SetupBlockedRegisters() {
   // Stack register is always reserved.
-  blocked_core_registers_[ESP] = true;
+  blocked_core_registers_ = 1u << ESP;
+  DCHECK_EQ(blocked_fpu_registers_, 0u);
 }
 
 InstructionCodeGeneratorX86::InstructionCodeGeneratorX86(HGraph* graph, CodeGeneratorX86* codegen)
@@ -2752,6 +2757,9 @@ void LocationsBuilderX86::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invok
     CriticalNativeCallingConventionVisitorX86 calling_convention_visitor(
         /*for_register_allocation=*/ true);
     CodeGenerator::CreateCommonInvokeLocationSummary(invoke, &calling_convention_visitor);
+    if (invoke->GetMethodLoadKind() != MethodLoadKind::kBootImageLinkTimePcRelative) {
+      invoke->GetLocations()->AddTemp(Location::RequiresRegister());  // For target method.
+    }
   } else {
     HandleInvoke(invoke);
   }
@@ -5567,6 +5575,7 @@ void CodeGeneratorX86::GenerateStaticOrDirectCall(
     case MethodLoadKind::kBootImageLinkTimePcRelative:
       // For kCallCriticalNative we skip loading the method and do the call directly.
       if (invoke->GetCodePtrLocation() == CodePtrLocation::kCallCriticalNative) {
+        DCHECK(callee_method.IsInvalid());
         break;
       }
       FALLTHROUGH_INTENDED;
@@ -5588,7 +5597,9 @@ void CodeGeneratorX86::GenerateStaticOrDirectCall(
                                     GetCriticalNativeDirectCallFrameSize>(invoke);
       if (invoke->GetMethodLoadKind() == MethodLoadKind::kBootImageLinkTimePcRelative) {
         DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
-        Register base_reg = GetInvokeExtraParameter(invoke, temp.AsRegister<Register>());
+        DCHECK(temp.IsInvalid());
+        Register base_reg =
+            invoke->GetLocations()->InAt(invoke->GetSpecialInputIndex()).AsRegister<Register>();
         __ call(Address(base_reg, CodeGeneratorX86::kPlaceholder32BitOffset));
         RecordBootImageJniEntrypointPatch(invoke);
       } else {
@@ -9285,17 +9296,19 @@ void CodeGeneratorX86::PatchJitRootUse(uint8_t* code,
       dchecked_integral_cast<uint32_t>(address);
 }
 
-void CodeGeneratorX86::EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) {
+void CodeGeneratorX86::EmitJitRootPatches(uint8_t* buffer,
+                                          [[maybe_unused]] const uint8_t* code_address,
+                                          const uint8_t* roots_data) {
   for (const PatchInfo<Label>& info : jit_string_patches_) {
     StringReference string_reference(info.target_dex_file, dex::StringIndex(info.offset_or_index));
     uint64_t index_in_table = GetJitStringRootIndex(string_reference);
-    PatchJitRootUse(code, roots_data, info, index_in_table);
+    PatchJitRootUse(buffer, roots_data, info, index_in_table);
   }
 
   for (const PatchInfo<Label>& info : jit_class_patches_) {
     TypeReference type_reference(info.target_dex_file, dex::TypeIndex(info.offset_or_index));
     uint64_t index_in_table = GetJitClassRootIndex(type_reference);
-    PatchJitRootUse(code, roots_data, info, index_in_table);
+    PatchJitRootUse(buffer, roots_data, info, index_in_table);
   }
 }
 

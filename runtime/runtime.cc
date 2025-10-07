@@ -56,10 +56,10 @@
 #include "base/aborting.h"
 #include "base/arena_allocator.h"
 #include "base/atomic.h"
+#include "base/calloc_arena_pool.h"
 #include "base/dumpable.h"
 #include "base/file_utils.h"
 #include "base/flags.h"
-#include "base/calloc_arena_pool.h"
 #include "base/mem_map_arena_pool.h"
 #include "base/memory_tool.h"
 #include "base/mutex.h"
@@ -146,6 +146,7 @@
 #include "native/java_lang_reflect_Proxy.h"
 #include "native/java_util_concurrent_atomic_AtomicLong.h"
 #include "native/jdk_internal_misc_Unsafe.h"
+#include "native/jdk_internal_vm_Continuation.h"
 #include "native/libcore_io_Memory.h"
 #include "native/libcore_util_CharsetUtils.h"
 #include "native/org_apache_harmony_dalvik_ddmc_DdmServer.h"
@@ -1736,13 +1737,33 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   hidden_api_policy_ = runtime_options.GetOrDefault(Opt::HiddenApiPolicy);
   DCHECK_IMPLIES(is_zygote_, hidden_api_policy_ == hiddenapi::EnforcementPolicy::kDisabled);
 
-  // Set core platform API enforcement policy. The checks are disabled by default and
-  // can be enabled with a command line flag. AndroidRuntime will pass the flag if
-  // a system property is set.
-  core_platform_api_policy_ = runtime_options.GetOrDefault(Opt::CorePlatformApiPolicy);
-  if (core_platform_api_policy_ != hiddenapi::EnforcementPolicy::kDisabled) {
-    LOG(INFO) << "Core platform API reporting enabled, enforcing="
-        << (core_platform_api_policy_ == hiddenapi::EnforcementPolicy::kEnabled ? "true" : "false");
+  // Set core platform API enforcement policy. Always enabled if the
+  // hiddenapi_platform_enforcement flag is set, otherwise the checks are
+  // disabled by default and can be enabled with a command line flag.
+  // AndroidRuntime will pass the flag if a system property is set.
+  // TODO(b/377676642): Replace flag with SDK level check when ramped.
+  {
+    bool always_enable = false;
+#ifdef ART_TARGET_ANDROID
+    if (com::android::art::flags::hiddenapi_platform_enforcement()) {
+      always_enable = true;
+    }
+#endif
+    const char* reason;
+    if (always_enable) {
+      core_platform_api_policy_ = hiddenapi::EnforcementPolicy::kEnabled;
+      reason = "from the hiddenapi_platform_enforcement flag";
+    } else {
+      core_platform_api_policy_ = runtime_options.GetOrDefault(Opt::CorePlatformApiPolicy);
+      reason = "by runtime option";
+    }
+    if (core_platform_api_policy_ != hiddenapi::EnforcementPolicy::kDisabled) {
+      LOG(INFO) << "Core platform API "
+                << (core_platform_api_policy_ == hiddenapi::EnforcementPolicy::kEnabled
+                        ? "enforcement"
+                        : "reporting")
+                << " enabled " << reason;
+    }
   }
 
   // Dex2Oat's Runtime does not need the signal chain or the fault handler
@@ -1806,6 +1827,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                        runtime_options.GetOrDefault(Opt::HeapMinFree),
                        runtime_options.GetOrDefault(Opt::HeapMaxFree),
                        runtime_options.GetOrDefault(Opt::HeapTargetUtilization),
+                       runtime_options.GetOrDefault(Opt::EnableTimeBasedGcTrigger),
+                       runtime_options.GetOrDefault(Opt::HeapMemoryGcCostFactor),
                        foreground_heap_growth_multiplier,
                        runtime_options.GetOrDefault(Opt::StopForNativeAllocs),
                        runtime_options.GetOrDefault(Opt::MemoryMaximumSize),
@@ -2460,6 +2483,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   register_java_lang_VMClassLoader(env);
   register_java_util_concurrent_atomic_AtomicLong(env);
   register_jdk_internal_misc_Unsafe(env);
+  register_jdk_internal_vm_Continuation(env);
   register_libcore_io_Memory(env);
   register_libcore_util_CharsetUtils(env);
   register_org_apache_harmony_dalvik_ddmc_DdmServer(env);
@@ -3401,11 +3425,12 @@ bool Runtime::GetOatFilesExecutable() const {
   return !IsAotCompiler() && !IsSystemServerProfiled();
 }
 
-void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
-                                  size_t map_size_bytes,
-                                  const uint8_t* map_begin,
-                                  const uint8_t* map_end,
-                                  const std::string& file_name) {
+size_t Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
+                                    size_t map_size_bytes,
+                                    const uint8_t* map_begin,
+                                    const uint8_t* map_end,
+                                    const std::string& file_name) {
+  // TODO(b/359932564): Fix map_size_bytes adjustment to account for map_begin alignment.
   map_begin = AlignDown(map_begin, gPageSize);
   map_size_bytes = RoundUp(map_size_bytes, gPageSize);
 #ifdef ART_TARGET_ANDROID
@@ -3419,7 +3444,7 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
   if (accurate_process_state_at_startup) {
     const Runtime* runtime = Runtime::Current();
     if (runtime != nullptr && !runtime->InJankPerceptibleProcessState()) {
-      return;
+      return 0;
     }
   }
 #endif  // ART_TARGET_ANDROID
@@ -3427,13 +3452,10 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
   // Ideal blockTransferSize for madvising files (128KiB)
   static constexpr size_t kIdealIoTransferSizeBytes = 128*1024;
 
+  size_t madvised_bytes = 0;
   size_t target_size_bytes = std::min<size_t>(map_size_bytes, madvise_size_limit_bytes);
-
   if (target_size_bytes > 0) {
-    ScopedTrace madvising_trace("madvising "
-                                + file_name
-                                + " size="
-                                + std::to_string(target_size_bytes));
+    SCOPED_TRACE << "madvising " << file_name << " size=" << target_size_bytes;
 
     // Based on requested size (target_size_bytes)
     const uint8_t* target_pos = map_begin + target_size_bytes;
@@ -3463,8 +3485,13 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
                    << ": " << strerror(errno);
         break;
       }
+      madvised_bytes += madvise_length;
     }
   }
+
+  DCHECK_LE(madvised_bytes, madvise_size_limit_bytes)
+      << "Madvise should not have advised more than the requested size.";
+  return madvised_bytes;
 }
 
 // Return whether a boot image has a profile. This means we'll need to pre-JIT

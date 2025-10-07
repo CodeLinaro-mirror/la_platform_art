@@ -323,6 +323,9 @@ template<typename T>
 inline bool Class::IsDiscoverable(bool public_only,
                                   const hiddenapi::AccessContext& access_context,
                                   T* member) {
+  // For `ObjPtr<>` poisoning, check access context's class validity even
+  // in cases when the class is not actually needed.
+  access_context.GetClass().AssertValid();
   if (public_only && ((member->GetAccessFlags() & kAccPublic) == 0)) {
     return false;
   }
@@ -1267,6 +1270,16 @@ inline bool Class::HasTypeChecksFailure() {
   return (flags & kAccHasTypeChecksFailure) != 0u;
 }
 
+inline void Class::SetHasDuplicateMethods() {
+  uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
+  SetAccessFlags(flags | kAccHasDuplicateMethods);
+}
+
+inline bool Class::HasDuplicateMethods() {
+  uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
+  return (flags & kAccHasDuplicateMethods) != 0u;
+}
+
 inline void Class::ClearFinalizable() {
   // We're clearing the finalizable flag only for `Object` and `Enum`
   // during early setup without the boot image.
@@ -1319,6 +1332,62 @@ ALWAYS_INLINE FLATTEN inline ArtField* Class::FindDeclaredField(uint32_t dex_fie
     if (field.GetDexFieldIndex() == dex_field_idx) {
       return &field;
     } else if (field.GetDexFieldIndex() < dex_field_idx) {
+      break;
+    }
+  }
+  return nullptr;
+}
+
+template <bool kOnlyLookAtIndex, PointerSize kPointerSize>
+ALWAYS_INLINE inline ArtMethod* Class::FindDeclaredClassMethod(uint32_t dex_method_idx) {
+  return UNLIKELY(HasDuplicateMethods())
+      ? FindDeclaredClassMethodSlow<kPointerSize>(dex_method_idx)
+      : FindDeclaredClassMethodFast<kOnlyLookAtIndex, kPointerSize>(dex_method_idx);
+}
+
+
+template <bool kOnlyLookAtIndex, PointerSize kPointerSize>
+ALWAYS_INLINE FLATTEN inline ArtMethod* Class::FindDeclaredClassMethodFast(
+    uint32_t dex_method_idx) {
+  DCHECK(!HasDuplicateMethods());
+  LengthPrefixedArray<ArtMethod>* array = GetMethodsPtr();
+  static constexpr size_t kMethodAlignment = ArtMethod::Alignment(kPointerSize);
+  static constexpr size_t kMethodSize = ArtMethod::Size(kPointerSize);
+
+  size_t size = array->size();
+  if (size == 0) {
+    return nullptr;
+  }
+  // The method array is an ordered list of methods where there may be missing
+  // indices. For example, it could be [40, 42], but in 90% of cases cases we have
+  // [40, 41, 42]. The latter is the case we are optimizing for, where for
+  // example `dex_method_idx` is 41, and we can just substract it with the
+  // first method index (40) and directly access the array with that index (1).
+  uint32_t index = dex_method_idx - array->At(0, kMethodSize, kMethodAlignment).GetDexMethodIndex();
+  if (index < size) {
+    ArtMethod& method = array->At(index, kMethodSize, kMethodAlignment);
+    if (!method.IsCopied() && method.GetDexMethodIndex() == dex_method_idx) {
+      return &method;
+    }
+  }
+  if (kOnlyLookAtIndex) {
+    return nullptr;
+  }
+
+  // Reset index to take a look at the whole array since we might have methods with the same dex
+  // method index e.g. [120, 121, 122, 122, 123]. In this example, if we don't reset the index to
+  // `size` we will start iterating from the second 122 and miss 123.
+  index = size;
+  // If there is a method, it's down the array. The array is ordered by method
+  // index, so we know we can stop the search if `dex_method_idx` is greater
+  // than the current method's index.
+  for (; index > 0; --index) {
+    ArtMethod& method = array->At(index - 1, kMethodSize, kMethodAlignment);
+    if (method.IsCopied()) {
+      continue;
+    } else if (method.GetDexMethodIndex() == dex_method_idx) {
+      return &method;
+    } else if (method.GetDexMethodIndex() < dex_method_idx) {
       break;
     }
   }

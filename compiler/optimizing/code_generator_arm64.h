@@ -735,7 +735,7 @@ class CodeGeneratorARM64 : public CodeGenerator {
 
   // Register allocation.
 
-  void SetupBlockedRegisters() const override;
+  void SetupBlockedRegisters();
 
   size_t SaveCoreRegister(size_t stack_index, uint32_t reg_id) override;
   size_t RestoreCoreRegister(size_t stack_index, uint32_t reg_id) override;
@@ -786,9 +786,17 @@ class CodeGeneratorARM64 : public CodeGenerator {
   void Load(DataType::Type type,
             vixl::aarch64::CPURegister dst,
             const vixl::aarch64::MemOperand& src);
+  static void Load(vixl::aarch64::MacroAssembler* assembler,
+                   DataType::Type type,
+                   vixl::aarch64::CPURegister dst,
+                   const vixl::aarch64::MemOperand& src);
   void Store(DataType::Type type,
              vixl::aarch64::CPURegister src,
              const vixl::aarch64::MemOperand& dst);
+  static void Store(vixl::aarch64::MacroAssembler* assembler,
+                    DataType::Type type,
+                    vixl::aarch64::CPURegister src,
+                    const vixl::aarch64::MemOperand& dst);
   void LoadAcquire(HInstruction* instruction,
                    DataType::Type type,
                    vixl::aarch64::CPURegister dst,
@@ -812,8 +820,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
                                            SlowPathCode* slow_path);
 
   ParallelMoveResolverARM64* GetMoveResolver() override { return &move_resolver_; }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.
@@ -977,7 +983,8 @@ class CodeGeneratorARM64 : public CodeGenerator {
                      /*out*/ ArenaVector<uint8_t>* code,
                      /*out*/ std::string* debug_name) override;
 
-  void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
+  void EmitJitRootPatches(
+      uint8_t* buffer, const uint8_t* code_address, const uint8_t* roots_data) override;
 
   // Generate a GC root reference load:
   //
