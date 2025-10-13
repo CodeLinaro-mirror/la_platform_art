@@ -1074,7 +1074,8 @@
           "2287-no-temp-component-class",
           "2288-checker-smali-string-builder-wrong-init",
           "2289-smali-invalid-rti",
-          "2292-checker-smali-peek-poke-truncation"
+          "2292-checker-smali-peek-poke-truncation",
+          "2396-verifier-null-vs-nonzero"
         ],
         "variant": "jvm",
         "bug": "b/73888836",
@@ -1638,7 +1639,8 @@
       "env_vars": {"ART_TEST_ON_VM": "true"}
     },
     {
-      "tests": ["2042-reference-processing"],
+      "tests": ["2042-reference-processing",
+                "656-checker-simd-opt-no-interp-ac"],
       "description": ["Timeout on QEMU"],
       "env_vars": {"ART_TEST_ON_VM": "true"}
     },
