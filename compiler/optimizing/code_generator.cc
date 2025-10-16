@@ -74,10 +74,10 @@ static bool CheckType(DataType::Type type, Location location) {
   if (location.IsFpuRegister()
       || (location.IsUnallocated() && (location.GetPolicy() == Location::kRequiresFpuRegister))) {
     return (type == DataType::Type::kFloat32) || (type == DataType::Type::kFloat64);
-  } else if (location.IsRegister() ||
+  } else if (location.IsCoreRegister() ||
              (location.IsUnallocated() && (location.GetPolicy() == Location::kRequiresRegister))) {
     return DataType::IsIntegralType(type) || (type == DataType::Type::kReference);
-  } else if (location.IsRegisterPair()) {
+  } else if (location.IsCoreRegisterPair()) {
     return type == DataType::Type::kInt64;
   } else if (location.IsFpuRegisterPair()) {
     return type == DataType::Type::kFloat64;
@@ -1333,7 +1333,7 @@ void CodeGenerator::EmitVRegInfo(HEnvironment* environment,
         break;
       }
 
-      case Location::kRegister : {
+      case Location::kCoreRegister : {
         DCHECK(!is_for_catch_handler);
         int id = location.reg();
         if (slow_path != nullptr && slow_path->IsCoreRegisterSaved(id)) {
@@ -1399,7 +1399,7 @@ void CodeGenerator::EmitVRegInfo(HEnvironment* environment,
         break;
       }
 
-      case Location::kRegisterPair : {
+      case Location::kCoreRegisterPair : {
         DCHECK(!is_for_catch_handler);
         int low = location.low();
         int high = location.high();

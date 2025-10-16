@@ -203,15 +203,15 @@ void RegisterAllocationResolver::Resolve(ArrayRef<HInstruction* const> safepoint
     LocationSummary* locations = at->GetLocations();
     switch (temp->GetType()) {
       case DataType::Type::kInt32:
-        locations->SetTempAt(temp_index, Location::RegisterLocation(reg));
+        locations->SetTempAt(temp_index, Location::CoreRegister(reg));
         break;
 
       case DataType::Type::kFloat64:
         if (codegen_->NeedsTwoRegisters(DataType::Type::kFloat64)) {
-          Location location = Location::FpuRegisterPairLocation(reg, temp->GetHighRegister());
+          Location location = Location::FpuRegisterPair(reg, temp->GetHighRegister());
           locations->SetTempAt(temp_index, location);
         } else {
-          locations->SetTempAt(temp_index, Location::FpuRegisterLocation(reg));
+          locations->SetTempAt(temp_index, Location::FpuRegister(reg));
         }
         break;
 
@@ -372,7 +372,7 @@ void RegisterAllocationResolver::ConnectSiblings(LiveInterval* interval,
             if (current->GetParent()->HasSpillSlot()) {
               locations->SetStackBit(current->GetParent()->GetSpillSlot() / kVRegSize);
             }
-            if (source.GetKind() == Location::kRegister) {
+            if (source.GetKind() == Location::kCoreRegister) {
               locations->SetRegisterBit(source.reg());
             }
             return true;
@@ -473,8 +473,8 @@ void RegisterAllocationResolver::ConnectSplitSiblings(LiveInterval* interval,
 }
 
 static bool IsValidDestination(Location destination) {
-  return destination.IsRegister()
-      || destination.IsRegisterPair()
+  return destination.IsCoreRegister()
+      || destination.IsCoreRegisterPair()
       || destination.IsFpuRegister()
       || destination.IsFpuRegisterPair()
       || destination.IsStackSlot()
@@ -686,15 +686,15 @@ Location RegisterAllocationResolver::GetLocation(LiveInterval* interval) {
     uint32_t reg = interval->GetRegisterOrLowRegister();
     if (interval->IsFloatingPoint()) {
       if (interval->IsPair()) {
-        return Location::FpuRegisterPairLocation(reg, interval->GetHighRegister());
+        return Location::FpuRegisterPair(reg, interval->GetHighRegister());
       } else {
-        return Location::FpuRegisterLocation(reg);
+        return Location::FpuRegister(reg);
       }
     } else {
       if (interval->IsPair()) {
-        return Location::RegisterPairLocation(reg, interval->GetHighRegister());
+        return Location::CoreRegisterPair(reg, interval->GetHighRegister());
       } else {
-        return Location::RegisterLocation(reg);
+        return Location::CoreRegister(reg);
       }
     }
   } else {

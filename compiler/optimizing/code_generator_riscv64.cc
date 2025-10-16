@@ -113,11 +113,11 @@ Location Riscv64ReturnLocation(DataType::Type return_type) {
     case DataType::Type::kReference:
     case DataType::Type::kUint64:
     case DataType::Type::kInt64:
-      return Location::RegisterLocation(A0);
+      return Location::CoreRegister(A0);
 
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64:
-      return Location::FpuRegisterLocation(FA0);
+      return Location::FpuRegister(FA0);
 
     case DataType::Type::kVoid:
       return Location::NoLocation();
@@ -162,7 +162,7 @@ std::pair<uint64_t, int32_t> SplitJitAddress(uint64_t address) {
 }
 
 int32_t ReadBarrierMarkEntrypointOffset(Location ref) {
-  DCHECK(ref.IsRegister());
+  DCHECK(ref.IsCoreRegister());
   int reg = ref.reg();
   DCHECK(T0 <= reg && reg <= T6 && reg != TR) << reg;
   // Note: Entrypoints for registers X30 (T5) and X31 (T6) are stored in entries
@@ -181,7 +181,7 @@ Location InvokeDexCallingConventionVisitorRISCV64::GetReturnLocation(DataType::T
 }
 
 Location InvokeDexCallingConventionVisitorRISCV64::GetMethodLocation() const {
-  return Location::RegisterLocation(kArtMethodRegister);
+  return Location::CoreRegister(kArtMethodRegister);
 }
 
 Location InvokeDexCallingConventionVisitorRISCV64::GetNextLocation(DataType::Type type) {
@@ -195,10 +195,10 @@ Location InvokeDexCallingConventionVisitorRISCV64::GetNextLocation(DataType::Typ
   if (DataType::IsFloatingPointType(type) &&
       float_index_ < calling_convention.GetNumberOfFpuRegisters()) {
     next_location =
-        Location::FpuRegisterLocation(calling_convention.GetFpuRegisterAt(float_index_++));
+        Location::FpuRegister(calling_convention.GetFpuRegisterAt(float_index_++));
   } else if (!DataType::IsFloatingPointType(type) &&
              (gp_index_ < calling_convention.GetNumberOfRegisters())) {
-    next_location = Location::RegisterLocation(calling_convention.GetRegisterAt(gp_index_++));
+    next_location = Location::CoreRegister(calling_convention.GetRegisterAt(gp_index_++));
   } else {
     size_t stack_offset = calling_convention.GetStackOffsetOf(stack_index_);
     next_location = DataType::Is64BitType(type) ? Location::DoubleStackSlot(stack_offset) :
@@ -217,7 +217,7 @@ Location CriticalNativeCallingConventionVisitorRiscv64::GetNextLocation(DataType
   Location location = Location::NoLocation();
   if (DataType::IsFloatingPointType(type)) {
     if (fpr_index_ < kParameterFpuRegistersLength) {
-      location = Location::FpuRegisterLocation(kParameterFpuRegisters[fpr_index_]);
+      location = Location::FpuRegister(kParameterFpuRegisters[fpr_index_]);
       ++fpr_index_;
     } else {
       // Native ABI allows passing excessive FP args in GPRs. This is facilitated by
@@ -229,7 +229,7 @@ Location CriticalNativeCallingConventionVisitorRiscv64::GetNextLocation(DataType
   } else {
     // Native ABI uses the same core registers as a runtime call.
     if (gpr_index_ < kRuntimeParameterCoreRegistersLength) {
-      location = Location::RegisterLocation(kRuntimeParameterCoreRegisters[gpr_index_]);
+      location = Location::CoreRegister(kRuntimeParameterCoreRegisters[gpr_index_]);
       ++gpr_index_;
     }
   }
@@ -259,7 +259,7 @@ Location CriticalNativeCallingConventionVisitorRiscv64::GetReturnLocation(
 
 Location CriticalNativeCallingConventionVisitorRiscv64::GetMethodLocation() const {
   // Pass the method in the hidden argument T0.
-  return Location::RegisterLocation(T0);
+  return Location::CoreRegister(T0);
 }
 
 #define __ down_cast<CodeGeneratorRISCV64*>(codegen)->GetAssembler()->  // NOLINT
@@ -388,10 +388,10 @@ class BoundsCheckSlowPathRISCV64 : public SlowPathCodeRISCV64 {
     // move resolver.
     InvokeRuntimeCallingConvention calling_convention;
     codegen->EmitParallelMoves(locations->InAt(0),
-                               Location::RegisterLocation(calling_convention.GetRegisterAt(0)),
+                               Location::CoreRegister(calling_convention.GetRegisterAt(0)),
                                DataType::Type::kInt32,
                                locations->InAt(1),
-                               Location::RegisterLocation(calling_convention.GetRegisterAt(1)),
+                               Location::CoreRegister(calling_convention.GetRegisterAt(1)),
                                DataType::Type::kInt32);
     QuickEntrypointEnum entrypoint = instruction_->AsBoundsCheck()->IsStringCharAt() ?
                                          kQuickThrowStringBounds :
@@ -446,7 +446,7 @@ class LoadClassSlowPathRISCV64 : public SlowPathCodeRISCV64 {
       DCHECK(must_do_clinit);
       Location source = instruction_->IsLoadClass() ? out : locations->InAt(0);
       riscv64_codegen->MoveLocation(
-          Location::RegisterLocation(calling_convention.GetRegisterAt(0)), source, cls_->GetType());
+          Location::CoreRegister(calling_convention.GetRegisterAt(0)), source, cls_->GetType());
     }
     if (must_do_clinit) {
       riscv64_codegen->InvokeRuntime(kQuickInitializeStaticStorage, instruction_, this);
@@ -455,7 +455,8 @@ class LoadClassSlowPathRISCV64 : public SlowPathCodeRISCV64 {
 
     // Move the class to the desired location.
     if (out.IsValid()) {
-      DCHECK(out.IsRegister() && !locations->GetLiveRegisters()->ContainsCoreRegister(out.reg()));
+      DCHECK(out.IsCoreRegister());
+      DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(out.reg()));
       DataType::Type type = DataType::Type::kReference;
       DCHECK_EQ(type, instruction_->GetType());
       riscv64_codegen->MoveLocation(out, calling_convention.GetReturnLocation(type), type);
@@ -522,7 +523,7 @@ class ReadBarrierForRootSlowPathRISCV64 : public SlowPathCodeRISCV64 {
 
     InvokeRuntimeCallingConvention calling_convention;
     CodeGeneratorRISCV64* riscv64_codegen = down_cast<CodeGeneratorRISCV64*>(codegen);
-    riscv64_codegen->MoveLocation(Location::RegisterLocation(calling_convention.GetRegisterAt(0)),
+    riscv64_codegen->MoveLocation(Location::CoreRegister(calling_convention.GetRegisterAt(0)),
                                   root_,
                                   DataType::Type::kReference);
     riscv64_codegen->InvokeRuntime(kQuickReadBarrierForRootSlow, instruction_, this);
@@ -583,17 +584,17 @@ class ArraySetSlowPathRISCV64 : public SlowPathCodeRISCV64 {
     HParallelMove parallel_move(codegen->GetGraph()->GetAllocator());
     parallel_move.AddMove(
         locations->InAt(0),
-        Location::RegisterLocation(calling_convention.GetRegisterAt(0)),
+        Location::CoreRegister(calling_convention.GetRegisterAt(0)),
         DataType::Type::kReference,
         nullptr);
     parallel_move.AddMove(
         locations->InAt(1),
-        Location::RegisterLocation(calling_convention.GetRegisterAt(1)),
+        Location::CoreRegister(calling_convention.GetRegisterAt(1)),
         DataType::Type::kInt32,
         nullptr);
     parallel_move.AddMove(
         locations->InAt(2),
-        Location::RegisterLocation(calling_convention.GetRegisterAt(2)),
+        Location::CoreRegister(calling_convention.GetRegisterAt(2)),
         DataType::Type::kReference,
         nullptr);
     codegen->GetMoveResolver()->EmitNativeCode(&parallel_move);
@@ -632,10 +633,10 @@ class TypeCheckSlowPathRISCV64 : public SlowPathCodeRISCV64 {
     // move resolver.
     InvokeRuntimeCallingConvention calling_convention;
     codegen->EmitParallelMoves(locations->InAt(0),
-                               Location::RegisterLocation(calling_convention.GetRegisterAt(0)),
+                               Location::CoreRegister(calling_convention.GetRegisterAt(0)),
                                DataType::Type::kReference,
                                locations->InAt(1),
-                               Location::RegisterLocation(calling_convention.GetRegisterAt(1)),
+                               Location::CoreRegister(calling_convention.GetRegisterAt(1)),
                                DataType::Type::kReference);
     if (instruction_->IsInstanceOf()) {
       riscv64_codegen->InvokeRuntime(kQuickInstanceofNonTrivial, instruction_, this);
@@ -689,7 +690,7 @@ class ReadBarrierMarkSlowPathRISCV64 : public SlowPathCodeRISCV64 {
  public:
   ReadBarrierMarkSlowPathRISCV64(HInstruction* instruction, Location ref, Location entrypoint)
       : SlowPathCodeRISCV64(instruction), ref_(ref), entrypoint_(entrypoint) {
-    DCHECK(entrypoint.IsRegister());
+    DCHECK(entrypoint.IsCoreRegister());
   }
 
   const char* GetDescription() const override { return "ReadBarrierMarkSlowPathRISCV64"; }
@@ -1089,11 +1090,11 @@ void ParallelMoveResolverRISCV64::Exchange(int index1, int index2, bool double_s
   Location loc1(double_slot ? Location::DoubleStackSlot(index1) : Location::StackSlot(index1));
   Location loc2(double_slot ? Location::DoubleStackSlot(index2) : Location::StackSlot(index2));
   riscv64::ScratchRegisterScope srs(GetAssembler());
-  Location tmp = Location::RegisterLocation(srs.AllocateXRegister());
+  Location tmp = Location::CoreRegister(srs.AllocateXRegister());
   DataType::Type tmp_type = double_slot ? DataType::Type::kInt64 : DataType::Type::kInt32;
   Location tmp2 = use_fp_tmp2
-      ? Location::FpuRegisterLocation(srs.AllocateFRegister())
-      : Location::RegisterLocation(srs.AllocateXRegister());
+      ? Location::FpuRegister(srs.AllocateFRegister())
+      : Location::CoreRegister(srs.AllocateXRegister());
   DataType::Type tmp2_type = use_fp_tmp2
       ? (double_slot ? DataType::Type::kFloat64 : DataType::Type::kFloat32)
       : tmp_type;
@@ -1320,7 +1321,7 @@ void CodeGeneratorRISCV64::GenerateGcRootFieldLoad(HInstruction* instruction,
                     "have different sizes.");
 
       // Use RA as temp. It is clobbered in the slow path anyway.
-      Location temp = Location::RegisterLocation(RA);
+      Location temp = Location::CoreRegister(RA);
       SlowPathCodeRISCV64* slow_path =
           AddGcRootBakerBarrierBarrierSlowPath(instruction, root, temp);
       EmitBakerReadBarierMarkingCheck(slow_path, root, temp);
@@ -1382,7 +1383,7 @@ void InstructionCodeGeneratorRISCV64::GenerateTestAndBranch(HInstruction* instru
   if (IsBooleanValueOrMaterializedCondition(cond)) {
     // The condition instruction has been materialized, compare the output to 0.
     Location cond_val = instruction->GetLocations()->InAt(condition_input_index);
-    DCHECK(cond_val.IsRegister());
+    DCHECK(cond_val.IsCoreRegister());
     if (true_target == nullptr) {
       __ Beqz(cond_val.AsRegister<XRegister>(), false_target);
     } else {
@@ -1899,7 +1900,7 @@ void CodeGeneratorRISCV64::GenerateReferenceLoadWithBakerReadBarrier(HInstructio
   XRegister reg = ref.AsRegister<XRegister>();
   if (index.IsValid()) {
     DCHECK(!needs_null_check);
-    DCHECK(index.IsRegister());
+    DCHECK(index.IsCoreRegister());
     DataType::Type type = DataType::Type::kReference;
     DCHECK_EQ(type, instruction->GetType());
     if (instruction->IsArrayGet()) {
@@ -1924,7 +1925,7 @@ void CodeGeneratorRISCV64::GenerateReferenceLoadWithBakerReadBarrier(HInstructio
   // Slow path marking the reference.
   XRegister tmp = RA;  // Use RA as temp. It is clobbered in the slow path anyway.
   SlowPathCodeRISCV64* slow_path = new (GetScopedAllocator()) ReadBarrierMarkSlowPathRISCV64(
-      instruction, ref, Location::RegisterLocation(tmp));
+      instruction, ref, Location::CoreRegister(tmp));
   AddSlowPath(slow_path);
 
   const int32_t entry_point_offset = ReadBarrierMarkEntrypointOffset(ref);
@@ -3591,7 +3592,7 @@ void InstructionCodeGeneratorRISCV64::VisitConstructorFence(
 
 void LocationsBuilderRISCV64::VisitCurrentMethod(HCurrentMethod* instruction) {
   LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
-  locations->SetOut(Location::RegisterLocation(kArtMethodRegister));
+  locations->SetOut(Location::CoreRegister(kArtMethodRegister));
 }
 
 void InstructionCodeGeneratorRISCV64::VisitCurrentMethod(
@@ -3988,7 +3989,7 @@ void InstructionCodeGeneratorRISCV64::VisitInstanceOf(HInstanceOf* instruction) 
       // marking), or define two more entrypoints, or request an additional temp
       // from the register allocator instead of using a scratch register.
       ScratchRegisterScope srs(GetAssembler());
-      Location tmp = Location::RegisterLocation(srs.AllocateXRegister());
+      Location tmp = Location::CoreRegister(srs.AllocateXRegister());
       // /* HeapReference<Class> */ tmp = obj->klass_
       GenerateReferenceLoadTwoRegisters(
           instruction, tmp, obj_loc, class_offset, maybe_temp_loc, read_barrier_option);
@@ -4141,9 +4142,9 @@ void LocationsBuilderRISCV64::VisitInvokeInterface(HInvokeInterface* instruction
   // Use T0 as the hidden argument for `art_quick_imt_conflict_trampoline`.
   if (instruction->GetHiddenArgumentLoadKind() == MethodLoadKind::kRecursive) {
     instruction->GetLocations()->SetInAt(instruction->GetNumberOfArguments() - 1,
-                                         Location::RegisterLocation(T0));
+                                         Location::CoreRegister(T0));
   } else {
-    instruction->GetLocations()->AddTemp(Location::RegisterLocation(T0));
+    instruction->GetLocations()->AddTemp(Location::CoreRegister(T0));
   }
 }
 
@@ -4218,7 +4219,7 @@ void LocationsBuilderRISCV64::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* i
       // Use the next argument register, if usable for C.LD, as the target method temp. Otherwise,
       // we'll use RA. We prefer the low register temp that allows shorter encoding than RA.
       Location maybe_temp = calling_convention_visitor.GetNextLocation(DataType::Type::kInt32);
-      if (maybe_temp.IsRegister() && maybe_temp.reg() <= A5) {
+      if (maybe_temp.IsCoreRegister() && maybe_temp.reg() <= A5) {
         instruction->GetLocations()->AddTemp(maybe_temp);
       }
     }
@@ -4312,7 +4313,7 @@ void LocationsBuilderRISCV64::VisitLoadClass(HLoadClass* instruction) {
   HLoadClass::LoadKind load_kind = instruction->GetLoadKind();
   if (load_kind == HLoadClass::LoadKind::kRuntimeCall) {
     InvokeRuntimeCallingConvention calling_convention;
-    Location loc = Location::RegisterLocation(calling_convention.GetRegisterAt(0));
+    Location loc = Location::CoreRegister(calling_convention.GetRegisterAt(0));
     DCHECK_EQ(DataType::Type::kReference, instruction->GetType());
     DCHECK(loc.Equals(calling_convention.GetReturnLocation(DataType::Type::kReference)));
     CodeGenerator::CreateLoadClassRuntimeCallLocationSummary(instruction, loc, loc);
@@ -4474,7 +4475,7 @@ void InstructionCodeGeneratorRISCV64::VisitLoadException(HLoadException* instruc
 
 void LocationsBuilderRISCV64::VisitLoadMethodHandle(HLoadMethodHandle* instruction) {
   InvokeRuntimeCallingConvention calling_convention;
-  Location loc = Location::RegisterLocation(calling_convention.GetRegisterAt(0));
+  Location loc = Location::CoreRegister(calling_convention.GetRegisterAt(0));
   CodeGenerator::CreateLoadMethodHandleRuntimeCallLocationSummary(instruction, loc, loc);
 }
 
@@ -4484,7 +4485,7 @@ void InstructionCodeGeneratorRISCV64::VisitLoadMethodHandle(HLoadMethodHandle* i
 
 void LocationsBuilderRISCV64::VisitLoadMethodType(HLoadMethodType* instruction) {
   InvokeRuntimeCallingConvention calling_convention;
-  Location loc = Location::RegisterLocation(calling_convention.GetRegisterAt(0));
+  Location loc = Location::CoreRegister(calling_convention.GetRegisterAt(0));
   CodeGenerator::CreateLoadMethodTypeRuntimeCallLocationSummary(instruction, loc, loc);
 }
 
@@ -4646,7 +4647,7 @@ void LocationsBuilderRISCV64::VisitMonitorOperation(HMonitorOperation* instructi
   LocationSummary* locations =
       LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConvention calling_convention;
-  locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  locations->SetInAt(0, Location::CoreRegister(calling_convention.GetRegisterAt(0)));
 }
 
 void InstructionCodeGeneratorRISCV64::VisitMonitorOperation(HMonitorOperation* instruction) {
@@ -4759,8 +4760,8 @@ void LocationsBuilderRISCV64::VisitNewArray(HNewArray* instruction) {
       LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetOut(calling_convention.GetReturnLocation(DataType::Type::kReference));
-  locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
-  locations->SetInAt(1, Location::RegisterLocation(calling_convention.GetRegisterAt(1)));
+  locations->SetInAt(0, Location::CoreRegister(calling_convention.GetRegisterAt(0)));
+  locations->SetInAt(1, Location::CoreRegister(calling_convention.GetRegisterAt(1)));
 }
 
 void InstructionCodeGeneratorRISCV64::VisitNewArray(HNewArray* instruction) {
@@ -4774,7 +4775,7 @@ void LocationsBuilderRISCV64::VisitNewInstance(HNewInstance* instruction) {
   LocationSummary* locations =
       LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConvention calling_convention;
-  locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  locations->SetInAt(0, Location::CoreRegister(calling_convention.GetRegisterAt(0)));
   locations->SetOut(calling_convention.GetReturnLocation(DataType::Type::kReference));
 }
 
@@ -4947,8 +4948,8 @@ void LocationsBuilderRISCV64::VisitRem(HRem* instruction) {
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64: {
       InvokeRuntimeCallingConvention calling_convention;
-      locations->SetInAt(0, Location::FpuRegisterLocation(calling_convention.GetFpuRegisterAt(0)));
-      locations->SetInAt(1, Location::FpuRegisterLocation(calling_convention.GetFpuRegisterAt(1)));
+      locations->SetInAt(0, Location::FpuRegister(calling_convention.GetFpuRegisterAt(0)));
+      locations->SetInAt(1, Location::FpuRegister(calling_convention.GetFpuRegisterAt(1)));
       locations->SetOut(calling_convention.GetReturnLocation(type));
       break;
     }
@@ -5065,7 +5066,7 @@ void InstructionCodeGeneratorRISCV64::VisitStaticFieldSet(HStaticFieldSet* instr
 }
 
 void LocationsBuilderRISCV64::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
-  codegen_->CreateStringBuilderAppendLocations(instruction, Location::RegisterLocation(A0));
+  codegen_->CreateStringBuilderAppendLocations(instruction, Location::CoreRegister(A0));
 }
 
 void InstructionCodeGeneratorRISCV64::VisitStringBuilderAppend(HStringBuilderAppend* instruction) {
@@ -5268,7 +5269,7 @@ void LocationsBuilderRISCV64::VisitThrow(HThrow* instruction) {
   LocationSummary* locations =
       LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConvention calling_convention;
-  locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  locations->SetInAt(0, Location::CoreRegister(calling_convention.GetRegisterAt(0)));
 }
 
 void InstructionCodeGeneratorRISCV64::VisitThrow(HThrow* instruction) {
@@ -6289,7 +6290,7 @@ void CodeGeneratorRISCV64::GenerateFrameExit() {
 void CodeGeneratorRISCV64::Bind(HBasicBlock* block) { __ Bind(GetLabelOf(block)); }
 
 void CodeGeneratorRISCV64::MoveConstant(Location destination, int32_t value) {
-  DCHECK(destination.IsRegister());
+  DCHECK(destination.IsCoreRegister());
   __ LoadConst32(destination.AsRegister<XRegister>(), value);
 }
 
@@ -6308,23 +6309,23 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
   // TODO(riscv64): Can unspecified `dst_type` move 32-bit GPR to FPR without NaN-boxing?
   CHECK(!unspecified_type);
 
-  if (destination.IsRegister() || destination.IsFpuRegister()) {
+  if (destination.IsCoreRegister() || destination.IsFpuRegister()) {
     if (unspecified_type) {
       HConstant* src_cst = source.IsConstant() ? source.GetConstant() : nullptr;
       if (source.IsStackSlot() ||
           (src_cst != nullptr &&
            (src_cst->IsIntConstant() || src_cst->IsFloatConstant() || src_cst->IsNullConstant()))) {
         // For stack slots and 32-bit constants, a 32-bit type is appropriate.
-        dst_type = destination.IsRegister() ? DataType::Type::kInt32 : DataType::Type::kFloat32;
+        dst_type = destination.IsCoreRegister() ? DataType::Type::kInt32 : DataType::Type::kFloat32;
       } else {
         // If the source is a double stack slot or a 64-bit constant, a 64-bit type
         // is appropriate. Else the source is a register, and since the type has not
         // been specified, we chose a 64-bit type to force a 64-bit move.
-        dst_type = destination.IsRegister() ? DataType::Type::kInt64 : DataType::Type::kFloat64;
+        dst_type = destination.IsCoreRegister() ? DataType::Type::kInt64 : DataType::Type::kFloat64;
       }
     }
     DCHECK((destination.IsFpuRegister() && DataType::IsFloatingPointType(dst_type)) ||
-           (destination.IsRegister() && !DataType::IsFloatingPointType(dst_type)));
+           (destination.IsCoreRegister() && !DataType::IsFloatingPointType(dst_type)));
 
     if (source.IsStackSlot() || source.IsDoubleStackSlot()) {
       // Move to GPR/FPR from stack
@@ -6364,8 +6365,8 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
       } else if (dst_type == DataType::Type::kFloat64) {
         __ FMvDX(destination.AsFpuRegister<FRegister>(), gpr);
       }
-    } else if (source.IsRegister()) {
-      if (destination.IsRegister()) {
+    } else if (source.IsCoreRegister()) {
+      if (destination.IsCoreRegister()) {
         // Move to GPR from GPR
         __ Mv(destination.AsRegister<XRegister>(), source.AsRegister<XRegister>());
       } else {
@@ -6391,7 +6392,7 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
           }
         }
       } else {
-        DCHECK(destination.IsRegister());
+        DCHECK(destination.IsCoreRegister());
         if (DataType::Is64BitType(dst_type)) {
           __ FMvXD(destination.AsRegister<XRegister>(), source.AsFpuRegister<FRegister>());
         } else {
@@ -6404,9 +6405,9 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
     UNREACHABLE();
   } else {  // The destination is not a register. It must be a stack slot.
     DCHECK(destination.IsStackSlot() || destination.IsDoubleStackSlot());
-    if (source.IsRegister() || source.IsFpuRegister()) {
+    if (source.IsCoreRegister() || source.IsFpuRegister()) {
       if (unspecified_type) {
-        if (source.IsRegister()) {
+        if (source.IsCoreRegister()) {
           dst_type = destination.IsStackSlot() ? DataType::Type::kInt32 : DataType::Type::kInt64;
         } else {
           dst_type =
@@ -6420,13 +6421,13 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
                      destination.IsDoubleStackSlot() == DataType::Is64BitType(dst_type));
       // Move to stack from GPR/FPR
       if (destination.IsDoubleStackSlot()) {
-        if (source.IsRegister()) {
+        if (source.IsCoreRegister()) {
           __ Stored(source.AsRegister<XRegister>(), SP, destination.GetStackIndex());
         } else {
           __ FStored(source.AsFpuRegister<FRegister>(), SP, destination.GetStackIndex());
         }
       } else {
-        if (source.IsRegister()) {
+        if (source.IsCoreRegister()) {
           __ Storew(source.AsRegister<XRegister>(), SP, destination.GetStackIndex());
         } else {
           __ FStorew(source.AsFpuRegister<FRegister>(), SP, destination.GetStackIndex());
@@ -6469,7 +6470,7 @@ void CodeGeneratorRISCV64::MoveLocation(Location destination,
 }
 
 void CodeGeneratorRISCV64::AddLocationAsTemp(Location location, LocationSummary* locations) {
-  if (location.IsRegister()) {
+  if (location.IsCoreRegister()) {
     locations->AddTemp(location);
   } else {
     UNIMPLEMENTED(FATAL) << "AddLocationAsTemp not implemented for location " << location;
@@ -7103,7 +7104,7 @@ void CodeGeneratorRISCV64::GenerateStaticOrDirectCall(HInvokeStaticOrDirect* inv
         DCHECK_EQ(invoke->GetCodePtrLocation(), CodePtrLocation::kCallCriticalNative);
         // Use RA for both the target method and then the code pointer. The code shall be two
         // bytes longer because we'll have to use 32-bit instead of 16-bit encoding for one load.
-        callee_method = Location::RegisterLocation(RA);
+        callee_method = Location::CoreRegister(RA);
       }
       LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
@@ -7285,7 +7286,7 @@ void CodeGeneratorRISCV64::SwapLocations(Location loc1, Location loc2, DataType:
   bool is_fp_reg2 = loc2.IsFpuRegister();
 
   if ((is_slot1 != is_slot2) ||
-      (loc2.IsRegister() && loc1.IsRegister()) ||
+      (loc2.IsCoreRegister() && loc1.IsCoreRegister()) ||
       (is_fp_reg2 && is_fp_reg1)) {
     if ((is_fp_reg2 && is_fp_reg1) && GetGraph()->HasSIMD()) {
       LOG(FATAL) << "Unsupported";
@@ -7293,8 +7294,8 @@ void CodeGeneratorRISCV64::SwapLocations(Location loc1, Location loc2, DataType:
     }
     ScratchRegisterScope srs(GetAssembler());
     Location tmp = (is_fp_reg2 || is_fp_reg1)
-        ? Location::FpuRegisterLocation(srs.AllocateFRegister())
-        : Location::RegisterLocation(srs.AllocateXRegister());
+        ? Location::FpuRegister(srs.AllocateFRegister())
+        : Location::CoreRegister(srs.AllocateXRegister());
     MoveLocation(tmp, loc1, type);
     MoveLocation(loc1, loc2, type);
     MoveLocation(loc2, tmp, type);

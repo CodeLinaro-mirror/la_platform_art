@@ -682,7 +682,7 @@ bool FastCompilerARM64::InitializeParameters() {
     vreg_locations_[vreg_parameter_index] = convention.GetNextLocation(DataType::Type::kReference);
     if (needs_spill) {
       Location new_location = CreateNewLocation(vreg_parameter_index, DataType::Type::kReference);
-      DCHECK(vreg_locations_[vreg_parameter_index].IsRegister());
+      DCHECK(vreg_locations_[vreg_parameter_index].IsCoreRegister());
       MoveLocation(new_location, vreg_locations_[vreg_parameter_index], DataType::Type::kReference);
       vreg_locations_[vreg_parameter_index] = new_location;
     }
@@ -900,8 +900,8 @@ bool FastCompilerARM64::ProcessInstructions() {
       Location stack_location =
           CreateNewLocation(register_to_spill_.first, register_to_spill_.second);
       Location reg_location = DataType::IsFloatingPointType(register_to_spill_.second)
-          ? Location::FpuRegisterLocation(kResultRegisterForSpill)
-          : Location::RegisterLocation(kResultRegisterForSpill);
+          ? Location::FpuRegister(kResultRegisterForSpill)
+          : Location::CoreRegister(kResultRegisterForSpill);
       MoveLocation(stack_location, reg_location, register_to_spill_.second);
       vreg_locations_[register_to_spill_.first] = stack_location;
       if (DataType::Is64BitType(register_to_spill_.second)) {
@@ -929,9 +929,9 @@ bool FastCompilerARM64::MoveLocation(Location destination,
   if (source.Equals(destination)) {
     return true;
   }
-  if (destination.IsRegister()) {
+  if (destination.IsCoreRegister()) {
     Register dst = RegisterFrom(destination, hint_type);
-    if (source.IsRegister()) {
+    if (source.IsCoreRegister()) {
       __ Mov(dst, RegisterFrom(source, hint_type));
       return true;
     }
@@ -979,7 +979,7 @@ bool FastCompilerARM64::MoveLocation(Location destination,
       __ Ldr(dst, StackOperandFrom(source));
       return true;
     }
-    if (source.IsRegister()) {
+    if (source.IsCoreRegister()) {
       Register src = RegisterFrom(
           source, dst.Is64Bits() ? DataType::Type::kInt64 : DataType::Type::kInt32);
       __ Fmov(dst, src);
@@ -1001,7 +1001,7 @@ bool FastCompilerARM64::MoveLocation(Location destination,
   }
 
   if (destination.IsStackSlot()) {
-    if (source.IsRegister()) {
+    if (source.IsCoreRegister()) {
       DataType::Type src_type = DataType::Is64BitType(hint_type)
           ? DataType::Type::kInt64
           : DataType::Type::kInt32;
@@ -1050,9 +1050,9 @@ Location FastCompilerARM64::CreateNewLocation(uint32_t reg, DataType::Type type)
     return Location::StackSlot(GetStackSlot(reg));
   }
   if (DataType::IsFloatingPointType(type)) {
-    return Location::FpuRegisterLocation(kAvailableCalleeSaveFpuRegisters[reg].GetCode());
+    return Location::FpuRegister(kAvailableCalleeSaveFpuRegisters[reg].GetCode());
   }
-  return Location::RegisterLocation(kAvailableCalleeSaveRegisters[reg].GetCode());
+  return Location::CoreRegister(kAvailableCalleeSaveRegisters[reg].GetCode());
 }
 
 Location FastCompilerARM64::CreateNewRegisterLocation(uint32_t reg,
@@ -1083,16 +1083,16 @@ Location FastCompilerARM64::CreateNewRegisterLocation(uint32_t reg,
       DCHECK(has_frame_);
       DCHECK(!NeedsToSpill());
       register_to_spill_ = std::make_pair(reg, type);
-      return Location::FpuRegisterLocation(kResultRegisterForSpill);
+      return Location::FpuRegister(kResultRegisterForSpill);
     }
     uint32_t register_code = has_frame_
         ? kAvailableCalleeSaveFpuRegisters[reg].GetCode()
         : kAvailableTempFpuRegisters[reg].GetCode();
-    vreg_locations_[reg] = Location::FpuRegisterLocation(register_code);
+    vreg_locations_[reg] = Location::FpuRegister(register_code);
     return vreg_locations_[reg];
   }
 
-  if (vreg_locations_[reg].IsRegister()) {
+  if (vreg_locations_[reg].IsCoreRegister()) {
     // Re-use existing register.
     return vreg_locations_[reg];
   }
@@ -1101,13 +1101,13 @@ Location FastCompilerARM64::CreateNewRegisterLocation(uint32_t reg,
     DCHECK(has_frame_);
     DCHECK(!NeedsToSpill());
     register_to_spill_ = std::make_pair(reg, type);
-    return Location::RegisterLocation(kResultRegisterForSpill);
+    return Location::CoreRegister(kResultRegisterForSpill);
   }
 
   uint32_t register_code = has_frame_
       ? kAvailableCalleeSaveRegisters[reg].GetCode()
       : kAvailableTempRegisters[reg].GetCode();
-  vreg_locations_[reg] = Location::RegisterLocation(register_code);
+  vreg_locations_[reg] = Location::CoreRegister(register_code);
   return vreg_locations_[reg];
 }
 
@@ -1116,8 +1116,8 @@ Location FastCompilerARM64::GetExistingRegisterLocation(uint32_t reg, DataType::
     unimplemented_reason_ = "UnverifiedDeadCode";
     // Return a phony location.
     return DataType::IsFloatingPointType(type)
-        ? Location::FpuRegisterLocation(1)
-        : Location::RegisterLocation(1);
+        ? Location::FpuRegister(1)
+        : Location::CoreRegister(1);
   }
 
   if (DataType::IsFloatingPointType(type)) {
@@ -1127,14 +1127,14 @@ Location FastCompilerARM64::GetExistingRegisterLocation(uint32_t reg, DataType::
     Location new_location;
     if (reg >= kMaximumRegisters) {
       DCHECK(has_frame_);
-      new_location = Location::FpuRegisterLocation(GetTempFpuRegister());
+      new_location = Location::FpuRegister(GetTempFpuRegister());
       bool res = MoveLocation(new_location, vreg_locations_[reg], type);
       DCHECK(res);
     } else {
       uint32_t register_code = has_frame_
           ? kAvailableCalleeSaveFpuRegisters[reg].GetCode()
           : kAvailableTempFpuRegisters[reg].GetCode();
-      new_location = Location::FpuRegisterLocation(register_code);
+      new_location = Location::FpuRegister(register_code);
       bool res = MoveLocation(new_location, vreg_locations_[reg], type);
       DCHECK(res);
       vreg_locations_[reg] = new_location;
@@ -1145,21 +1145,21 @@ Location FastCompilerARM64::GetExistingRegisterLocation(uint32_t reg, DataType::
     return new_location;
   }
 
-  if (vreg_locations_[reg].IsRegister()) {
+  if (vreg_locations_[reg].IsCoreRegister()) {
     return vreg_locations_[reg];
   }
 
   Location new_location;
   if (reg >= kMaximumRegisters) {
     DCHECK(has_frame_);
-    new_location = Location::RegisterLocation(GetTempCoreRegister());
+    new_location = Location::CoreRegister(GetTempCoreRegister());
     bool res = MoveLocation(new_location, vreg_locations_[reg], type);
     DCHECK(res);
   } else {
     uint32_t register_code = has_frame_
         ? kAvailableCalleeSaveRegisters[reg].GetCode()
         : kAvailableTempRegisters[reg].GetCode();
-    new_location = Location::RegisterLocation(register_code);
+    new_location = Location::CoreRegister(register_code);
     bool res = MoveLocation(new_location, vreg_locations_[reg], type);
     DCHECK(res);
     vreg_locations_[reg] = new_location;
@@ -1214,7 +1214,7 @@ void FastCompilerARM64::RecordPcInfo(uint32_t dex_pc) {
           break;
         }
 
-        case Location::kRegister: {
+        case Location::kCoreRegister: {
           stack_map_stream->AddDexRegisterEntry(Kind::kInRegister, location.reg());
           // Note: if we were using the fast compiler for debuggable, we would
           // need to emit a `kInRegisterHi` here for long values. This would
@@ -1330,16 +1330,16 @@ bool FastCompilerARM64::GenerateFrame() {
     // Move registers which are currently allocated from caller-saves to callee-saves,
     // and adjust the offsets of stack locations.
     for (uint32_t i = 0; i < number_of_vregs; ++i) {
-      if (vreg_locations_[i].IsRegister()) {
+      if (vreg_locations_[i].IsCoreRegister()) {
         Location new_location =
-            Location::RegisterLocation(kAvailableCalleeSaveRegisters[i].GetCode());
+            Location::CoreRegister(kAvailableCalleeSaveRegisters[i].GetCode());
         if (!MoveLocation(new_location, vreg_locations_[i], DataType::Type::kInt64)) {
           return false;
         }
         vreg_locations_[i] = new_location;
       } else if (vreg_locations_[i].IsFpuRegister()) {
         Location new_location =
-            Location::FpuRegisterLocation(kAvailableCalleeSaveFpuRegisters[i].GetCode());
+            Location::FpuRegister(kAvailableCalleeSaveFpuRegisters[i].GetCode());
         if (!MoveLocation(new_location, vreg_locations_[i], DataType::Type::kFloat64)) {
           return false;
         }
@@ -1349,7 +1349,7 @@ bool FastCompilerARM64::GenerateFrame() {
         vreg_locations_[i] =
             Location::StackSlot(vreg_locations_[i].GetStackIndex() + GetFrameSize());
         Location new_location =
-            Location::RegisterLocation(kAvailableCalleeSaveRegisters[i].GetCode());
+            Location::CoreRegister(kAvailableCalleeSaveRegisters[i].GetCode());
         if (!MoveLocation(new_location, vreg_locations_[i], DataType::Type::kInt32)) {
           return false;
         }
@@ -1853,10 +1853,10 @@ bool FastCompilerARM64::BuildFilledNewArray(uint32_t dex_pc,
     for (int32_t i = 0; i < number_of_operands; ++i) {
       Location loc = vreg_locations_[operands.GetOperand(i)];
       Register value;
-      if (loc.IsRegister()) {
+      if (loc.IsCoreRegister()) {
         value = RegisterFrom(loc, type);
       } else {
-        MoveLocation(Location::RegisterLocation(temp.GetCode()), loc, type);
+        MoveLocation(Location::CoreRegister(temp.GetCode()), loc, type);
         value = temp;
       }
       MemOperand mem = HeapOperand(array, offset + (i <<  DataType::SizeShift(type)));
@@ -2308,12 +2308,14 @@ bool FastCompilerARM64::BuildMove(uint32_t dest_reg,
               /* is_wide= */ DataType::Is64BitType(type),
               CanBeNull(src_reg));
 
+  // Fetch the source before creating a new register for the destination, in
+  // case they overlap.
+  Location source = vreg_locations_[src_reg];
+
   // Translate a move into an actual move instruction. We could just update
   // `vreg_locations_`, but that would require tracking aliases, which may be
   // costly in compile time.
-  if (!MoveLocation(CreateNewRegisterLocation(dest_reg, type, next),
-                    vreg_locations_[src_reg],
-                    type)) {
+  if (!MoveLocation(CreateNewRegisterLocation(dest_reg, type, next), source, type)) {
     return false;
   }
   return true;
