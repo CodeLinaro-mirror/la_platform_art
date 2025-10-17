@@ -497,9 +497,6 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
 
   size_t FirstRegisterUseAfter(size_t position) const {
     DCHECK(!IsTemp());
-    if (IsDefiningPosition(position) && DefinitionRequiresRegister()) {
-      return position;
-    }
 
     size_t end = GetEnd();
     for (const UsePosition& use : GetUses()) {
@@ -516,25 +513,14 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
     return kNoLifetime;
   }
 
-  // Returns the location of the first register use for this live interval,
-  // including a register definition if applicable.
+  // Returns the location of the first register use for this live interval.
   size_t FirstRegisterUse() const {
-    size_t start = GetStart();
-    return IsTemp() ? start : FirstRegisterUseAfter(start);
-  }
-
-  // Whether the interval requires a register rather than a stack location.
-  // If needed for performance, this could be cached.
-  bool RequiresRegister() const {
-    return !HasRegisters() && FirstRegisterUse() != kNoLifetime;
+    return FirstRegisterUseAfter(GetStart());
   }
 
   size_t FirstUseAfter(size_t position) const {
     DCHECK(!IsTemp());
-    if (IsDefiningPosition(position)) {
-      DCHECK(defined_by_->GetLocations()->Out().IsValid());
-      return position;
-    }
+    DCHECK(!IsDefiningPosition(position));
 
     size_t end = GetEnd();
     for (const UsePosition& use : GetUses()) {
@@ -600,10 +586,6 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   }
 
   void Dump(std::ostream& stream) const;
-
-  // Same as Dump, but adds context such as the instruction defining this interval, and
-  // the register currently assigned to this interval.
-  void DumpWithContext(std::ostream& stream, const CodeGenerator& codegen) const;
 
   LiveInterval* GetNextSibling() const { return next_sibling_; }
   LiveInterval* GetLastSibling() {
@@ -702,31 +684,23 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
     range_search_start_ = first_range_;
   }
 
-  bool DefinitionRequiresRegister() const {
+  bool RequiresRegisterForDefinitionAt(size_t position) const {
+    DCHECK(!IsTemp());
+    if (!IsDefiningPosition(position)) {
+      return false;
+    }
     DCHECK(IsParent());
     LocationSummary* locations = defined_by_->GetLocations();
     Location location = locations->Out();
     // This interval is the first interval of the instruction. If the output
     // of the instruction requires a register, we return the position of that instruction
     // as the first register use.
-    if (location.IsUnallocated()) {
-      if ((location.GetPolicy() == Location::kRequiresRegister)
-           || (location.GetPolicy() == Location::kSameAsFirstInput
-               && (locations->InAt(0).IsRegister()
-                   || locations->InAt(0).IsRegisterPair()
-                   || locations->InAt(0).GetPolicy() == Location::kRequiresRegister))) {
-        return true;
-      } else if ((location.GetPolicy() == Location::kRequiresFpuRegister)
-                 || (location.GetPolicy() == Location::kSameAsFirstInput
-                     && (locations->InAt(0).IsFpuRegister()
-                         || locations->InAt(0).IsFpuRegisterPair()
-                         || locations->InAt(0).GetPolicy() == Location::kRequiresFpuRegister))) {
-        return true;
-      }
-    } else if (location.IsRegister() || location.IsRegisterPair()) {
-      return true;
+    if (location.Equals(Location::SameAsFirstInput())) {
+      location = locations->InAt(0);
+      DCHECK(!location.Equals(Location::SameAsFirstInput()));
     }
-    return false;
+    return location.IsRegisterKind() ||
+           (location.IsUnallocated() && location.RequiresRegisterKind());
   }
 
   void SetHintPhiInterval(LiveInterval* hint_phi_interval) {

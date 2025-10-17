@@ -63,14 +63,14 @@ class Location : public ValueObject {
     // We do not use the value 5 because it conflicts with kLocationConstantMask.
     kDoNotUse5 = 5,
 
-    kRegister = 6,  // Core register.
+    kCoreRegister = 6,  // Core register.
     kFpuRegister = 7,  // Float register.
     kVecRegister = 8,  // Vector register.
 
     // We do not use the value 9 because it conflicts with kLocationConstantMask.
     kDoNotUse9 = 9,
 
-    kRegisterPair = 10,  // Long register.
+    kCoreRegisterPair = 10,  // Long register.
     kFpuRegisterPair = 11,  // Double register.
 
     // Unallocated location represents a location that is not fixed and can be
@@ -89,10 +89,10 @@ class Location : public ValueObject {
     static_assert((kStackSlot & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kDoubleStackSlot & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kSIMDStackSlot & kLocationConstantMask) != kConstant, "TagError");
-    static_assert((kRegister & kLocationConstantMask) != kConstant, "TagError");
+    static_assert((kCoreRegister & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kFpuRegister & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kVecRegister & kLocationConstantMask) != kConstant, "TagError");
-    static_assert((kRegisterPair & kLocationConstantMask) != kConstant, "TagError");
+    static_assert((kCoreRegisterPair & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kFpuRegisterPair & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kUnallocated & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kConstant & kLocationConstantMask) == kConstant, "TagError");
@@ -136,28 +136,28 @@ class Location : public ValueObject {
   }
 
   // Register locations.
-  static constexpr Location RegisterLocation(int reg) {
-    return Location(kRegister, reg);
+  static constexpr Location CoreRegister(int reg) {
+    return Location(kCoreRegister, reg);
   }
 
-  static constexpr Location FpuRegisterLocation(int reg) {
+  static constexpr Location FpuRegister(int reg) {
     return Location(kFpuRegister, reg);
   }
 
-  static constexpr Location VecRegisterLocation(int reg) {
+  static constexpr Location VecRegister(int reg) {
     return Location(kVecRegister, reg);
   }
 
-  static constexpr Location RegisterPairLocation(int low, int high) {
-    return Location(kRegisterPair, low << 16 | high);
+  static constexpr Location CoreRegisterPair(int low, int high) {
+    return Location(kCoreRegisterPair, low << 16 | high);
   }
 
-  static constexpr Location FpuRegisterPairLocation(int low, int high) {
+  static constexpr Location FpuRegisterPair(int low, int high) {
     return Location(kFpuRegisterPair, low << 16 | high);
   }
 
-  bool IsRegister() const {
-    return GetKind() == kRegister;
+  bool IsCoreRegister() const {
+    return GetKind() == kCoreRegister;
   }
 
   bool IsFpuRegister() const {
@@ -168,8 +168,8 @@ class Location : public ValueObject {
     return GetKind() == kVecRegister;
   }
 
-  bool IsRegisterPair() const {
-    return GetKind() == kRegisterPair;
+  bool IsCoreRegisterPair() const {
+    return GetKind() == kCoreRegisterPair;
   }
 
   bool IsFpuRegisterPair() const {
@@ -177,15 +177,15 @@ class Location : public ValueObject {
   }
 
   bool IsRegisterKind() const {
-    return IsRegister() ||
+    return IsCoreRegister() ||
            IsFpuRegister() ||
            IsVecRegister() ||
-           IsRegisterPair() ||
+           IsCoreRegisterPair() ||
            IsFpuRegisterPair();
   }
 
   int reg() const {
-    DCHECK(IsRegister() || IsFpuRegister() || IsVecRegister());
+    DCHECK(IsCoreRegister() || IsFpuRegister() || IsVecRegister());
     return GetPayload();
   }
 
@@ -201,7 +201,7 @@ class Location : public ValueObject {
 
   template <typename T>
   T AsRegister() const {
-    DCHECK(IsRegister());
+    DCHECK(IsCoreRegister());
     return static_cast<T>(reg());
   }
 
@@ -219,13 +219,13 @@ class Location : public ValueObject {
 
   template <typename T>
   T AsRegisterPairLow() const {
-    DCHECK(IsRegisterPair());
+    DCHECK(IsCoreRegisterPair());
     return static_cast<T>(low());
   }
 
   template <typename T>
   T AsRegisterPairHigh() const {
-    DCHECK(IsRegisterPair());
+    DCHECK(IsCoreRegisterPair());
     return static_cast<T>(high());
   }
 
@@ -242,28 +242,28 @@ class Location : public ValueObject {
   }
 
   bool IsPair() const {
-    return IsRegisterPair() || IsFpuRegisterPair();
+    return IsCoreRegisterPair() || IsFpuRegisterPair();
   }
 
   Location ToLow() const {
-    if (IsRegisterPair()) {
-      return Location::RegisterLocation(low());
+    if (IsCoreRegisterPair()) {
+      return CoreRegister(low());
     } else if (IsFpuRegisterPair()) {
-      return Location::FpuRegisterLocation(low());
+      return FpuRegister(low());
     } else {
       DCHECK(IsDoubleStackSlot());
-      return Location::StackSlot(GetStackIndex());
+      return StackSlot(GetStackIndex());
     }
   }
 
   Location ToHigh() const {
-    if (IsRegisterPair()) {
-      return Location::RegisterLocation(high());
+    if (IsCoreRegisterPair()) {
+      return CoreRegister(high());
     } else if (IsFpuRegisterPair()) {
-      return Location::FpuRegisterLocation(high());
+      return FpuRegister(high());
     } else {
       DCHECK(IsDoubleStackSlot());
-      return Location::StackSlot(GetHighStackIndex(4));
+      return StackSlot(GetHighStackIndex(4));
     }
   }
 
@@ -313,12 +313,12 @@ class Location : public ValueObject {
     DCHECK_NE(num_of_slots, 0u);
     switch (num_of_slots) {
       case 1u:
-        return Location::StackSlot(spill_slot);
+        return StackSlot(spill_slot);
       case 2u:
-        return Location::DoubleStackSlot(spill_slot);
+        return DoubleStackSlot(spill_slot);
       default:
         // Assume all other stack slot sizes correspond to SIMD slot size.
-        return Location::SIMDStackSlot(spill_slot);
+        return SIMDStackSlot(spill_slot);
     }
   }
 
@@ -372,10 +372,10 @@ class Location : public ValueObject {
       case kStackSlot: return "S";
       case kDoubleStackSlot: return "DS";
       case kSIMDStackSlot: return "SIMD";
-      case kRegister: return "R";
+      case kCoreRegister: return "R";
       case kFpuRegister: return "F";
       case kVecRegister: return "V";
-      case kRegisterPair: return "RP";
+      case kCoreRegisterPair: return "RP";
       case kFpuRegisterPair: return "FP";
       case kUnallocated: return "U";
       case kDoNotUse5:  // fall-through
@@ -684,7 +684,7 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
 
   bool IsFixedInput(uint32_t input_index) const {
     Location input = Inputs()[input_index];
-    return input.IsRegister()
+    return input.IsCoreRegister()
         || input.IsFpuRegister()
         || input.IsPair()
         || input.IsStackSlot()

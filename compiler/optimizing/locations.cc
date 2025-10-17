@@ -99,7 +99,7 @@ Location Location::FpuRegisterOrInt32Constant(HInstruction* instruction) {
 Location Location::ByteRegisterOrConstant(int reg, HInstruction* instruction) {
   return instruction->IsConstant()
       ? Location::ConstantLocation(instruction)
-      : Location::RegisterLocation(reg);
+      : Location::CoreRegister(reg);
 }
 
 Location Location::FpuRegisterOrConstant(HInstruction* instruction) {
@@ -117,7 +117,7 @@ void Location::DCheckInstructionIsConstant(HInstruction* instruction) {
 
 std::ostream& operator<<(std::ostream& os, const Location& location) {
   os << location.DebugString();
-  if (location.IsRegister() || location.IsFpuRegister() || location.IsVecRegister()) {
+  if (location.IsCoreRegister() || location.IsFpuRegister() || location.IsVecRegister()) {
     os << location.reg();
   } else if (location.IsPair()) {
     os << location.low() << ":" << location.high();

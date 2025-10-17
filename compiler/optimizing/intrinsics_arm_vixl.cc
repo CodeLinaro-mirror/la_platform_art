@@ -1487,7 +1487,7 @@ void IntrinsicCodeGeneratorARMVIXL::VisitSystemArrayCopy(HInvoke* invoke) {
     // Null constant length: not need to emit the loop code at all.
   } else {
     vixl32::Label skip_copy_and_write_barrier;
-    if (length.IsRegister()) {
+    if (length.IsCoreRegister()) {
       // Don't enter the copy loop if the length is null.
       __ CompareAndBranchIfZero(
           RegisterFrom(length), &skip_copy_and_write_barrier, /* is_far_target= */ false);
@@ -1857,7 +1857,7 @@ void IntrinsicCodeGeneratorARMVIXL::VisitLongReverse(HInvoke* invoke) {
 }
 
 static void GenerateReverseBytesInPlaceForEachWord(ArmVIXLAssembler* assembler, Location pair) {
-  DCHECK(pair.IsRegisterPair());
+  DCHECK(pair.IsCoreRegisterPair());
   __ Rev(LowRegisterFrom(pair), LowRegisterFrom(pair));
   __ Rev(HighRegisterFrom(pair), HighRegisterFrom(pair));
 }
@@ -3493,14 +3493,14 @@ static void GenerateCompareAndSet(CodeGeneratorARMVIXL* codegen,
   // the main path attempt to emit CAS when it matched `expected` after marking.
   // Otherwise the type of `expected` shall match the type of `new_value` and `old_value`.
   if (type == DataType::Type::kInt64) {
-    DCHECK(expected.IsRegisterPair());
-    DCHECK(new_value.IsRegisterPair());
-    DCHECK(old_value.IsRegisterPair());
+    DCHECK(expected.IsCoreRegisterPair());
+    DCHECK(new_value.IsCoreRegisterPair());
+    DCHECK(old_value.IsCoreRegisterPair());
   } else {
-    DCHECK(expected.IsRegister() ||
-           (type == DataType::Type::kReference && expected.IsRegisterPair()));
-    DCHECK(new_value.IsRegister());
-    DCHECK(old_value.IsRegister());
+    DCHECK(expected.IsCoreRegister() ||
+           (type == DataType::Type::kReference && expected.IsCoreRegisterPair()));
+    DCHECK(new_value.IsCoreRegister());
+    DCHECK(old_value.IsCoreRegister());
     // Make sure the unmarked old value for reference CAS slow path is not clobbered by STREX.
     DCHECK(!expected.Contains(LocationFrom(store_result)));
   }
@@ -3525,7 +3525,9 @@ static void GenerateCompareAndSet(CodeGeneratorARMVIXL* codegen,
   // branch goes to the read barrier slow path that clobbers `success` anyway.
   bool init_failure_for_cmp =
       success.IsValid() &&
-      !(type == DataType::Type::kReference && codegen->EmitReadBarrier() && expected.IsRegister());
+      !(type == DataType::Type::kReference &&
+        codegen->EmitReadBarrier() &&
+        expected.IsCoreRegister());
   // Instruction scheduling: Loading a constant between LDREX* and using the loaded value
   // is essentially free, so prepare the failure value here if we can.
   bool init_failure_for_cmp_early =
@@ -3538,7 +3540,7 @@ static void GenerateCompareAndSet(CodeGeneratorARMVIXL* codegen,
     ExactAssemblyScope aas(assembler->GetVIXLAssembler(), 2 * k16BitT32InstructionSizeInBytes);
     __ it(eq);
     __ cmp(eq, HighRegisterFrom(old_value), HighRegisterFrom(expected));
-  } else if (expected.IsRegisterPair()) {
+  } else if (expected.IsCoreRegisterPair()) {
     DCHECK_EQ(type, DataType::Type::kReference);
     DCHECK(!expected.Contains(old_value));
     // Check if the loaded value matches any of the two registers in `expected`.
@@ -3602,19 +3604,19 @@ class ReadBarrierCasSlowPathARMVIXL : public SlowPathCodeARMVIXL {
       // We need to add the slow path now, it is too late when emitting slow path code.
       mark_old_value_slow_path_ = arm_codegen->AddReadBarrierSlowPath(
           invoke,
-          Location::RegisterLocation(old_value_temp.GetCode()),
-          Location::RegisterLocation(old_value.GetCode()),
-          Location::RegisterLocation(base.GetCode()),
+          Location::CoreRegister(old_value_temp.GetCode()),
+          Location::CoreRegister(old_value.GetCode()),
+          Location::CoreRegister(base.GetCode()),
           /*offset=*/ 0u,
-          /*index=*/ Location::RegisterLocation(offset.GetCode()));
+          /*index=*/ Location::CoreRegister(offset.GetCode()));
       if (!success.IsValid()) {
         update_old_value_slow_path_ = arm_codegen->AddReadBarrierSlowPath(
             invoke,
-            Location::RegisterLocation(old_value.GetCode()),
-            Location::RegisterLocation(old_value_temp.GetCode()),
-            Location::RegisterLocation(base.GetCode()),
+            Location::CoreRegister(old_value.GetCode()),
+            Location::CoreRegister(old_value_temp.GetCode()),
+            Location::CoreRegister(base.GetCode()),
             /*offset=*/ 0u,
-            /*index=*/ Location::RegisterLocation(offset.GetCode()));
+            /*index=*/ Location::CoreRegister(offset.GetCode()));
       }
     }
   }
@@ -3886,9 +3888,9 @@ static void GenerateGetAndUpdate(CodeGeneratorARMVIXL* codegen,
       new_value = arg;
       break;
     case GetAndUpdateOp::kAddWithByteSwap:
-      if (old_value.IsRegisterPair()) {
+      if (old_value.IsCoreRegisterPair()) {
         // To avoid register overlap when reversing bytes, load into temps.
-        DCHECK(maybe_temp.IsRegisterPair());
+        DCHECK(maybe_temp.IsCoreRegisterPair());
         loaded_value = maybe_temp;
         new_value = loaded_value;  // Use the same temporaries for the new value.
         break;
@@ -3896,13 +3898,13 @@ static void GenerateGetAndUpdate(CodeGeneratorARMVIXL* codegen,
       FALLTHROUGH_INTENDED;
     case GetAndUpdateOp::kAdd:
       if (old_value.IsFpuRegisterPair()) {
-        DCHECK(maybe_temp.IsRegisterPair());
+        DCHECK(maybe_temp.IsCoreRegisterPair());
         loaded_value = maybe_temp;
         new_value = loaded_value;  // Use the same temporaries for the new value.
         break;
       }
       if (old_value.IsFpuRegister()) {
-        DCHECK(maybe_temp.IsRegister());
+        DCHECK(maybe_temp.IsCoreRegister());
         loaded_value = maybe_temp;
         new_value = loaded_value;  // Use the same temporary for the new value.
         break;
@@ -4106,9 +4108,9 @@ static void GenUnsafeGetAndUpdate(HInvoke* invoke,
       codegen->GenerateReadBarrierSlow(invoke,
                                        out_or_temp,
                                        out_or_temp,
-                                       Location::RegisterLocation(base.GetCode()),
+                                       Location::CoreRegister(base.GetCode()),
                                        /*offset=*/ 0u,
-                                       /*index=*/ Location::RegisterLocation(offset.GetCode()));
+                                       /*index=*/ Location::CoreRegister(offset.GetCode()));
     }
   }
 }
@@ -4643,7 +4645,7 @@ static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke,
     // To preserve the offset value across the non-Baker read barrier slow path
     // for loading the declaring class, use a fixed callee-save register.
     constexpr int first_callee_save = CTZ(kArmCalleeSaveRefSpills);
-    locations->AddTemp(Location::RegisterLocation(first_callee_save));
+    locations->AddTemp(Location::CoreRegister(first_callee_save));
   } else {
     locations->AddTemp(Location::RequiresRegister());
   }
@@ -5009,12 +5011,12 @@ static void CreateVarHandleCompareAndSetOrExchangeLocations(HInvoke* invoke,
     if (GetExpectedVarHandleCoordinatesCount(invoke) == 0u) {  // For static fields.
       DCHECK_EQ(locations->GetTempCount(), 2u);
       DCHECK(locations->GetTemp(0u).Equals(Location::RequiresRegister()));
-      DCHECK(locations->GetTemp(1u).Equals(Location::RegisterLocation(first_callee_save)));
-      locations->SetTempAt(0u, Location::RegisterLocation(second_callee_save));
+      DCHECK(locations->GetTemp(1u).Equals(Location::CoreRegister(first_callee_save)));
+      locations->SetTempAt(0u, Location::CoreRegister(second_callee_save));
     } else {
       DCHECK_EQ(locations->GetTempCount(), 1u);
       DCHECK(locations->GetTemp(0u).Equals(Location::RequiresRegister()));
-      locations->SetTempAt(0u, Location::RegisterLocation(first_callee_save));
+      locations->SetTempAt(0u, Location::CoreRegister(first_callee_save));
     }
   }
 
@@ -5589,11 +5591,11 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
       } else {
         codegen->GenerateReadBarrierSlow(
             invoke,
-            Location::RegisterLocation(RegisterFrom(result).GetCode()),
-            Location::RegisterLocation(RegisterFrom(old_value).GetCode()),
-            Location::RegisterLocation(target.object.GetCode()),
+            Location::CoreRegister(RegisterFrom(result).GetCode()),
+            Location::CoreRegister(RegisterFrom(old_value).GetCode()),
+            Location::CoreRegister(target.object.GetCode()),
             /*offset=*/ 0u,
-            /*index=*/ Location::RegisterLocation(target.offset.GetCode()));
+            /*index=*/ Location::CoreRegister(target.offset.GetCode()));
       }
     }
   }
