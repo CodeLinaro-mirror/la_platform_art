@@ -1472,8 +1472,10 @@ class OatWriter::InitImageMethodVisitor final : public OatDexMethodVisitor {
       REQUIRES_SHARED(Locks::mutator_lock_) {
     OatDexMethodVisitor::StartClass(dex_file, class_def_index);
     // Skip classes that are not in the image.
-    TypeReference type_ref(dex_file, dex_file->GetClassDef(class_def_index).class_idx_);
-    if (!writer_->GetCompilerOptions().IsImageClass(type_ref, /*array_dim=*/ 0u)) {
+    const dex::TypeId& type_id =
+        dex_file_->GetTypeId(dex_file->GetClassDef(class_def_index).class_idx_);
+    const char* class_descriptor = dex_file->GetTypeDescriptor(type_id);
+    if (!writer_->GetCompilerOptions().IsImageClass(class_descriptor)) {
       klass_ = nullptr;
       return true;
     }
