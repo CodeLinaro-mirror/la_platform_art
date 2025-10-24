@@ -123,6 +123,7 @@ pid_t ThreadList::GetLockOwner() {
 void ThreadList::DumpNativeStacks(std::ostream& os) {
   MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
   unwindstack::AndroidLocalUnwinder unwinder;
+  unwinder.set_check_global_elf_cache(true);
   for (const auto& thread : list_) {
     os << "DUMPING THREAD " << thread->GetTid() << "\n";
     DumpNativeStack(os, unwinder, thread->GetTid(), "\t");
@@ -196,6 +197,7 @@ class DumpCheckpoint final : public Closure {
         barrier_(0, /*verify_count_on_shutdown=*/false),
         unwinder_(std::vector<std::string>{}, std::vector<std::string> {"oat", "odex"}),
         dump_native_stack_(dump_native_stack) {
+    unwinder_.set_check_global_elf_cache(true);
   }
 
   void Run(Thread* thread) override {
@@ -223,15 +225,21 @@ class DumpCheckpoint final : public Closure {
     }
   }
 
-  void WaitForThreadsToRunThroughCheckpoint(size_t threads_running_checkpoint) {
+  bool WaitForThreadsToRunThroughCheckpoint(size_t threads_running_checkpoint) {
     Thread* self = Thread::Current();
     ScopedThreadStateChange tsc(self, ThreadState::kWaitingForCheckPointsToRun);
-    bool timed_out = barrier_.Increment(self, threads_running_checkpoint, kDumpWaitTimeout);
-    if (timed_out) {
-      // Avoid a recursive abort.
-      LOG((kIsDebugBuild && (gAborting == 0)) ? ::android::base::FATAL : ::android::base::ERROR)
-          << "Unexpected time out during dump checkpoint.";
+    bool timed_out = false;
+    if (!kIsDebugBuild && gAborting == 0) {
+      barrier_.Increment(self, threads_running_checkpoint);
+    } else {
+      // Timeout when aborting. We don't want to wait for a long time when aborting.
+      timed_out = barrier_.Increment(self, threads_running_checkpoint, kDumpWaitTimeout);
+      if (timed_out) {
+        LOG(gAborting == 0 ? ::android::base::FATAL : ::android::base::ERROR)
+            << "Unexpected time out during dump checkpoint.";
+      }
     }
+    return timed_out;
   }
 
  private:
@@ -256,18 +264,24 @@ void ThreadList::Dump(std::ostream& os, bool dump_native_stack) {
   if (self != nullptr) {
     // Dump() can be called in any mutator lock state.
     bool mutator_lock_held = Locks::mutator_lock_->IsSharedHeld(self);
-    DumpCheckpoint checkpoint(dump_native_stack);
+    // Use a regular pointer and clean up only if waiting for checkpoints was successful. On a
+    // timeout, it's better to leak the memory than causing memory corruption issues.
+    DumpCheckpoint* checkpoint = new DumpCheckpoint(dump_native_stack);
     // Acquire mutator lock separately for each thread, to avoid long runnable code sequence
     // without suspend checks.
     size_t threads_running_checkpoint =
-        RunCheckpoint(&checkpoint,
+        RunCheckpoint(checkpoint,
                       nullptr,
                       true,
                       /* acquire_mutator_lock= */ !mutator_lock_held);
+    bool time_out = false;
     if (threads_running_checkpoint != 0) {
-      checkpoint.WaitForThreadsToRunThroughCheckpoint(threads_running_checkpoint);
+      time_out = checkpoint->WaitForThreadsToRunThroughCheckpoint(threads_running_checkpoint);
     }
-    checkpoint.Dump(self, os);
+    checkpoint->Dump(self, os);
+    if (!time_out) {
+      delete checkpoint;
+    }
   } else {
     DumpUnattachedThreads(os, dump_native_stack);
   }
@@ -825,6 +839,8 @@ std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barr
   static constexpr uint64_t kTracingWaitNSecs = 7'200'000'000'000ull;  // wait a bit < 2 hours;
 
   // Long wait; gather information in case of timeout.
+  static constexpr const char* kMainDiskName = "sda";
+  ConciseDiskStats firstDiskStats(collect_state ? kMainDiskName : nullptr);
   std::string sampled_state = collect_state ? GetOsThreadStatQuick(t) : "";
   if (collect_state && GetStateFromStatString(sampled_state) == 't') {
     LOG(WARNING) << "Thread suspension nearly timed out due to Tracing stop (debugger attached?)";
@@ -859,11 +875,31 @@ std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barr
   uint64_t total_wait_time = attempt_of_4 == 0 ?
                                  final_wait_time :
                                  4 * final_wait_time * avg_wait_multiplier / wait_multiplier;
-  return collect_state ? "Target states: [" + sampled_state + ", " + GetOsThreadStatQuick(t) + "]" +
-                             (cur_val == 0 ? "(barrier now passed)" : "") +
-                             " Final wait time: " + PrettyDuration(final_wait_time) +
-                             "; appr. total wait time: " + PrettyDuration(total_wait_time) :
-                         "";
+  std::string io_state = "";
+  std::string current_state = GetOsThreadStatQuick(t);
+  bool include_io =
+      GetStateFromStatString(current_state) == 'D' && GetStateFromStatString(sampled_state) == 'D';
+  if (include_io) {
+    std::string pressure = GetOSPressureIOSummary();
+    if (!pressure.empty()) {
+      io_state += "pressure/io: " + pressure + "; ";
+    }
+    if (!firstDiskStats.IsEmpty()) {
+      ConciseDiskStats secondDiskStats(kMainDiskName);
+      io_state += std::string("diskstats(") + kMainDiskName +
+                  "): " + secondDiskStats.SummarizeDiff(firstDiskStats) + "; ";
+    }
+    if (io_state.empty()) {
+      include_io = false;
+    }
+  }
+  // In the uninterruptible sleep case, we include one thread state + io information.
+  // In all other cases, we include both thread states.
+  return collect_state ? "/proc/.../stat: " + (include_io ? "" : sampled_state + "->") +
+                             current_state + "; " + (cur_val == 0 ? "(barrier now passed) " : "") +
+                             io_state + "Final wait time: " + PrettyDuration(final_wait_time) +
+                             "; appr. total wait time: " + PrettyDuration(total_wait_time)
+                       : "";
 }
 
 void ThreadList::SuspendAll(const char* cause, bool long_suspend) {
@@ -1040,11 +1076,10 @@ void ThreadList::SuspendAllInternal(Thread* self, SuspendReason reason) {
         culprit->GetThreadName(name);
         oss << "Info for " << name << ": ";
         std::string thr_descr =
-            StringPrintf("state&flags: 0x%x, Java/native priority: %d/%d, barrier value: %d, ",
+            StringPrintf("state&flags: 0x%x, Java/native priority: %d/%d, ",
                          culprit->GetStateAndFlags(std::memory_order_relaxed).GetValue(),
                          culprit->GetNativePriority(),
-                         getpriority(PRIO_PROCESS /* really thread */, culprit->GetTid()),
-                         pending_threads.load());
+                         getpriority(PRIO_PROCESS /* really thread */, culprit->GetTid()));
         oss << thr_descr << result.value();
         culprit->AbortInThis("SuspendAll timeout; " + oss.str());
       }
@@ -1244,24 +1279,16 @@ bool ThreadList::SuspendThread(Thread* self,
     }
     std::string name;
     thread->GetThreadName(name);
-    WrappedSuspend1Barrier* first_barrier;
-    {
-      MutexLock suspend_count_mu(self, *Locks::thread_suspend_count_lock_);
-      first_barrier = thread->tlsPtr_.active_suspend1_barriers;
-    }
     // 'thread' should still have a suspend request pending, and hence stick around. Try to abort
     // there, since its stack trace is much more interesting than ours.
     std::string message = StringPrintf(
         "%s timed out: %s: state&flags: 0x%x, Java/native priority: %d/%d,"
-        " barriers: %p, ours: %p, barrier value: %d, nsusps: %d, ncheckpts: %d, thread_info: %s",
+        " nsusps: %d, ncheckpts: %d, culprit info: %s",
         func_name,
         name.c_str(),
         thread->GetStateAndFlags(std::memory_order_relaxed).GetValue(),
         thread->GetNativePriority(),
         getpriority(PRIO_PROCESS /* really thread */, thread->GetTid()),
-        first_barrier,
-        &wrapped_barrier,
-        wrapped_barrier.barrier_.load(),
         thread->suspended_count_ - suspended_count,
         thread->checkpoint_count_ - checkpoint_count,
         failure_info.value().c_str());

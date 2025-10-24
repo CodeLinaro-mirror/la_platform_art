@@ -70,7 +70,7 @@ static constexpr int kC2ConditionMask = 0x400;
 static RegisterSet OneRegInReferenceOutSaveEverythingCallerSaves() {
   // Custom calling convention: RAX serves as both input and output.
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(Location::RegisterLocation(RAX));
+  caller_saves.AddCoreRegister(RAX);
   return caller_saves;
 }
 
@@ -1591,7 +1591,6 @@ static constexpr bool kIsIntrinsicUnimplemented[] = {
 
 }  // namespace detail
 
-static constexpr int kNumberOfCpuRegisterPairs = 0;
 // Use a fake return address register to mimic Quick.
 static constexpr Register kFakeReturnRegister = Register(kLastCpuRegister + 1);
 CodeGeneratorX86_64::CodeGeneratorX86_64(HGraph* graph,
@@ -1600,10 +1599,7 @@ CodeGeneratorX86_64::CodeGeneratorX86_64(HGraph* graph,
     : CodeGenerator(graph,
                     kNumberOfCpuRegisters,
                     kNumberOfFloatRegisters,
-                    kNumberOfCpuRegisterPairs,
-                    ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves))
-                        | (1 << kFakeReturnRegister),
-                    ComputeRegisterMask(kFpuCalleeSaves, arraysize(kFpuCalleeSaves)),
+                    ComputeCalleeSaves(),
                     compiler_options,
                     stats,
                     ArrayRef<const bool>(detail::kIsIntrinsicUnimplemented)),
@@ -1631,8 +1627,8 @@ CodeGeneratorX86_64::CodeGeneratorX86_64(HGraph* graph,
       jit_class_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       jit_method_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       fixups_to_jump_tables_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
-  SetupBlockedRegisters();
-  AddAllocatedRegister(Location::RegisterLocation(kFakeReturnRegister));
+  blocked_registers_ = ComputeBlockedRegisters();
+  AddAllocatedCoreRegister(kFakeReturnRegister);
 }
 
 InstructionCodeGeneratorX86_64::InstructionCodeGeneratorX86_64(HGraph* graph,
@@ -1641,10 +1637,20 @@ InstructionCodeGeneratorX86_64::InstructionCodeGeneratorX86_64(HGraph* graph,
         assembler_(codegen->GetAssembler()),
         codegen_(codegen) {}
 
-inline void CodeGeneratorX86_64::SetupBlockedRegisters() {
+inline RegisterSet CodeGeneratorX86_64::ComputeCalleeSaves() {
+  RegisterSet callee_saves = RegisterSet::Empty();
+  callee_saves.AddCoreRegisterSet(
+      ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves)) |
+      (1 << kFakeReturnRegister));
+  callee_saves.AddFpuRegisterSet(ComputeRegisterMask(kFpuCalleeSaves, arraysize(kFpuCalleeSaves)));
+  return callee_saves;
+}
+
+inline RegisterSet CodeGeneratorX86_64::ComputeBlockedRegisters() {
+  RegisterSet blocked_registers = RegisterSet::Empty();
   // Stack register is always reserved. Block the register used as TMP.
-  blocked_core_registers_ = (1u << RSP) | (1u << TMP);
-  DCHECK_EQ(blocked_fpu_registers_, 0u);
+  blocked_registers.AddCoreRegisterSet((1u << RSP) | (1u << TMP));
+  return blocked_registers;
 }
 
 static dwarf::Reg DWARFReg(Register reg) {
@@ -1896,7 +1902,7 @@ void CodeGeneratorX86_64::GenerateFrameEntry() {
     size_t xmm_spill_slot_size = GetCalleePreservedFPWidth();
 
     for (int i = arraysize(kFpuCalleeSaves) - 1; i >= 0; --i) {
-      if (allocated_registers_.ContainsFloatingPointRegister(kFpuCalleeSaves[i])) {
+      if (allocated_registers_.ContainsFpuRegister(kFpuCalleeSaves[i])) {
         int offset = xmm_spill_location + (xmm_spill_slot_size * i);
         __ movsd(Address(CpuRegister(RSP), offset), XmmRegister(kFpuCalleeSaves[i]));
         __ cfi().RelOffset(DWARFReg(kFpuCalleeSaves[i]), offset);
@@ -1928,7 +1934,7 @@ void CodeGeneratorX86_64::GenerateFrameExit() {
     uint32_t xmm_spill_location = GetFpuSpillStart();
     size_t xmm_spill_slot_size = GetCalleePreservedFPWidth();
     for (size_t i = 0; i < arraysize(kFpuCalleeSaves); ++i) {
-      if (allocated_registers_.ContainsFloatingPointRegister(kFpuCalleeSaves[i])) {
+      if (allocated_registers_.ContainsFpuRegister(kFpuCalleeSaves[i])) {
         int offset = xmm_spill_location + (xmm_spill_slot_size * i);
         __ movsd(XmmRegister(kFpuCalleeSaves[i]), Address(CpuRegister(RSP), offset));
         __ cfi().Restore(DWARFReg(kFpuCalleeSaves[i]));
@@ -2404,7 +2410,7 @@ void LocationsBuilderX86_64::VisitDeoptimize(HDeoptimize* deoptimize) {
       LocationSummary::Create(allocator_, deoptimize, LocationSummary::kCallOnSlowPath);
   InvokeRuntimeCallingConvention calling_convention;
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0));
   locations->SetCustomSlowPathCallerSaves(caller_saves);
   if (IsBooleanValueOrMaterializedCondition(deoptimize->InputAt(0))) {
     locations->SetInAt(0, Location::Any());
@@ -6173,8 +6179,8 @@ void InstructionCodeGeneratorX86_64::VisitArrayLength(HArrayLength* instruction)
 void LocationsBuilderX86_64::VisitBoundsCheck(HBoundsCheck* instruction) {
   RegisterSet caller_saves = RegisterSet::Empty();
   InvokeRuntimeCallingConvention calling_convention;
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(1)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(1));
   LocationSummary* locations = codegen_->CreateThrowingSlowPathLocations(instruction, caller_saves);
   locations->SetInAt(0, Location::RegisterOrConstant(instruction->InputAt(0)));
   HInstruction* length = instruction->InputAt(1);

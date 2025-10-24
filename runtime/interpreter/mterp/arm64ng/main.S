@@ -299,27 +299,22 @@ END \name
     str    xPC, [xREFS, #-16]
 .endm
 
-.macro BRANCH
+// Emit a branch with the offset in code units provided in `wINST`.
+//
+// Specify the `dispatch` label if you want to emit shorter code by jumping to an existing opcode
+// dispatch. By default, we emit the opcode dispatch explicitly as part of the `BRANCH` code.
+.macro BRANCH dispatch=none
     add     xPC, xPC, wINST, sxtw #1    // update xPC
     // Update method counter and do a suspend check if the branch is negative or zero.
     cmp wINST, #0
-    b.le 2f
-1:
+    b.le NterpHotnessCheck
     FETCH wINST, 0                      // load wINST
+    .ifc \dispatch, none
     GET_INST_OPCODE ip                  // extract opcode from wINST
     GOTO_OPCODE ip                      // jump to next instruction
-2:
-    ldr x0, [sp]
-    ldrh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-    // If the counter is at zero, handle this in the runtime.
-    cbz w2, NterpHandleHotnessOverflow
-    add x2, x2, #-1
-    strh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    DO_SUSPEND_CHECK continue_label=1b
-    b 1b
+    .else
+    b \dispatch
+    .endif
 .endm
 
 // Uses x12, x13, and x14 as temporaries.
@@ -1764,9 +1759,13 @@ NterpCommonInvokeInstanceRange:
     COMMON_INVOKE_RANGE suffix="invokeInstance"
 
 NterpCommonInvokeInterface:
+    ldr x2, [x2, #MIRROR_CLASS_IMT_PTR_OFFSET_64]
+    ldr x0, [x2, w3, uxtw #3]
     COMMON_INVOKE_NON_RANGE is_interface=1, suffix="invokeInterface"
 
 NterpCommonInvokeInterfaceRange:
+    ldr x2, [x2, #MIRROR_CLASS_IMT_PTR_OFFSET_64]
+    ldr x0, [x2, w3, uxtw #3]
     COMMON_INVOKE_RANGE is_interface=1, suffix="invokeInterface"
 
 NterpCommonInvokePolymorphic:
@@ -1787,18 +1786,31 @@ NterpHandleStringInit:
 NterpHandleStringInitRange:
    COMMON_INVOKE_RANGE is_string_init=1, suffix="stringInit"
 
-NterpHandleHotnessOverflow:
-    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=1f, if_not_hot=5f
+NterpHotnessCheck:
+    ldr x0, [sp]
+    ldrh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+#if (NTERP_HOTNESS_VALUE != 0)
+#error Expected 0 for hotness value
+#endif
+    // If the counter is at zero, handle this in the runtime.
+    cbz w2, 3f
+    add x2, x2, #-1
+    strh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
 1:
-    mov x1, xPC
-    mov x2, xFP
-    bl nterp_hot_method
-    cbnz x0, 3f
+    DO_SUSPEND_CHECK continue_label=2f
 2:
     FETCH wINST, 0                      // load wINST
     GET_INST_OPCODE ip                  // extract opcode from wINST
     GOTO_OPCODE ip                      // jump to next instruction
+
 3:
+    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=4f, if_not_hot=1b
+4:
+    mov x1, xPC
+    mov x2, xFP
+    bl nterp_hot_method
+    cbz x0, 2b
+
     // Drop the current frame.
     ldr ip, [xREFS, #-8]
     mov sp, ip
@@ -1838,11 +1850,11 @@ NterpHandleHotnessOverflow:
     sub sp, sp, x1
 
     add x2, x0, #OSR_DATA_MEMORY
-4:
+5:
     sub x1, x1, #8
     ldr ip, [x2, x1]
     str ip, [sp, x1]
-    cbnz x1, 4b
+    cbnz x1, 5b
 
     // Fetch the native PC to jump to and save it in a callee-save register.
     ldr xFP, [x0, #OSR_DATA_NATIVE_PC]
@@ -1852,9 +1864,6 @@ NterpHandleHotnessOverflow:
 
     // Jump to the compiled code.
     br xFP
-5:
-    DO_SUSPEND_CHECK continue_label=2b
-    b 2b
 
 // This is the logical end of ExecuteNterpImpl, where the frame info applies.
 // EndExecuteNterpImpl includes the methods below as we want the runtime to

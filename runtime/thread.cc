@@ -71,12 +71,12 @@
 #include "gc_root.h"
 #include "handle_scope-inl.h"
 #include "handle_scope.h"
-#include "indirect_reference_table-inl.h"
 #include "instrumentation.h"
 #include "intern_table.h"
 #include "interpreter/interpreter.h"
 #include "interpreter/shadow_frame-inl.h"
 #include "java_frame_root_info.h"
+#include "jni/indirect_reference_table-inl.h"
 #include "jni/java_vm_ext.h"
 #include "jni/jni_internal.h"
 #include "mirror/class-alloc-inl.h"
@@ -2498,6 +2498,7 @@ Thread::DumpOrder Thread::DumpStack(std::ostream& os,
                                     bool dump_native_stack,
                                     bool force_dump_stack) const {
   unwindstack::AndroidLocalUnwinder unwinder;
+  unwinder.set_check_global_elf_cache(true);
   return DumpStack(os, unwinder, dump_native_stack, force_dump_stack);
 }
 

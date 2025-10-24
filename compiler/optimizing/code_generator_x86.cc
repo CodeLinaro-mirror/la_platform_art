@@ -68,7 +68,7 @@ static constexpr int32_t kFloatNaN = INT32_C(0x7FC00000);
 static RegisterSet OneRegInReferenceOutSaveEverythingCallerSaves() {
   InvokeRuntimeCallingConvention calling_convention;
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0));
   // TODO: Add GetReturnLocation() to the calling convention so that we can DCHECK()
   // that the kPrimNot result register is the same as the first argument register.
   return caller_saves;
@@ -1143,10 +1143,7 @@ CodeGeneratorX86::CodeGeneratorX86(HGraph* graph,
     : CodeGenerator(graph,
                     kNumberOfCpuRegisters,
                     kNumberOfXmmRegisters,
-                    kNumberOfRegisterPairs,
-                    ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves)) |
-                        (1 << kFakeReturnRegister),
-                    0u,
+                    ComputeCalleeSaves(),
                     compiler_options,
                     stats,
                     ArrayRef<const bool>(detail::kIsIntrinsicUnimplemented)),
@@ -1177,15 +1174,24 @@ CodeGeneratorX86::CodeGeneratorX86(HGraph* graph,
   // `long`s require register pairs.
   data_types_requiring_register_pair_ = 1u << enum_cast<>(DataType::Type::kInt64);
 
-  SetupBlockedRegisters();
+  blocked_registers_ = ComputeBlockedRegisters();
   // Use a fake return address register to mimic Quick.
-  AddAllocatedRegister(Location::RegisterLocation(kFakeReturnRegister));
+  AddAllocatedCoreRegister(kFakeReturnRegister);
 }
 
-inline void CodeGeneratorX86::SetupBlockedRegisters() {
+inline RegisterSet CodeGeneratorX86::ComputeCalleeSaves() {
+  RegisterSet callee_saves = RegisterSet::Empty();
+  callee_saves.AddCoreRegisterSet(
+      ComputeRegisterMask(kCoreCalleeSaves, arraysize(kCoreCalleeSaves)) |
+      (1 << kFakeReturnRegister));
+  return callee_saves;
+}
+
+inline RegisterSet CodeGeneratorX86::ComputeBlockedRegisters() {
+  RegisterSet blocked_registers = RegisterSet::Empty();
   // Stack register is always reserved.
-  blocked_core_registers_ = 1u << ESP;
-  DCHECK_EQ(blocked_fpu_registers_, 0u);
+  blocked_registers.AddCoreRegister(ESP);
+  return blocked_registers;
 }
 
 InstructionCodeGeneratorX86::InstructionCodeGeneratorX86(HGraph* graph, CodeGeneratorX86* codegen)
@@ -2279,7 +2285,7 @@ void LocationsBuilderX86::VisitDeoptimize(HDeoptimize* deoptimize) {
       LocationSummary::Create(allocator_, deoptimize, LocationSummary::kCallOnSlowPath);
   InvokeRuntimeCallingConvention calling_convention;
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0));
   locations->SetCustomSlowPathCallerSaves(caller_saves);
   if (IsBooleanValueOrMaterializedCondition(deoptimize->InputAt(0))) {
     locations->SetInAt(0, Location::Any());
@@ -6879,8 +6885,8 @@ void InstructionCodeGeneratorX86::VisitArrayLength(HArrayLength* instruction) {
 void LocationsBuilderX86::VisitBoundsCheck(HBoundsCheck* instruction) {
   RegisterSet caller_saves = RegisterSet::Empty();
   InvokeRuntimeCallingConvention calling_convention;
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
-  caller_saves.Add(Location::RegisterLocation(calling_convention.GetRegisterAt(1)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(1));
   LocationSummary* locations = codegen_->CreateThrowingSlowPathLocations(instruction, caller_saves);
   locations->SetInAt(0, Location::RegisterOrConstant(instruction->InputAt(0)));
   HInstruction* length = instruction->InputAt(1);

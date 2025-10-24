@@ -937,6 +937,7 @@ cc_defaults {
         "667-jit-jni-stub/jit_jni_stub_test.cc",
         "674-hiddenapi/core.cc",
         "692-vdex-inmem-loader/vdex_inmem_loader.cc",
+        "712-varhandle-invocations/jni_direct_buffer.cc",
         "720-thread-priority/thread_priority.cc",
         "800-smali/jni.cc",
         "817-hiddenapi/libarttest_api.cc",
@@ -1416,11 +1417,35 @@ art_cc_test {
     test_config: "art-gtests-target-chroot.xml",
 }
 
+// Convert ART apex to zip format so that it can be easily consumed in tradefed.
+// TODO: We should create the zip directly from the needed files and remove testing apex.
+cc_genrule {
+    name: "art-test-target-apex",
+    srcs: [
+        ":com.android.art.testing",
+    ],
+    tools: [
+        "deapexer",
+        "debugfs_static",
+        "fsck.erofs",
+        "soong_zip",
+    ],
+    cmd: "OUTPUT_DIR=$(genDir)/extracted && " +
+        "mkdir -p $$OUTPUT_DIR && " +
+        "$(location deapexer) " +
+        "  --debugfs_path $(location debugfs_static) " +
+        "  --fsckerofs_path $(location fsck.erofs) " +
+        "  extract $(in) $$OUTPUT_DIR && " +
+        "$(location soong_zip) -o $(out) -P apex/com.android.art -C $$OUTPUT_DIR -D $$OUTPUT_DIR",
+    out: ["art-test-target-apex.zip"],
+}
+
 art_cc_test {
     name: "ArtTest",
     data: [
         // We need the ART testing apex, which contains debug binaries and other utilities.
         ":com.android.art.testing",
+        ":art-test-target-apex",
         // Archive which contains all run-test data and test-specific bash scripts to run them.
         ":art-test-target-fg",
     ],
@@ -1458,6 +1483,7 @@ filegroup {
         ":art-gtest-jars-ImageLayoutB",
         ":art-gtest-jars-IMTA",
         ":art-gtest-jars-IMTB",
+        ":art-gtest-jars-InlinedString",
         ":art-gtest-jars-Instrumentation",
         ":art-gtest-jars-Interfaces",
         ":art-gtest-jars-Lookup",
@@ -1634,6 +1660,13 @@ java_library {
 java_library {
     name: "art-gtest-jars-Instrumentation",
     srcs: ["Instrumentation/**/*.java"],
+    defaults: ["art-gtest-jars-defaults"],
+}
+
+java_library {
+    name: "art-gtest-jars-InlinedString",
+    srcs: ["InlinedString/**/*.java"],
+    libs: ["art-gtest-jars-StringLiterals"],
     defaults: ["art-gtest-jars-defaults"],
 }
 

@@ -999,6 +999,8 @@
           "864-catch",
           "864-move-object",
           "865-fallthrough",
+          "866-fast",
+          "867-backwards-catch",
           "900-hello-plugin",
           "901-hello-ti-agent",
           "903-hello-tagging",
@@ -1069,7 +1071,9 @@
           "2276-const-method-type-gc-cleanup",
           "2281-method-handle-invoke-static-class-unload",
           "2286-invokevirtual-invokeexact",
-          "2287-no-temp-component-class"
+          "2287-no-temp-component-class",
+          "2288-checker-smali-string-builder-wrong-init",
+          "2289-smali-invalid-rti"
         ],
         "variant": "jvm",
         "bug": "b/73888836",
@@ -1149,6 +1153,7 @@
                   "734-duplicate-fields",
                   "735-interface-clone",
                   "736-interface-super-Object",
+                  "738-jit-const-string",
                   "808-checker-invoke-super",
                   "809-checker-invoke-super-bss",
                   "810-checker-invoke-super-default",
