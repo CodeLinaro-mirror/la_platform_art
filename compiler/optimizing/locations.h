@@ -24,8 +24,10 @@
 #include "base/bit_field.h"
 #include "base/bit_utils.h"
 #include "base/bit_vector.h"
+#include "base/casts.h"
 #include "base/macros.h"
 #include "base/value_object.h"
+#include "physical_register_type.h"
 #include "register_set.h"
 
 namespace art HIDDEN {
@@ -82,6 +84,13 @@ class Location : public ValueObject {
     // We do not use the value 13 because it conflicts with kLocationConstantMask.
     kDoNotUse13 = 13,
   };
+
+  static constexpr PhysicalRegisterType RegisterTypeForKind(Kind kind) {
+    // The values in the `Kind` enumeration were selected in a way that makes
+    // conversions between the `Kind` and `PhysicalRegisterType` simple.
+    // The correctness is ensured by `static_assert()`s in `GetRegisterType()`.
+    return enum_cast<PhysicalRegisterType>((kind - kCoreRegister) & 3u);
+  }
 
   constexpr Location() : ValueObject(), value_(kInvalid) {
     // Verify that non-constant location kinds do not interfere with kConstant.
@@ -176,26 +185,30 @@ class Location : public ValueObject {
     return GetKind() == kFpuRegisterPair;
   }
 
+  bool IsRegister() const {
+    return IsCoreRegister() || IsFpuRegister() || IsVecRegister();
+  }
+
+  bool IsRegisterPair() const {
+    return IsCoreRegisterPair() || IsFpuRegisterPair();
+  }
+
   bool IsRegisterKind() const {
-    return IsCoreRegister() ||
-           IsFpuRegister() ||
-           IsVecRegister() ||
-           IsCoreRegisterPair() ||
-           IsFpuRegisterPair();
+    return IsRegister() || IsRegisterPair();
   }
 
   int reg() const {
-    DCHECK(IsCoreRegister() || IsFpuRegister() || IsVecRegister());
+    DCHECK(IsRegister());
     return GetPayload();
   }
 
   int low() const {
-    DCHECK(IsPair());
+    DCHECK(IsRegisterPair());
     return GetPayload() >> 16;
   }
 
   int high() const {
-    DCHECK(IsPair());
+    DCHECK(IsRegisterPair());
     return GetPayload() & 0xFFFF;
   }
 
@@ -241,10 +254,6 @@ class Location : public ValueObject {
     return static_cast<T>(high());
   }
 
-  bool IsPair() const {
-    return IsCoreRegisterPair() || IsFpuRegisterPair();
-  }
-
   Location ToLow() const {
     if (IsCoreRegisterPair()) {
       return CoreRegister(low());
@@ -265,6 +274,25 @@ class Location : public ValueObject {
       DCHECK(IsDoubleStackSlot());
       return StackSlot(GetHighStackIndex(4));
     }
+  }
+
+  uint32_t GetRegisterSet() const {
+    if (IsRegister()) {
+      return 1u << reg();
+    } else {
+      DCHECK(IsRegisterPair());
+      return (1u << low()) | (1u << high());
+    }
+  }
+
+  PhysicalRegisterType GetRegisterType() const {
+    DCHECK(IsRegisterKind());
+    static_assert(RegisterTypeForKind(kCoreRegister) == PhysicalRegisterType::kCoreRegister);
+    static_assert(RegisterTypeForKind(kFpuRegister) == PhysicalRegisterType::kFpuRegister);
+    static_assert(RegisterTypeForKind(kVecRegister) == PhysicalRegisterType::kVectorRegister);
+    static_assert(RegisterTypeForKind(kCoreRegisterPair) == PhysicalRegisterType::kCoreRegister);
+    static_assert(RegisterTypeForKind(kFpuRegisterPair) == PhysicalRegisterType::kFpuRegister);
+    return RegisterTypeForKind(GetKind());
   }
 
   static uintptr_t EncodeStackIndex(intptr_t stack_index) {
@@ -345,7 +373,7 @@ class Location : public ValueObject {
   bool Contains(Location other) const {
     if (Equals(other)) {
       return true;
-    } else if (IsPair() || IsDoubleStackSlot()) {
+    } else if (IsRegisterPair() || IsDoubleStackSlot()) {
       return ToLow().Equals(other) || ToHigh().Equals(other);
     }
     return false;
@@ -357,7 +385,8 @@ class Location : public ValueObject {
     if (kIsDebugBuild && !overlap) {
       // Note: These are also overlapping cases. But we are not able to handle them in
       // ParallelMoveResolverWithSwap. Make sure that we do not meet such case with our compiler.
-      if ((IsPair() && other.IsPair()) || (IsDoubleStackSlot() && other.IsDoubleStackSlot())) {
+      if ((IsRegisterPair() && other.IsRegisterPair()) ||
+          (IsDoubleStackSlot() && other.IsDoubleStackSlot())) {
         DCHECK(!Contains(other.ToLow()));
         DCHECK(!Contains(other.ToHigh()));
       }
@@ -389,7 +418,7 @@ class Location : public ValueObject {
   // Unallocated locations.
   enum Policy {
     kAny,
-    kRequiresRegister,
+    kRequiresCoreRegister,
     kRequiresFpuRegister,
     kRequiresVecRegister,
     kSameAsFirstInput,
@@ -408,8 +437,8 @@ class Location : public ValueObject {
     return UnallocatedLocation(kAny);
   }
 
-  static Location RequiresRegister() {
-    return UnallocatedLocation(kRequiresRegister);
+  static Location RequiresCoreRegister() {
+    return UnallocatedLocation(kRequiresCoreRegister);
   }
 
   static Location RequiresFpuRegister() {
@@ -438,7 +467,7 @@ class Location : public ValueObject {
   }
 
   bool RequiresRegisterKind() const {
-    return GetPolicy() == kRequiresRegister ||
+    return GetPolicy() == kRequiresCoreRegister ||
            GetPolicy() == kRequiresFpuRegister ||
            GetPolicy() == kRequiresVecRegister;
   }
@@ -567,7 +596,7 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
 
   void AddRegisterTemps(size_t count) {
     for (size_t i = 0; i < count; ++i) {
-      AddTemp(Location::RequiresRegister());
+      AddTemp(Location::RequiresCoreRegister());
     }
   }
 
@@ -686,7 +715,7 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
     Location input = Inputs()[input_index];
     return input.IsCoreRegister()
         || input.IsFpuRegister()
-        || input.IsPair()
+        || input.IsRegisterPair()
         || input.IsStackSlot()
         || input.IsDoubleStackSlot();
   }
