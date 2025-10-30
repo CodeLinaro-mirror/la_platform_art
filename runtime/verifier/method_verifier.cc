@@ -913,6 +913,17 @@ class MethodVerifierImpl : public ::art::verifier::MethodVerifier {
         << ", target index " << target_index;
   }
 
+  NO_INLINE void FailIncompatibleArrayType(Instruction::Code opcode, const RegType& array_type)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "array type " << array_type
+        << " incompatible with " << opcode;
+  }
+
+  NO_INLINE void FailForVoidOrPrimitiveType(Instruction::Code opcode, dex::TypeIndex type_idx) {
+    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on unexpected class "
+        << dex_file_->PrettyType(type_idx);
+  }
+
   NO_INLINE void FailPrimitivePut(uint32_t vregA, RegType::Kind target_kind)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     bool wide = (target_kind == RegType::Kind::kLongLo || target_kind == RegType::Kind::kDoubleLo);
@@ -3189,31 +3200,16 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
       const bool is_checkcast = (inst->Opcode() == Instruction::CHECK_CAST);
       const dex::TypeIndex type_idx((is_checkcast) ? inst->VRegB_21c() : inst->VRegC_22c());
       const RegType& res_type = ResolveClass<CheckAccess::kYes>(type_idx);
-      if (res_type.IsConflict()) {
-        // If this is a primitive type, fail HARD.
-        ObjPtr<mirror::Class> klass = GetClassLinker()->LookupResolvedType(
-            type_idx, dex_cache_.Get(), class_loader_.Get());
-        if (klass != nullptr && klass->IsPrimitive()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "using primitive type "
-              << dex_file_->GetTypeDescriptorView(type_idx) << " in instanceof in "
-              << GetDeclaringClass();
-          return false;
-        }
-
-        DCHECK_NE(failures_.size(), 0U);
-        if (!is_checkcast) {
-          work_line_->SetRegisterType(inst->VRegA_22c(inst_data), kBoolean);
-        }
-        break;  // bad class
+      if (!res_type.IsNonZeroReferenceTypes()) {
+        // `void` (reported as conflict), or primitive type.
+        FailForVoidOrPrimitiveType(opcode, type_idx);
+        return false;
       }
       // TODO: check Compiler::CanAccessTypeWithoutChecks returns false when res_type is unresolved
       uint32_t orig_type_reg =
           (is_checkcast) ? inst->VRegA_21c(inst_data) : inst->VRegB_22c(inst_data);
       const RegType& orig_type = work_line_->GetRegisterType(this, orig_type_reg);
-      if (!res_type.IsNonZeroReferenceTypes()) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on unexpected class " << res_type;
-        return false;
-      } else if (!orig_type.IsReferenceTypes()) {
+      if (!orig_type.IsReferenceTypes()) {
         Fail(VERIFY_ERROR_BAD_CLASS_HARD) << opcode << " on non-reference in v" << orig_type_reg;
         return false;
       } else if (orig_type.IsUninitializedTypes()) {
@@ -5190,8 +5186,7 @@ void MethodVerifierImpl::VerifyAGet(const Instruction* inst,
     } else if (array_type.IsUnresolvedMergedReference()) {
       // Unresolved array types must be reference array types.
       if (is_primitive) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "reference array type " << array_type
-                    << " source for category 1 aget";
+        FailIncompatibleArrayType(inst->Opcode(), array_type);
       } else {
         Fail(VERIFY_ERROR_NO_CLASS) << "cannot verify aget for " << array_type
             << " because of missing class";
@@ -5202,16 +5197,11 @@ void MethodVerifierImpl::VerifyAGet(const Instruction* inst,
       /* verify the class */
       const RegType& component_type = reg_types_.GetComponentType(array_type);
       if (!component_type.IsReferenceTypes() && !is_primitive) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "primitive array type " << array_type
-            << " source for aget-object";
-      } else if (component_type.IsNonZeroReferenceTypes() && is_primitive) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "reference array type " << array_type
-            << " source for category 1 aget";
+        FailIncompatibleArrayType(inst->Opcode(), array_type);
       } else if (is_primitive && !insn_type.Equals(component_type) &&
                  !((insn_type.IsInteger() && component_type.IsFloat()) ||
                  (insn_type.IsLongLo() && component_type.IsDoubleLo()))) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "array type " << array_type
-            << " incompatible with aget of type " << insn_type;
+        FailIncompatibleArrayType(inst->Opcode(), array_type);
       } else {
         // Use knowledge of the field type which is stronger than the type inferred from the
         // instruction, which can't differentiate object types and ints from floats, longs from
@@ -5297,8 +5287,7 @@ void MethodVerifierImpl::VerifyAPut(const Instruction* inst,
     } else if (array_type.IsUnresolvedMergedReference()) {
       // Unresolved array types must be reference array types.
       if (is_primitive) {
-        Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "aput insn has type '" << insn_type
-                                          << "' but unresolved type '" << array_type << "'";
+        FailIncompatibleArrayType(inst->Opcode(), array_type);
       } else {
         Fail(VERIFY_ERROR_NO_CLASS) << "cannot verify aput for " << array_type
                                     << " because of missing class";
@@ -5323,15 +5312,13 @@ void MethodVerifierImpl::VerifyAPut(const Instruction* inst,
           // This is a global failure rather than a class change failure as the instructions and
           // the descriptors for the type should have been consistent within the same file at
           // compile time.
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "aput insn has type '" << insn_type
-              << "' but expected type '" << component_type << "'";
+          FailIncompatibleArrayType(inst->Opcode(), array_type);
           return;
         }
         VerifyPrimitivePut(component_type.GetKind(), vregA);
       } else {
         if (!component_type.IsReferenceTypes()) {
-          Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "primitive array type " << array_type
-              << " source for aput-object";
+          FailIncompatibleArrayType(inst->Opcode(), array_type);
         } else {
           // The instruction agrees with the type of array, confirm the value to be stored does too
           // Note: we use the instruction type (rather than the component type) for aput-object as
