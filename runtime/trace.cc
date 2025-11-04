@@ -665,11 +665,18 @@ void Trace::Start(std::unique_ptr<File>&& trace_file_in,
     return;
   }
 
-  if ((TraceFlag::kTraceLowOverhead & flags) && !ShouldEnableProfileCode()) {
-    // Low-overhead tracing requested but the feature isn't enabled.
-    LOG(ERROR) << "Feature not supported. Please build with ALLOW_PROFILE_CODE and enable "
-                "com.android.art.rw.flags.enable_profile_code_rw";
-    return;
+  if ((TraceFlag::kTraceLowOverhead & flags)) {
+    if (!ShouldEnableProfileCode()) {
+      // Low-overhead tracing requested but the feature isn't enabled.
+      LOG(ERROR) << "Feature not supported. Please build with ALLOW_PROFILE_CODE and enable "
+                 "com.android.art.rw.flags.enable_profile_code_rw";
+      return;
+    }
+
+    if (flags & Trace::TraceFlag::kTraceClockSourceThreadCpu) {
+      LOG(ERROR) << "ThreadCpu time is not supported with low-overhead tracing";
+      return;
+    }
   }
 
   // Initialize the frequency of timestamp counter updates here. This is needed
@@ -1169,8 +1176,11 @@ void TraceWriter::FinishTracing(int flags, bool flush_entries) {
       DCHECK(trace_output_mode_ == TraceOutputMode::kDDMS);
       std::vector<uint8_t> data;
       data.resize(summary.length() + final_offset);
-      memcpy(data.data(), summary.c_str(), summary.length());
-      memcpy(data.data() + summary.length(), buf_.get(), final_offset);
+      {
+        MutexLock mu(Thread::Current(), trace_writer_lock_);
+        memcpy(data.data(), summary.c_str(), summary.length());
+        memcpy(data.data() + summary.length(), buf_.get(), final_offset);
+      }
       Runtime::Current()->GetRuntimeCallbacks()->DdmPublishChunk(CHUNK_TYPE("MPSE"),
                                                                  ArrayRef<const uint8_t>(data));
     }
@@ -1179,7 +1189,8 @@ void TraceWriter::FinishTracing(int flags, bool flush_entries) {
     DCHECK(trace_output_mode_ != TraceOutputMode::kDDMS);
 
     if (trace_output_mode_ == TraceOutputMode::kFile) {
-      WriteToFile(buf_.get(), final_offset);
+      MutexLock mu(Thread::Current(), trace_writer_lock_);
+      WriteToFileLocked(buf_.get(), final_offset);
     }
 
     // Write the summary packet

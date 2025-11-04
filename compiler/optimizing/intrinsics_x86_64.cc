@@ -705,6 +705,14 @@ static void CreateSystemArrayCopyLocations(HInvoke* invoke) {
       return;
     }
   }
+
+  // If source and destination are the same, fallback to native implementation: some overlapping
+  // copy regions must be copied in reverse and we can't know in all cases if it's needed.
+  SystemArrayCopyOptimizations optimizations(invoke);
+  if (optimizations.GetDestinationIsSource()) {
+    return;
+  }
+
   ArenaAllocator* allocator = invoke->GetBlock()->GetGraph()->GetAllocator();
   LocationSummary* locations =
       LocationSummary::Create(allocator, invoke, LocationSummary::kCallOnSlowPath, kIntrinsified);
@@ -810,17 +818,26 @@ static void SystemArrayCopyPrimitive(HInvoke* invoke,
   SlowPathCode* slow_path = new (codegen->GetScopedAllocator()) IntrinsicSlowPathX86_64(invoke);
   codegen->AddSlowPath(slow_path);
 
-  // Bail out if the source and destination are the same.
+  SystemArrayCopyOptimizations optimizations(invoke);
+
+  // If we know at compile time that source and destination are the same, we should not intrinsify.
+  DCHECK(!optimizations.GetDestinationIsSource());
+  // If source and destination are the same, take the slow path. Overlapping copy regions must be
+  // copied in reverse and we can't know in all cases if it's needed.
   __ cmpl(src, dest);
   __ j(kEqual, slow_path->GetEntryLabel());
 
-  // Bail out if the source is null.
-  __ testl(src, src);
-  __ j(kEqual, slow_path->GetEntryLabel());
+  if (!optimizations.GetSourceIsNotNull()) {
+    // Bail out if the source is null.
+    __ testl(src, src);
+    __ j(kEqual, slow_path->GetEntryLabel());
+  }
 
-  // Bail out if the destination is null.
-  __ testl(dest, dest);
-  __ j(kEqual, slow_path->GetEntryLabel());
+  if (!optimizations.GetDestinationIsNotNull()) {
+    // Bail out if the destination is null.
+    __ testl(dest, dest);
+    __ j(kEqual, slow_path->GetEntryLabel());
+  }
 
   // If the length is negative, bail out.
   // We have already checked in the LocationsBuilder for the constant case.
@@ -4209,6 +4226,9 @@ void IntrinsicLocationsBuilderX86_64::VisitMethodHandleInvokeExact(HInvoke* invo
   Location receiver_mh_loc = calling_convention.GetNextLocation(DataType::Type::kReference);
   locations->SetInAt(0, receiver_mh_loc);
 
+  // The last input is MethodType object corresponding to the call-site.
+  locations->SetInAt(number_of_args, Location::RequiresCoreRegister());
+
   locations->AddTemp(Location::RequiresCoreRegister());
   // Hidden arg for invoke-interface.
   locations->AddTemp(Location::CoreRegister(RAX));
@@ -4236,9 +4256,25 @@ void IntrinsicCodeGeneratorX86_64::VisitMethodHandleInvokeExact(HInvoke* invoke)
       new (codegen_->GetScopedAllocator()) InvokePolymorphicSlowPathX86_64(invoke, method_handle);
   codegen_->AddSlowPath(slow_path);
 
-  CpuRegister temp = locations->GetTemp(0).AsRegister<CpuRegister>();
-  CpuRegister method = CpuRegister(kMethodRegisterArgument);
+  CpuRegister call_site_type =
+      locations->InAt(invoke->GetNumberOfArguments()).AsRegister<CpuRegister>();
 
+  CpuRegister temp = locations->GetTemp(0).AsRegister<CpuRegister>();
+
+  // Call site should match with MethodHandle's type.
+  if (kPoisonHeapReferences) {
+    // call_site_type should be left intact as it 1) might be in callee-saved register 2) is known
+    // for GC to contain a reference.
+    __ movl(temp, call_site_type);
+    __ PoisonHeapReference(temp);
+    __ cmpl(temp, Address(method_handle, mirror::MethodHandle::MethodTypeOffset()));
+    __ j(kNotEqual, slow_path->GetEntryLabel());
+  } else {
+    __ cmpl(call_site_type, Address(method_handle, mirror::MethodHandle::MethodTypeOffset()));
+    __ j(kNotEqual, slow_path->GetEntryLabel());
+  }
+
+  CpuRegister method = CpuRegister(kMethodRegisterArgument);
   __ movq(method, Address(method_handle, mirror::MethodHandle::ArtFieldOrMethodOffset()));
 
   Label execute_target_method;
