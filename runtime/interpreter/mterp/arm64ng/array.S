@@ -1,4 +1,4 @@
-%def op_aget(load="ldr", shift="2", data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", wide="0", is_object="0"):
+%def op_aget(load="ldr", shift=2, data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", wide=False, is_object=False):
 /*
  * Array get.  vAA <- vBB[vCC].
  *
@@ -34,29 +34,29 @@
     $load   w0, [x0, #$data_offset]     // w0<- vBB[vCC]
     FETCH_ADVANCE_INST 2                // advance rPC, load rINST
     SET_VREG w0, w2                     // vAA<- w0
-    GET_INST_OPCODE x10                 // extract opcode from wINST
-    GOTO_OPCODE x10                     // jump to next instruction
+    PREPARE_OPCODE_DISPATCH             // insert opcode to xIBASE
+    GOTO_OPCODE                         // jump to next instruction
     .endif
 
 %def op_aget_boolean():
-%  op_aget(load="ldrb", shift="0", data_offset="MIRROR_BOOLEAN_ARRAY_DATA_OFFSET", is_object="0")
+%  op_aget(load="ldrb", shift=0, data_offset="MIRROR_BOOLEAN_ARRAY_DATA_OFFSET")
 
 %def op_aget_byte():
-%  op_aget(load="ldrsb", shift="0", data_offset="MIRROR_BYTE_ARRAY_DATA_OFFSET", is_object="0")
+%  op_aget(load="ldrsb", shift=0, data_offset="MIRROR_BYTE_ARRAY_DATA_OFFSET")
 
 %def op_aget_char():
-%  op_aget(load="ldrh", shift="1", data_offset="MIRROR_CHAR_ARRAY_DATA_OFFSET", is_object="0")
+%  op_aget(load="ldrh", shift=1, data_offset="MIRROR_CHAR_ARRAY_DATA_OFFSET")
 
 %def op_aget_object():
-%  op_aget(load="ldr", shift="2", data_offset="MIRROR_OBJECT_ARRAY_DATA_OFFSET", is_object="1")
+%  op_aget(load="ldr", shift=2, data_offset="MIRROR_OBJECT_ARRAY_DATA_OFFSET", is_object=True)
 
 %def op_aget_short():
-%  op_aget(load="ldrsh", shift="1", data_offset="MIRROR_SHORT_ARRAY_DATA_OFFSET", is_object="0")
+%  op_aget(load="ldrsh", shift=1, data_offset="MIRROR_SHORT_ARRAY_DATA_OFFSET")
 
 %def op_aget_wide():
-%  op_aget(load="ldr", shift="3", data_offset="MIRROR_WIDE_ARRAY_DATA_OFFSET", wide="1", is_object="0")
+%  op_aget(load="ldr", shift=3, data_offset="MIRROR_WIDE_ARRAY_DATA_OFFSET", wide=True)
 
-%def op_aput(store="str", shift="2", data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", wide="0", is_object="0"):
+%def op_aput(store="str", shift=2, data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", wide=False, is_object=False):
 /*
  * Array put.  vBB[vCC] <- vAA.
  *
@@ -91,26 +91,26 @@
     .else
     $store  w2, [x0, #$data_offset]     // vBB[vCC]<- w2
     .endif
-    GET_INST_OPCODE ip                  // extract opcode from rINST
-    GOTO_OPCODE ip                      // jump to next instruction
+    PREPARE_OPCODE_DISPATCH             // insert opcode to xIBASE
+    GOTO_OPCODE                         // jump to next instruction
 
 %def op_aput_boolean():
-%  op_aput(store="strb", shift="0", data_offset="MIRROR_BOOLEAN_ARRAY_DATA_OFFSET", wide="0", is_object="0")
+%  op_aput(store="strb", shift=0, data_offset="MIRROR_BOOLEAN_ARRAY_DATA_OFFSET")
 
 %def op_aput_byte():
-%  op_aput(store="strb", shift="0", data_offset="MIRROR_BYTE_ARRAY_DATA_OFFSET", wide="0", is_object="0")
+%  op_aput(store="strb", shift=0, data_offset="MIRROR_BYTE_ARRAY_DATA_OFFSET")
 
 %def op_aput_char():
-%  op_aput(store="strh", shift="1", data_offset="MIRROR_CHAR_ARRAY_DATA_OFFSET", wide="0", is_object="0")
+%  op_aput(store="strh", shift=1, data_offset="MIRROR_CHAR_ARRAY_DATA_OFFSET")
 
 %def op_aput_short():
-%  op_aput(store="strh", shift="1", data_offset="MIRROR_SHORT_ARRAY_DATA_OFFSET", wide="0", is_object="0")
+%  op_aput(store="strh", shift=1, data_offset="MIRROR_SHORT_ARRAY_DATA_OFFSET")
 
 %def op_aput_wide():
-%  op_aput(store="str", shift="3", data_offset="MIRROR_WIDE_ARRAY_DATA_OFFSET", wide="1", is_object="0")
+%  op_aput(store="str", shift=3, data_offset="MIRROR_WIDE_ARRAY_DATA_OFFSET", wide=True)
 
 %def op_aput_object():
-%  op_aput(store="str", shift="2", data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", wide="0", is_object="1")
+%  op_aput(store="str", shift=2, data_offset="MIRROR_INT_ARRAY_DATA_OFFSET", is_object=True)
 
 %def op_array_length():
     /*
@@ -122,9 +122,9 @@
     cbz     w0, common_errNullObject    // bail if null
     FETCH_ADVANCE_INST 1                // advance rPC, load rINST
     ldr     w3, [x0, #MIRROR_ARRAY_LENGTH_OFFSET]    // w3<- array length
-    GET_INST_OPCODE ip                  // extract opcode from rINST
+    PREPARE_OPCODE_DISPATCH             // insert opcode to xIBASE
     SET_VREG w3, w2                     // vB<- length
-    GOTO_OPCODE ip                      // jump to next instruction
+    GOTO_OPCODE                         // jump to next instruction
 
 %def op_fill_array_data():
     /* fill-array-data vAA, +BBBBBBBB */
@@ -137,8 +137,8 @@
     add     x0, xPC, x0, lsl #1         // x0<- PC + ssssssssBBBBbbbb*2 (array data off.)
     bl      art_quick_handle_fill_data
     FETCH_ADVANCE_INST 3                // advance rPC, load rINST
-    GET_INST_OPCODE ip                  // extract opcode from rINST
-    GOTO_OPCODE ip                      // jump to next instruction
+    PREPARE_OPCODE_DISPATCH             // insert opcode to xIBASE
+    GOTO_OPCODE                         // jump to next instruction
 
 %def op_filled_new_array(helper="nterp_filled_new_array"):
 /*
@@ -155,8 +155,8 @@
     mov     x3, xPC
     bl      $helper
     FETCH_ADVANCE_INST 3                // advance rPC, load rINST
-    GET_INST_OPCODE ip                  // extract opcode from rINST
-    GOTO_OPCODE ip                      // jump to next instruction
+    PREPARE_OPCODE_DISPATCH             // insert opcode to xIBASE
+    GOTO_OPCODE                         // jump to next instruction
 
 %def op_filled_new_array_range():
 %  op_filled_new_array(helper="nterp_filled_new_array_range")
