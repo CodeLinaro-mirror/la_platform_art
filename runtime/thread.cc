@@ -131,6 +131,9 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic error "-Wconversion"
 
+// Make sure ScopedArtUtfChars is an alias of ScopedJniUtfChars.
+static_assert(std::is_same_v<ScopedArtUtfChars, ScopedJniUtfChars>);
+
 extern "C" __attribute__((weak)) void* __hwasan_tag_pointer(const volatile void* p,
                                                             unsigned char tag);
 
@@ -1840,7 +1843,7 @@ bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState wait_st
       // Arguably that's not making anything qualitatively worse.
       bool success = !Runtime::Current()
                           ->GetThreadList()
-                          ->WaitForSuspendBarrier(&wrapped_barrier.barrier_)
+                          ->WaitForSuspendBarrier(self, &wrapped_barrier.barrier_)
                           .has_value();
       CHECK(success);
     }
