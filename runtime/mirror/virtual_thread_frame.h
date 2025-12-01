@@ -68,6 +68,6 @@ class MANAGED VirtualThreadFrame final : public Object {
 };
 
 }  // namespace mirror
-}  // namespace art HIDDEN
+}  // namespace art
 
-#endif  // ART_RUNTIME_MIRROR_VIRTUAL_THREAD_CONTEXT_H_
+#endif  // ART_RUNTIME_MIRROR_VIRTUAL_THREAD_FRAME_H_

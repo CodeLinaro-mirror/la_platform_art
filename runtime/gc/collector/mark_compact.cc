@@ -1578,6 +1578,13 @@ void MarkCompact::MarkingPause() {
         // into the live stack.
         thread->RevokeThreadLocalAllocationStack();
         bump_pointer_space_->RevokeThreadLocalBuffers(thread);
+        if (com::android::art::flags::weak_const_string()) {
+          // When we end the pause, weak reference access shall be disabled until we sweep weaks.
+          // Since we shall not be marking anymore, we cannot allow retrieving intern references
+          // from the interpreter cache as those strings could be sweeped. Attempts to retrieve
+          // them from the `InternTable` shall block until we enable weak reference access again.
+          thread->GetInterpreterCache()->Clear(thread);
+        }
       }
     }
     ProcessMarkStack();
@@ -4030,7 +4037,7 @@ class MarkCompact::ImmuneSpaceUpdateObjVisitor {
 
   void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    DCHECK(!visit_native_roots_);
+    DCHECK(visit_native_roots_);
     collector_->UpdateRoot(root, moving_space_begin_, moving_space_end_);
   }
 
