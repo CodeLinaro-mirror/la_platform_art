@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#ifndef ART_RUNTIME_MIRROR_VIRTUAL_THREAD_CONTEXT_INL_H_
+#define ART_RUNTIME_MIRROR_VIRTUAL_THREAD_CONTEXT_INL_H_
+
 #include "mirror/virtual_thread_frame.h"
 #include "obj_ptr.h"
 #include "object-inl.h"
@@ -82,4 +85,6 @@ inline void VirtualThreadContext::SetFramesArray(
 }
 
 }  // namespace mirror
-}  // namespace art HIDDEN
+}  // namespace art
+
+#endif  // ART_RUNTIME_MIRROR_VIRTUAL_THREAD_CONTEXT_INL_H_

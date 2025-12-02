@@ -87,6 +87,6 @@ class MANAGED VirtualThreadContext final : public Object {
 };
 
 }  // namespace mirror
-}  // namespace art HIDDEN
+}  // namespace art
 
 #endif  // ART_RUNTIME_MIRROR_VIRTUAL_THREAD_CONTEXT_H_
