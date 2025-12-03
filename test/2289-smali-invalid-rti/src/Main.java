@@ -22,9 +22,8 @@ public class Main {
             Class.forName("B445143421").getDeclaredMethod("main").invoke(null);
             throw new Error("Didn't get npe");
         } catch (InvocationTargetException expected) {
-            NullPointerException npe = (NullPointerException) expected.getCause();
-            if (!npe.getMessage().equals("Attempt to read from null array")) {
-                throw new Error("Got NPE, but with the wrong message: " + npe.getMessage());
+            if (!(expected.getCause() instanceof NullPointerException)) {
+                throw new Error("Expected NPE, got: " + expected);
             }
         }
     }

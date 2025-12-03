@@ -1602,6 +1602,12 @@ bool HInliner::IsInliningEncouraged(const HInvoke* invoke_instruction,
     return false;
   }
 
+  if (invoke_instruction->AlwaysThrows()) {
+    LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedAlwaysThrows)
+        << "Method " << method->PrettyMethod() << " will not be inlined because it always throws";
+    return false;
+  }
+
   return true;
 }
 
@@ -1641,6 +1647,7 @@ bool HInliner::TryBuildAndInline(HInvoke* invoke_instruction,
     if (invoke_instruction->GetType() == DataType::Type::kReference) {
       new_invoke->SetReferenceTypeInfoIfValid(invoke_instruction->GetReferenceTypeInfo());
     }
+    new_invoke->SetAlwaysThrows(invoke_instruction->AlwaysThrows());
     *return_replacement = new_invoke;
     return true;
   }

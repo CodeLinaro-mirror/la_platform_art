@@ -141,7 +141,7 @@ using ::android::base::unique_fd;
 using ::android::base::WriteStringToFd;
 using ::android::base::WriteStringToFile;
 using ::android::fs_mgr::FstabEntry;
-using ::art::service::ValidateClassLoaderContext;
+using ::art::service::FlattenAndValidateClassLoaderContext;
 using ::art::service::ValidateDexPath;
 using ::art::tools::CmdlineBuilder;
 using ::art::tools::Fatal;
@@ -680,6 +680,11 @@ ScopedAStatus Artd::isAlive(bool* _aidl_return) {
   return ScopedAStatus::ok();
 }
 
+ScopedAStatus Artd::stop() {
+  LOG(INFO) << "Stopping artd";
+  exit(0);
+}
+
 ScopedAStatus Artd::deleteArtifacts(const ArtifactsPath& in_artifactsPath, int64_t* _aidl_return) {
   RETURN_FATAL_IF_PRE_REBOOT(options_);
   RETURN_FATAL_IF_ARG_IS_PRE_REBOOT(in_artifactsPath, "artifactsPath");
@@ -1076,6 +1081,7 @@ ndk::ScopedAStatus Artd::getDexoptNeeded(const std::string& in_dexFile,
                                          const std::optional<std::string>& in_classLoaderContext,
                                          const std::string& in_compilerFilter,
                                          int32_t in_dexoptTrigger,
+                                         const ScopedFileDescriptor& in_loggingFd,
                                          GetDexoptNeededResult* _aidl_return) {
   Result<OatFileAssistantContext*> ofa_context = GetOatFileAssistantContext();
   if (!ofa_context.ok()) {
@@ -1095,6 +1101,9 @@ ndk::ScopedAStatus Artd::getDexoptNeeded(const std::string& in_dexFile,
   if (oat_file_assistant == nullptr) {
     return NonFatal("Failed to create OatFileAssistant: " + error_msg);
   }
+  ArtLogger logger =
+      in_loggingFd.get() >= 0 ? ArtLogger::FromFd(in_loggingFd.get()) : ArtLogger::Default();
+  oat_file_assistant->SetLogger(std::move(logger));
 
   OatFileAssistant::DexOptStatus status;
   _aidl_return->isDexoptNeeded =
@@ -1187,6 +1196,9 @@ ndk::ScopedAStatus Artd::dexopt(
   _aidl_return->cancelled = false;
 
   RETURN_FATAL_IF_PRE_REBOOT_MISMATCH(options_, in_outputArtifacts, "outputArtifacts");
+  ArtLogger logger =
+      in_loggingFd.get() >= 0 ? ArtLogger::FromFd(in_loggingFd.get()) : ArtLogger::Default();
+
   RawArtifactsPath artifacts_path =
       OR_RETURN_FATAL(BuildArtifactsPath(in_outputArtifacts.artifactsPath));
   OR_RETURN_FATAL(ValidateDexPath(in_dexFile));
@@ -1368,8 +1380,8 @@ ndk::ScopedAStatus Artd::dexopt(
 
   art_exec_args.Add("--keep-fds=%s", fd_logger.GetFds()).Add("--").Concat(std::move(args));
 
-  LOG(INFO) << "Running dex2oat: " << Join(art_exec_args.Get(), /*separator=*/" ")
-            << "\nOpened FDs: " << fd_logger;
+  LOG_TO(logger, INFO) << "Running dex2oat: " << Join(art_exec_args.Get(), /*separator=*/" ")
+                       << "\nOpened FDs: " << fd_logger;
 
   ProcessStat stat;
   std::string error_msg;
@@ -1394,7 +1406,7 @@ ndk::ScopedAStatus Artd::dexopt(
     return NonFatal(ART_FORMAT("Failed to run dex2oat: {} {}", error_msg, result_info));
   }
 
-  LOG(INFO) << ART_FORMAT("dex2oat returned code {}", result.exit_code);
+  LOG_TO(logger, INFO) << ART_FORMAT("dex2oat returned code {}", result.exit_code);
 
   if (result.exit_code != 0) {
     return NonFatal(
@@ -1664,6 +1676,20 @@ ScopedAStatus Artd::initProfileSaveNotification(const PrimaryCurProfilePath& in_
 
   *_aidl_return = ndk::SharedRefBase::make<ArtdNotification>(
       injector_.get(), path, std::move(inotify_fd), std::move(pidfd));
+  return ScopedAStatus::ok();
+}
+
+ScopedAStatus Artd::hasAllClcDexFiles(const std::string& in_dexFile,
+                                      const std::string& in_classLoaderContext,
+                                      bool* _aidl_return) {
+  *_aidl_return = true;
+  for (const std::string& path :
+       OR_RETURN_FATAL(FlattenAndValidateClassLoaderContext(in_dexFile, in_classLoaderContext))) {
+    if (OR_RETURN_NON_FATAL(GetFileVisibility(path)) == FileVisibility::NOT_FOUND) {
+      *_aidl_return = false;
+      break;
+    }
+  }
   return ScopedAStatus::ok();
 }
 
@@ -2363,7 +2389,8 @@ ScopedAStatus Artd::validateClassLoaderContext(const std::string& in_dexFile,
                                                const std::string& in_classLoaderContext,
                                                std::optional<std::string>* _aidl_return) {
   RETURN_FATAL_IF_NOT_PRE_REBOOT(options_);
-  if (Result<void> result = ValidateClassLoaderContext(in_dexFile, in_classLoaderContext);
+  if (Result<std::vector<std::string>> result =
+          FlattenAndValidateClassLoaderContext(in_dexFile, in_classLoaderContext);
       !result.ok()) {
     *_aidl_return = result.error().message();
   } else {

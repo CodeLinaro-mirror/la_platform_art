@@ -157,7 +157,7 @@ class UsePosition : public ArenaObject<kArenaAllocSsaLiveness>,
     return user_->GetBlock()->GetLoopInformation();
   }
 
-  bool RequiresRegister() const {
+  bool RequiresCoreRegister() const {
     if (IsSynthesized()) return false;
     Location location = GetUser()->GetLocations()->InAt(GetInputIndex());
     return location.IsUnallocated() && location.RequiresRegisterKind();
@@ -245,7 +245,7 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   static LiveInterval* MakeInterval(ScopedArenaAllocator* allocator,
                                     DataType::Type type,
                                     bool is_pair,
-                                    HInstruction* instruction = nullptr) {
+                                    HInstruction* instruction) {
     return new (allocator) LiveInterval(allocator, type, is_pair, instruction);
   }
 
@@ -497,9 +497,6 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
 
   size_t FirstRegisterUseAfter(size_t position) const {
     DCHECK(!IsTemp());
-    if (IsDefiningPosition(position) && DefinitionRequiresRegister()) {
-      return position;
-    }
 
     size_t end = GetEnd();
     for (const UsePosition& use : GetUses()) {
@@ -508,7 +505,7 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
         break;
       }
       if (use_position > position) {
-        if (use.RequiresRegister()) {
+        if (use.RequiresCoreRegister()) {
           return use_position;
         }
       }
@@ -516,25 +513,14 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
     return kNoLifetime;
   }
 
-  // Returns the location of the first register use for this live interval,
-  // including a register definition if applicable.
+  // Returns the location of the first register use for this live interval.
   size_t FirstRegisterUse() const {
-    size_t start = GetStart();
-    return IsTemp() ? start : FirstRegisterUseAfter(start);
-  }
-
-  // Whether the interval requires a register rather than a stack location.
-  // If needed for performance, this could be cached.
-  bool RequiresRegister() const {
-    return !HasRegisters() && FirstRegisterUse() != kNoLifetime;
+    return FirstRegisterUseAfter(GetStart());
   }
 
   size_t FirstUseAfter(size_t position) const {
     DCHECK(!IsTemp());
-    if (IsDefiningPosition(position)) {
-      DCHECK(defined_by_->GetLocations()->Out().IsValid());
-      return position;
-    }
+    DCHECK(!IsDefiningPosition(position));
 
     size_t end = GetEnd();
     for (const UsePosition& use : GetUses()) {
@@ -562,6 +548,7 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   }
 
   HInstruction* GetDefinedBy() const {
+    DCHECK(parent_->defined_by_ == defined_by_);
     return defined_by_;
   }
 
@@ -599,10 +586,6 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   }
 
   void Dump(std::ostream& stream) const;
-
-  // Same as Dump, but adds context such as the instruction defining this interval, and
-  // the register currently assigned to this interval.
-  void DumpWithContext(std::ostream& stream, const CodeGenerator& codegen) const;
 
   LiveInterval* GetNextSibling() const { return next_sibling_; }
   LiveInterval* GetLastSibling() {
@@ -701,31 +684,23 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
     range_search_start_ = first_range_;
   }
 
-  bool DefinitionRequiresRegister() const {
+  bool RequiresRegisterForDefinitionAt(size_t position) const {
+    DCHECK(!IsTemp());
+    if (!IsDefiningPosition(position)) {
+      return false;
+    }
     DCHECK(IsParent());
     LocationSummary* locations = defined_by_->GetLocations();
     Location location = locations->Out();
     // This interval is the first interval of the instruction. If the output
     // of the instruction requires a register, we return the position of that instruction
     // as the first register use.
-    if (location.IsUnallocated()) {
-      if ((location.GetPolicy() == Location::kRequiresRegister)
-           || (location.GetPolicy() == Location::kSameAsFirstInput
-               && (locations->InAt(0).IsRegister()
-                   || locations->InAt(0).IsRegisterPair()
-                   || locations->InAt(0).GetPolicy() == Location::kRequiresRegister))) {
-        return true;
-      } else if ((location.GetPolicy() == Location::kRequiresFpuRegister)
-                 || (location.GetPolicy() == Location::kSameAsFirstInput
-                     && (locations->InAt(0).IsFpuRegister()
-                         || locations->InAt(0).IsFpuRegisterPair()
-                         || locations->InAt(0).GetPolicy() == Location::kRequiresFpuRegister))) {
-        return true;
-      }
-    } else if (location.IsRegister() || location.IsRegisterPair()) {
-      return true;
+    if (location.Equals(Location::SameAsFirstInput())) {
+      location = locations->InAt(0);
+      DCHECK(!location.Equals(Location::SameAsFirstInput()));
     }
-    return false;
+    return location.IsRegisterKind() ||
+           (location.IsUnallocated() && location.RequiresRegisterKind());
   }
 
   void SetHintPhiInterval(LiveInterval* hint_phi_interval) {
@@ -792,7 +767,7 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   LiveInterval(ScopedArenaAllocator* allocator,
                DataType::Type type,
                bool is_pair,
-               HInstruction* defined_by = nullptr,
+               HInstruction* defined_by,
                bool is_fixed = false,
                uint32_t regs = kNoRegisters,
                int8_t temp_index = kNoTempIndex)

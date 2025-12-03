@@ -209,22 +209,22 @@ class FieldAccessCallingConventionRISCV64 : public FieldAccessCallingConvention 
   FieldAccessCallingConventionRISCV64() {}
 
   Location GetObjectLocation() const override {
-    return Location::RegisterLocation(A1);
+    return Location::CoreRegister(A1);
   }
   Location GetFieldIndexLocation() const override {
-    return Location::RegisterLocation(A0);
+    return Location::CoreRegister(A0);
   }
   Location GetReturnLocation(DataType::Type type ATTRIBUTE_UNUSED) const override {
-    return Location::RegisterLocation(A0);
+    return Location::CoreRegister(A0);
   }
   Location GetSetValueLocation(DataType::Type type ATTRIBUTE_UNUSED,
                                bool is_instance) const override {
     return is_instance
-        ? Location::RegisterLocation(A2)
-        : Location::RegisterLocation(A1);
+        ? Location::CoreRegister(A2)
+        : Location::CoreRegister(A1);
   }
   Location GetFpuLocation(DataType::Type type ATTRIBUTE_UNUSED) const override {
-    return Location::FpuRegisterLocation(FA0);
+    return Location::FpuRegister(FA0);
   }
 
  private:
@@ -490,6 +490,7 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
 
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
+  void DumpVectorRegister(std::ostream& stream, int reg) const override;
 
   InstructionSet GetInstructionSet() const override { return InstructionSet::kRiscv64; }
 

@@ -604,7 +604,8 @@ LiveInterval* LiveInterval::SplitAt(size_t position) {
     return nullptr;
   }
 
-  LiveInterval* new_interval = new (allocator_) LiveInterval(allocator_, type_, IsPair());
+  LiveInterval* new_interval =
+      new (allocator_) LiveInterval(allocator_, type_, is_pair_, defined_by_);
 
   new_interval->next_sibling_ = next_sibling_;
   next_sibling_ = new_interval;
@@ -688,36 +689,6 @@ void LiveInterval::Dump(std::ostream& stream) const {
   stream << " is_pair: " << IsPair();
 }
 
-void LiveInterval::DumpWithContext(std::ostream& stream,
-                                   const CodeGenerator& codegen) const {
-  Dump(stream);
-  if (IsFixed()) {
-    if (HasRegisters()) {
-      stream << ", registers:0x" << GetRegisters() << std::dec << "(";
-      const char* delim = "";
-      for (uint32_t reg : LowToHighBits(GetRegisters())) {
-        stream << delim;
-        delim = ",";
-        if (IsFloatingPoint()) {
-          codegen.DumpFloatingPointRegister(stream, reg);
-        } else {
-          codegen.DumpCoreRegister(stream, reg);
-        }
-      }
-      stream << ")";
-    } else {
-      stream << ", registers:none";
-    }
-  } else {
-    stream << ", spill slot:" << GetSpillSlot();
-  }
-  stream << ", requires_register:" << (GetDefinedBy() != nullptr && RequiresRegister());
-  if (GetParent()->GetDefinedBy() != nullptr) {
-    stream << ", defined_by:" << GetParent()->GetDefinedBy()->GetKind();
-    stream << "(" << GetParent()->GetDefinedBy()->GetLifetimePosition() << ")";
-  }
-}
-
 bool LiveInterval::SameRegisterKind(Location other) const {
   if (IsFloatingPoint()) {
     if (IsPair()) {
@@ -727,9 +698,9 @@ bool LiveInterval::SameRegisterKind(Location other) const {
     }
   } else {
     if (IsPair()) {
-      return other.IsRegisterPair();
+      return other.IsCoreRegisterPair();
     } else {
-      return other.IsRegister();
+      return other.IsCoreRegister();
     }
   }
 }
@@ -737,7 +708,7 @@ bool LiveInterval::SameRegisterKind(Location other) const {
 size_t LiveInterval::NumberOfSpillSlotsNeeded() const {
   // For a SIMD operation, compute the number of needed spill slots.
   // TODO: do through vector type?
-  HInstruction* definition = GetParent()->GetDefinedBy();
+  HInstruction* definition = GetDefinedBy();
   if (definition != nullptr && HVecOperation::ReturnsSIMDValue(definition)) {
     if (definition->IsPhi()) {
       definition = definition->InputAt(1);  // SIMD always appears on back-edge

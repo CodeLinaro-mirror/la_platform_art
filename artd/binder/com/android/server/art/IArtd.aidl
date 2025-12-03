@@ -22,6 +22,15 @@ interface IArtd {
     boolean isAlive();
 
     /**
+     * Stops the artd service process immediately. This will not stop subprocesses of the artd
+     * service process.
+     *
+     * Note that this will fail any ongoing call to the artd service. Therefore, it should only be
+     * called when there is no ongoing call.
+     */
+    oneway void stop();
+
+    /**
      * Deletes dexopt artifacts and returns the released space, in bytes.
      *
      * Note that this method doesn't delete runtime artifacts. To delete them, call
@@ -150,7 +159,7 @@ interface IArtd {
     com.android.server.art.GetDexoptNeededResult getDexoptNeeded(
             @utf8InCpp String dexFile, @utf8InCpp String instructionSet,
             @nullable @utf8InCpp String classLoaderContext, @utf8InCpp String compilerFilter,
-            int dexoptTrigger);
+            int dexoptTrigger, in @nullable android.os.ParcelFileDescriptor loggingFd);
 
     /**
      * Creates a secure dex metadata companion (SDC) file for the secure dex metadata (SDM) file, if
@@ -317,6 +326,13 @@ interface IArtd {
     @PropagateAllowBlocking
     com.android.server.art.IArtdNotification initProfileSaveNotification(
             in com.android.server.art.ProfilePath.PrimaryCurProfilePath profilePath, int pid);
+
+    /**
+     * Returns true if all dex files referenced by the given class loader context exist.
+     *
+     * Throws fatal and non-fatal errors.
+     */
+    boolean hasAllClcDexFiles(@utf8InCpp String dexFile, @utf8InCpp String classLoaderContext);
 
     /**
      * Moves the staged files of the given artifacts and profiles to the permanent locations,

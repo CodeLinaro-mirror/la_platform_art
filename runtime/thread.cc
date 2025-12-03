@@ -1173,7 +1173,7 @@ Thread* Thread::Attach(const char* thread_name,
     self->Dump(LOG_STREAM(INFO));
   }
 
-  TraceProfiler::AllocateBuffer(self);
+  Trace::AllocateThreadBuffer(self);
   if (should_run_callbacks) {
     ScopedObjectAccess soa(self);
     runtime->GetRuntimeCallbacks()->ThreadStart(self);
@@ -3303,19 +3303,16 @@ static ObjPtr<mirror::StackTraceElement> CreateStackTraceElement(
       return nullptr;
     }
     const char* source_file = method->GetDeclaringClassSourceFile();
+    if (source_file != nullptr) {
+      source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
+      if (source_name_object == nullptr) {
+        soa.Self()->AssertPendingOOMException();
+        return nullptr;
+      }
+    }
     if (line_number == -1) {
       // Make the line_number field of StackTraceElement hold the dex pc.
-      // source_name_object is intentionally left null if we failed to map the dex pc to
-      // a line number (most probably because there is no debug info). See b/30183883.
       line_number = static_cast<int32_t>(dex_pc);
-    } else {
-      if (source_file != nullptr) {
-        source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
-        if (source_name_object == nullptr) {
-          soa.Self()->AssertPendingOOMException();
-          return nullptr;
-        }
-      }
     }
   }
   const char* method_name = method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetName();

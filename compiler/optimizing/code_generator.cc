@@ -71,13 +71,11 @@ namespace art HIDDEN {
 
 // Return whether a location is consistent with a type.
 static bool CheckType(DataType::Type type, Location location) {
-  if (location.IsFpuRegister()
-      || (location.IsUnallocated() && (location.GetPolicy() == Location::kRequiresFpuRegister))) {
+  if (location.IsFpuRegister() || (location.Equals(Location::RequiresFpuRegister()))) {
     return (type == DataType::Type::kFloat32) || (type == DataType::Type::kFloat64);
-  } else if (location.IsRegister() ||
-             (location.IsUnallocated() && (location.GetPolicy() == Location::kRequiresRegister))) {
+  } else if (location.IsCoreRegister() || (location.Equals(Location::RequiresCoreRegister()))) {
     return DataType::IsIntegralType(type) || (type == DataType::Type::kReference);
-  } else if (location.IsRegisterPair()) {
+  } else if (location.IsCoreRegisterPair()) {
     return type == DataType::Type::kInt64;
   } else if (location.IsFpuRegisterPair()) {
     return type == DataType::Type::kFloat64;
@@ -321,6 +319,12 @@ void CodeGenerator::InitializeCodeGenerationData() {
   code_generation_data_ = CodeGenerationData::Create(graph_->GetArenaStack(), GetInstructionSet());
 }
 
+void CodeGenerator::DumpVectorRegister([[maybe_unused]] std::ostream& stream,
+                                       [[maybe_unused]] int reg) const {
+  LOG(FATAL) << "No vector registers on " << GetInstructionSet();
+  UNREACHABLE();
+}
+
 void CodeGenerator::Compile() {
   InitializeCodeGenerationData();
 
@@ -467,7 +471,7 @@ void CodeGenerator::CreateCommonInvokeLocationSummary(
     } else {
       locations->AddTemp(visitor->GetMethodLocation());
       if (method_load_kind == MethodLoadKind::kRuntimeCall) {
-        locations->SetInAt(call->GetCurrentMethodIndex(), Location::RequiresRegister());
+        locations->SetInAt(call->GetCurrentMethodIndex(), Location::RequiresCoreRegister());
       }
     }
   } else if (!invoke->IsInvokePolymorphic()) {
@@ -941,6 +945,7 @@ std::unique_ptr<CodeGenerator> CodeGenerator::Create(HGraph* graph,
 CodeGenerator::CodeGenerator(HGraph* graph,
                              size_t number_of_core_registers,
                              size_t number_of_fpu_registers,
+                             size_t number_of_vector_registers,
                              RegisterSet callee_saves,
                              const CompilerOptions& compiler_options,
                              OptimizingCompilerStats* stats,
@@ -954,6 +959,7 @@ CodeGenerator::CodeGenerator(HGraph* graph,
       data_types_requiring_register_pair_(0u),
       number_of_core_registers_(number_of_core_registers),
       number_of_fpu_registers_(number_of_fpu_registers),
+      number_of_vector_registers_(number_of_vector_registers),
       block_order_(nullptr),
       disasm_info_(nullptr),
       stats_(stats),
@@ -969,6 +975,7 @@ CodeGenerator::CodeGenerator(HGraph* graph,
       unimplemented_intrinsics_(unimplemented_intrinsics) {
   DCHECK_LE(number_of_core_registers_, BitSizeOf<uint32_t>());
   DCHECK_LE(number_of_fpu_registers_, BitSizeOf<uint32_t>());
+  DCHECK_LE(number_of_vector_registers, BitSizeOf<uint32_t>());
 
   if (GetGraph()->IsCompilingOsr()) {
     // Make OSR methods have all registers spilled, this simplifies the logic of
@@ -1324,7 +1331,7 @@ void CodeGenerator::EmitVRegInfo(HEnvironment* environment,
         break;
       }
 
-      case Location::kRegister : {
+      case Location::kCoreRegister : {
         DCHECK(!is_for_catch_handler);
         int id = location.reg();
         if (slow_path != nullptr && slow_path->IsCoreRegisterSaved(id)) {
@@ -1390,7 +1397,7 @@ void CodeGenerator::EmitVRegInfo(HEnvironment* environment,
         break;
       }
 
-      case Location::kRegisterPair : {
+      case Location::kCoreRegisterPair : {
         DCHECK(!is_for_catch_handler);
         int low = location.low();
         int high = location.high();
@@ -1754,9 +1761,9 @@ LocationSummary* CodeGenerator::CreateSystemArrayCopyLocationSummary(
   LocationSummary* locations =
       LocationSummary::Create(allocator, invoke, LocationSummary::kCallOnSlowPath, kIntrinsified);
   // arraycopy(Object src, int src_pos, Object dest, int dest_pos, int length).
-  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(0, Location::RequiresCoreRegister());
   locations->SetInAt(1, Location::RegisterOrConstant(invoke->InputAt(1)));
-  locations->SetInAt(2, Location::RequiresRegister());
+  locations->SetInAt(2, Location::RequiresCoreRegister());
   locations->SetInAt(3, Location::RegisterOrConstant(invoke->InputAt(3)));
   locations->SetInAt(4, Location::RegisterOrConstant(invoke->InputAt(4)));
 
