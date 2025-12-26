@@ -150,6 +150,7 @@ class Heap {
   static constexpr size_t kDefaultTLABSize = 32 * KB;
   static constexpr double kDefaultTargetUtilization = 0.6;
 
+  static constexpr double kDefaultMemoryGcCostFactor = 1.0;
   static constexpr bool kDefaultEnableTimeBasedGcTrigger = false;
 
   static constexpr double kDefaultHeapGrowthMultiplier = 2.0;
@@ -196,7 +197,10 @@ class Heap {
     return gPageSize;
   }
 
-  static size_t GetDefaultMemoryGcCostFactor();
+  // Computes the time_based_gc_threshold_factor used internally for time
+  // based GC triggering based on the user provided memory_gc_cost_factor
+  // tuning knob setting.
+  static size_t ComputeTimeBasedGcThresholdFactor(double memory_gc_cost_factor);
 
   // Whether the transition-GC heap threshold condition applies or not for non-low memory devices.
   // Stressing GC will bypass the heap threshold condition.
@@ -243,6 +247,7 @@ class Heap {
        bool verify_pre_sweeping_rosalloc,
        bool verify_post_gc_rosalloc,
        bool gc_stress_mode,
+       bool continuous_gc_mode,
        bool measure_gc_performance,
        bool use_homogeneous_space_compaction,
        bool use_generational_gc,
@@ -984,6 +989,8 @@ class Heap {
   GcPauseListener* GetGcPauseListener() {
     return gc_pause_listener_.load(std::memory_order_acquire);
   }
+
+  bool InContinuousGCMode() const { return continuous_gc_mode_; }
   // Remove a gc pause listener. Note: the listener must not be deleted, as for performance
   // reasons, we assume it stays valid when we read it (so that we don't require a lock).
   EXPORT void RemoveGcPauseListener();
@@ -1498,7 +1505,6 @@ class Heap {
   // foreground we set target_footprint_ and concurrent_start_bytes_ to the corresponding value.
   size_t min_foreground_target_footprint_ GUARDED_BY(process_state_update_lock_);
   size_t min_foreground_concurrent_start_bytes_ GUARDED_BY(process_state_update_lock_);
-  size_t min_foreground_time_based_gc_threshold_ GUARDED_BY(process_state_update_lock_);
 
   // When num_bytes_allocated_ exceeds this amount then a concurrent GC should be requested so that
   // it completes ahead of an allocation failing.
@@ -1560,6 +1566,7 @@ class Heap {
   bool verify_pre_sweeping_rosalloc_;
   bool verify_post_gc_rosalloc_;
   const bool gc_stress_mode_;
+  bool continuous_gc_mode_;
 
   // RAII that temporarily disables the rosalloc verification during
   // the zygote fork.
@@ -1633,9 +1640,8 @@ class Heap {
 
   const bool enable_time_based_gc_trigger_;
 
-  // How many bytes of memory we are willing to spend 1% GC cost per second on.
-  // Used for the time based concurrent GC trigger.
-  const size_t memory_gc_cost_factor_;
+  // How much time_based_gc_threshold_ we get for every 1ms CPU spent doing GC.
+  const size_t time_based_gc_threshold_factor_;
 
   // The time*alloc threshold for when to trigger the next concurrent GC when
   // using time based GC triggering.

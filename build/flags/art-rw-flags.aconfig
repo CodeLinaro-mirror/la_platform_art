@@ -50,15 +50,6 @@ flag {
 }
 
 flag {
-  name: "auto_tune_time_based_gc_triggering"
-  namespace: "system_performance"
-  description: "Tune time based gc triggering based on device specs"
-  bug: "425665469"
-  is_fixed_read_only: false
-  is_exported: false
-}
-
-flag {
   name: "post_ur_job"
   namespace: "art_cloud"
   description: "Flag to enable post unattended reboot job."
@@ -121,3 +112,12 @@ flag {
     is_fixed_read_only: false
 }
 
+
+flag {
+  name: "dynamic_instrumentation_method_entry_hook"
+  namespace: "responsible_apis"
+  description: "Flag to inject the method entry hook when dynamic instrumentation is requested"
+  bug: "408255571"
+  is_fixed_read_only: false
+  is_exported: false
+}

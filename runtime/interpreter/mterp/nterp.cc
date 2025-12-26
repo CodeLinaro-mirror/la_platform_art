@@ -117,7 +117,14 @@ void CheckNterpAsmConstants() {
   ptrdiff_t interp_size = reinterpret_cast<uintptr_t>(artNterpAsmInstructionEnd) -
                           reinterpret_cast<uintptr_t>(artNterpAsmInstructionStart);
   static_assert(kNumPackedOpcodes * width != 0);
-  if (interp_size != kNumPackedOpcodes * width) {
+  // For arm64, we have four sets of opcode handlers, 20KiB apart, to get a handler set with
+  // 16KiB alignment for quick opcode dispatch. Each handler set is 16KiB and the 4KiB gaps
+  // hold slow paths for the handler sets. Slow paths for the last handler set are located
+  // after the `artNterpAsmInstructionEnd`.
+  static constexpr size_t kExpectedSize = (kRuntimeISA == InstructionSet::kArm64)
+      ? 4 * kNumPackedOpcodes * width + 3 * 4 * KB
+      : kNumPackedOpcodes * width;
+  if (interp_size != kExpectedSize) {
     LOG(FATAL) << "ERROR: unexpected asm interp size " << interp_size
                << "(did an instruction handler exceed " << width << " bytes?)";
   }
@@ -1002,8 +1009,6 @@ extern "C" jit::OsrData* NterpHotMethod(ArtMethod* method, uint16_t* dex_pc_ptr,
   } else {
     // Move the counter to the initial threshold in case we have to re-JIT it.
     method->ResetCounter(runtime->GetJITOptions()->GetWarmupThreshold());
-    // Mark the method as warm for the profile saver.
-    method->SetPreviouslyWarm();
   }
   jit::Jit* jit = runtime->GetJit();
   if (jit != nullptr && jit->UseJitCompilation()) {

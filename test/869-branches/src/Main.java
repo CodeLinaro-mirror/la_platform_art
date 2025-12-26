@@ -14,15 +14,9 @@
  * limitations under the License.
  */
 
-import java.lang.reflect.InvocationTargetException;
-
 public class Main {
-    public static void main(String[] args) throws Exception {
-        try {
-            Object retValue = Class.forName("Test").getDeclaredMethod("foo").invoke(null);
-            throw new Error("UNREACHABLE");
-        } catch (java.lang.VerifyError e) {
-            // expected
-        }
-    }
+  public static void main(String[] args) throws Exception {
+    Class<?> cls = Class.forName("TestCase");
+    cls.getDeclaredMethod("test", int.class, int.class).invoke(cls.newInstance(), 1, 0);
+  }
 }

@@ -138,6 +138,10 @@ class FastCompilerARM64 : public FastCompiler {
         compiler_options_(compiler_options),
         dex_compilation_unit_(dex_compilation_unit),
         code_generation_data_(CodeGenerationData::Create(arena_stack, InstructionSet::kArm64)),
+        processed_(ArenaBitVector::CreateFixedSize(
+                       allocator_,
+                       GetCodeItemAccessor().InsnsSizeInCodeUnits())),
+        work_queue_(allocator->Adapter()),
         vreg_locations_(dex_compilation_unit.GetCodeItemAccessor().RegistersSize(),
                         allocator->Adapter()),
         branch_targets_(dex_compilation_unit.GetCodeItemAccessor().InsnsSizeInCodeUnits(),
@@ -151,7 +155,7 @@ class FastCompilerARM64 : public FastCompiler {
         catch_pcs_(ArenaBitVector::CreateFixedSize(
                        allocator,
                        dex_compilation_unit.GetCodeItemAccessor().InsnsSizeInCodeUnits())),
-        loop_header_pcs_(ArenaBitVector::CreateFixedSize(
+        branch_pcs_(ArenaBitVector::CreateFixedSize(
                              allocator,
                              dex_compilation_unit.GetCodeItemAccessor().InsnsSizeInCodeUnits())),
         catch_stack_maps_(allocator->Adapter()),
@@ -169,7 +173,7 @@ class FastCompilerARM64 : public FastCompiler {
     memset(object_stack_masks_.data(), 0, object_stack_masks_.size() * sizeof(ArenaBitVector*));
     GetAssembler()->cfi().SetEnabled(compiler_options.GenerateAnyDebugInfo());
     if (with_loop_support) {
-      MarkLoopHeaders();
+      MarkBranchTargets();
     }
   }
 
@@ -251,13 +255,14 @@ class FastCompilerARM64 : public FastCompiler {
   }
 
   bool ShouldRecompileWithLoopSupport() const {
-    DCHECK(!loop_header_pcs_.IsAnyBitSet());
+    DCHECK(!branch_pcs_.IsAnyBitSet());
     return recompile_with_loop_support_;
   }
 
  private:
   // Go over each instruction of the method, and generate code for them.
   bool ProcessInstructions();
+  bool ProcessBlock(uint32_t dex_pc);
 
   // Initialize the locations of parameters for this method.
   bool InitializeParameters();
@@ -267,7 +272,8 @@ class FastCompilerARM64 : public FastCompiler {
   bool EnsureHasFrame();
 
   bool GenerateFrame();
-  void GenerateSuspendCheck();
+  void GenerateSuspendCheck(uint32_t dex_pc);
+  void GenerateSuspendCheckAndIncrementHotness(uint32_t dex_pc, Register temp);
   void IncrementHotness(Register method);
 
   // Generate code for a frame exit.
@@ -405,6 +411,13 @@ class FastCompilerARM64 : public FastCompiler {
             uint32_t dex_pc,
             DataType::Type type);
   bool BuildSwitch(const Instruction& instruction, uint32_t dex_pc);
+  bool BuildFillArrayData(const Instruction& instruction, uint32_t dex_pc);
+
+  void AddToWorkQueue(uint32_t dex_pc) {
+    if (!processed_.IsBitSet(dex_pc)) {
+      work_queue_.push(dex_pc);
+    }
+  }
 
   // Update registers and masks for the merge point.
   void PrepareToBranch(uint32_t dex_pc) {
@@ -412,6 +425,7 @@ class FastCompilerARM64 : public FastCompiler {
     // point use the same locations.
     MoveConstantsAndFpusToRegisters();
     UpdateMasks(dex_pc);
+    AddToWorkQueue(dex_pc);
   }
 
   // Mark whether dex register `vreg_index` is an object.
@@ -523,35 +537,31 @@ class FastCompilerARM64 : public FastCompiler {
 
   // Loop support
   //
-  void MarkLoopHeaders() {
+  void MarkBranchTargets() {
     for (const DexInstructionPcPair& pair : GetCodeItemAccessor()) {
       const uint32_t dex_pc = pair.DexPc();
       const Instruction& instruction = pair.Inst();
 
       if (instruction.IsBranch()) {
         int32_t target_offset = instruction.GetTargetOffset();
-        if (target_offset <= 0) {
-          loop_header_pcs_.SetBit(dex_pc + target_offset);
-        }
+        branch_pcs_.SetBit(dex_pc + target_offset);
       } else if (instruction.IsSwitch()) {
         DexSwitchTable table(instruction, dex_pc);
         for (DexSwitchTableIterator s_it(table); !s_it.Done(); s_it.Advance()) {
           int32_t target_offset = s_it.CurrentTargetOffset();
-          if (target_offset <= 0) {
-            loop_header_pcs_.SetBit(dex_pc + target_offset);
-          }
+          branch_pcs_.SetBit(dex_pc + target_offset);
         }
       }
     }
   }
 
-  bool IsLoopHeader(uint32_t dex_pc) const {
-    return loop_header_pcs_.IsBitSet(dex_pc);
+  bool CanBeLoopHeader(uint32_t dex_pc) const {
+    return branch_pcs_.IsBitSet(dex_pc);
   }
 
   bool CanHandleBackwardsBranch(uint32_t dex_pc, bool is_catch = false) {
-    if (!IsLoopHeader(dex_pc) && !is_catch) {
-      DCHECK(!loop_header_pcs_.IsAnyBitSet());
+    if (!CanBeLoopHeader(dex_pc) && !is_catch) {
+      DCHECK(!branch_pcs_.IsAnyBitSet());
       unimplemented_reason_ = "Loop retry";
       recompile_with_loop_support_ = true;
       return false;
@@ -560,7 +570,12 @@ class FastCompilerARM64 : public FastCompiler {
     // No need to check if the non-null masks match, as we disable the
     // optimization at loop header.
 
-    DCHECK_NE(object_register_masks_[dex_pc], std::numeric_limits<uint64_t>::max()) << dex_pc;
+    if (object_register_masks_[dex_pc] == std::numeric_limits<uint64_t>::max()) {
+      // If the "loop" header isn't initialized, this means this is just a
+      // backwards branch to a dex pc that hasn't been visited yet.
+      return true;
+    }
+
     if (object_register_masks_[dex_pc] !=
             (object_register_masks_[dex_pc] & object_register_mask_)) {
       unimplemented_reason_ = "Different register mask for loop";
@@ -590,6 +605,12 @@ class FastCompilerARM64 : public FastCompiler {
   const DexCompilationUnit& dex_compilation_unit_;
   std::unique_ptr<CodeGenerationData> code_generation_data_;
 
+  // A bit vector marking which instructions have already been processed.
+  BitVectorView<size_t> processed_;
+
+  // Work queue for the compiler, containing dex_pc to start the compilation.
+  ArenaPriorityQueue<uint32_t, std::greater<uint32_t>> work_queue_;
+
   // The current location of each dex register.
   ArenaVector<Location> vreg_locations_;
 
@@ -608,9 +629,9 @@ class FastCompilerARM64 : public FastCompiler {
   // Dex pcs that are catch targets.
   BitVectorView<size_t> catch_pcs_;
 
-  // If we are compiling this method with loop support, the dex pcs that are loop headers.
+  // If we are compiling this method with loop support, the dex pcs that are branch targets.
   // Empty otherwise.
-  BitVectorView<size_t> loop_header_pcs_;
+  BitVectorView<size_t> branch_pcs_;
 
   // Pair of {dex_pc, native_pc} collected during compilation, used when
   // generating stack map entries for catch instructions at the end of
@@ -725,10 +746,10 @@ bool FastCompilerARM64::InitializeParameters() {
 
   if (needs_spill) {
     // We can now generate the suspend check.
-    GenerateSuspendCheck();
+    GenerateSuspendCheck(/* dex_pc= */ 0u);
   }
 
-  if (loop_header_pcs_.IsAnyBitSet()) {
+  if (branch_pcs_.IsAnyBitSet()) {
     // Generate the frame now. We don't want to create it lazily as the branch
     // instruction going backwards might branch to a dex pc lower than where the
     // frame was created.
@@ -756,6 +777,7 @@ bool FastCompilerARM64::InitializeParameters() {
 }
 
 void FastCompilerARM64::MoveConstantsAndFpusToRegisters() {
+  DCHECK(has_frame_);
   for (uint32_t i = 0; i < vreg_locations_.size(); ++i) {
     Location location  = vreg_locations_[i];
     if (location.IsConstant()) {
@@ -775,6 +797,7 @@ void FastCompilerARM64::MoveConstantsAndFpusToRegisters() {
 }
 
 void FastCompilerARM64::ResetLocations() {
+  DCHECK(has_frame_);
   for (uint32_t i = 0; i < vreg_locations_.size(); ++i) {
     vreg_locations_[i] = CreateNewLocation(i, DataType::Type::kInt64);
   }
@@ -797,6 +820,12 @@ bool FastCompilerARM64::BranchTargetIsInitialized(uint32_t dex_pc) {
   return object_stack_masks_[dex_pc] != nullptr;
 }
 
+void FastCompilerARM64::GenerateSuspendCheckAndIncrementHotness(uint32_t dex_pc, Register temp) {
+  GenerateSuspendCheck(dex_pc);
+  __ Ldr(temp, MemOperand(sp, 0));
+  IncrementHotness(temp);
+}
+
 void FastCompilerARM64::StartBranchTarget(bool flow_continues, uint32_t dex_pc) {
   if (flow_continues) {
     // Emulate a branch to this pc.
@@ -812,7 +841,7 @@ void FastCompilerARM64::StartBranchTarget(bool flow_continues, uint32_t dex_pc) 
   }
 
   // Set new masks based on all incoming edges.
-  if (IsLoopHeader(dex_pc)) {
+  if (CanBeLoopHeader(dex_pc)) {
     // Disable non-null optimizations at loop header. It's preferable to perform
     // the compilation rather than bailing out because the back edge has a
     // different null mask.
@@ -825,15 +854,16 @@ void FastCompilerARM64::StartBranchTarget(bool flow_continues, uint32_t dex_pc) 
   object_stack_mask_.Copy(object_stack_masks_[dex_pc]);
 }
 
-bool FastCompilerARM64::ProcessInstructions() {
-  DCHECK(GetCodeItemAccessor().HasCodeItem());
-
-  DexInstructionIterator it = GetCodeItemAccessor().begin();
-  DexInstructionIterator end = GetCodeItemAccessor().end();
-  DCHECK(it != end);
+bool FastCompilerARM64::ProcessBlock(uint32_t dex_pc) {
   bool flow_continues = false;
+  DexInstructionIterator it = GetCodeItemAccessor().InstructionsFrom(dex_pc).begin();
+  DexInstructionIterator end = GetCodeItemAccessor().end();
   do {
     DexInstructionPcPair pair = *it;
+    if (processed_.IsBitSet(pair.DexPc())) {
+      break;
+    }
+    processed_.SetBit(pair.DexPc());
     ++it;
 
     // Fetch the next instruction as a micro-optimization currently only used
@@ -842,7 +872,7 @@ bool FastCompilerARM64::ProcessInstructions() {
     if (it != end) {
       const DexInstructionPcPair& next_pair = *it;
       if (GetLabelOf(next_pair.DexPc())->IsLinked() ||
-          IsLoopHeader(next_pair.DexPc()) ||
+          CanBeLoopHeader(next_pair.DexPc()) ||
           catch_pcs_.IsBitSet(next_pair.DexPc())) {
         // Disable the micro-optimization, as the next instruction is a branch
         // target.
@@ -854,20 +884,13 @@ bool FastCompilerARM64::ProcessInstructions() {
 
     vixl::aarch64::Label* label = GetLabelOf(pair.DexPc());
     bool is_catch = catch_pcs_.IsBitSet(pair.DexPc());
-    bool is_loop_header = IsLoopHeader(pair.DexPc());
+    bool can_be_loop_header = CanBeLoopHeader(pair.DexPc());
     bool is_linked = label->IsLinked();
-    if (is_linked || is_loop_header || is_catch) {
+    if (is_linked || can_be_loop_header || is_catch) {
       StartBranchTarget(flow_continues, pair.DexPc());
     }
-    if (is_linked || is_loop_header) {
+    if (is_linked || can_be_loop_header) {
       __ Bind(label);
-      if (is_loop_header) {
-        GenerateSuspendCheck();
-        UseScratchRegisterScope temps(GetVIXLAssembler());
-        Register temp = temps.AcquireX();
-        __ Ldr(temp, MemOperand(sp, 0));
-        IncrementHotness(temp);
-      }
     }
     if (is_catch) {
       catch_stack_maps_.push_back(std::make_pair(pair.DexPc(), GetAssembler()->CodePosition()));
@@ -887,6 +910,7 @@ bool FastCompilerARM64::ProcessInstructions() {
             return false;
           }
           UpdateMasks(iterator.GetHandlerAddress());
+          AddToWorkQueue(iterator.GetHandlerAddress());
         }
       }
     }
@@ -919,7 +943,24 @@ bool FastCompilerARM64::ProcessInstructions() {
     // For the next instruction, let it know if the previous instruction was
     // flowing through.
     flow_continues = pair.Inst().CanFlowThrough();
+    if (!flow_continues) {
+      break;
+    }
   } while (it != end);
+  return true;
+}
+
+bool FastCompilerARM64::ProcessInstructions() {
+  DCHECK(GetCodeItemAccessor().HasCodeItem());
+
+  AddToWorkQueue(0);
+  while (!work_queue_.empty()) {
+    uint32_t dex_pc = work_queue_.top();
+    work_queue_.pop();
+    if (!ProcessBlock(dex_pc)) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -1046,6 +1087,7 @@ bool FastCompilerARM64::MoveLocation(Location destination,
 }
 
 Location FastCompilerARM64::CreateNewLocation(uint32_t reg, DataType::Type type) {
+  DCHECK(has_frame_);
   if (reg >= kMaximumRegisters) {
     return Location::StackSlot(GetStackSlot(reg));
   }
@@ -1112,14 +1154,7 @@ Location FastCompilerARM64::CreateNewRegisterLocation(uint32_t reg,
 }
 
 Location FastCompilerARM64::GetExistingRegisterLocation(uint32_t reg, DataType::Type type) {
-  if (vreg_locations_[reg].IsInvalid()) {
-    unimplemented_reason_ = "UnverifiedDeadCode";
-    // Return a phony location.
-    return DataType::IsFloatingPointType(type)
-        ? Location::FpuRegister(1)
-        : Location::CoreRegister(1);
-  }
-
+  DCHECK(!vreg_locations_[reg].IsInvalid());
   if (DataType::IsFloatingPointType(type)) {
     if (vreg_locations_[reg].IsFpuRegister()) {
       return vreg_locations_[reg];
@@ -1264,7 +1299,7 @@ bool FastCompilerARM64::EnsureHasFrame() {
     return false;
   }
 
-  GenerateSuspendCheck();
+  GenerateSuspendCheck(/* dex_pc= */ 0u);
   return true;
 }
 
@@ -1365,18 +1400,16 @@ bool FastCompilerARM64::GenerateFrame() {
 
   // Increment hotness. We use the ArtMethod's counter as we're not allocating a
   // `ProfilingInfo` object in the fast baseline compiler.
-  if (!Runtime::Current()->IsAotCompiler()) {
-    IncrementHotness(kArtMethodRegister);
-  }
+  IncrementHotness(kArtMethodRegister);
   return true;
 }
 
-void FastCompilerARM64::GenerateSuspendCheck() {
+void FastCompilerARM64::GenerateSuspendCheck(uint32_t dex_pc) {
   MacroAssembler* masm = GetVIXLAssembler();
   if (compiler_options_.GetImplicitSuspendChecks()) {
     ExactAssemblyScope eas(masm, kInstructionSize, CodeBufferCheckScope::kExactSize);
     __ ldr(kImplicitSuspendCheckRegister, MemOperand(kImplicitSuspendCheckRegister));
-    RecordPcInfo(0);
+    RecordPcInfo(dex_pc);
   } else {
     UseScratchRegisterScope temps(masm);
     Register temp = temps.AcquireW();
@@ -1390,7 +1423,7 @@ void FastCompilerARM64::GenerateSuspendCheck() {
     {
       ExactAssemblyScope eas(masm, kInstructionSize, CodeBufferCheckScope::kExactSize);
       __ blr(lr);
-      RecordPcInfo(0);
+      RecordPcInfo(dex_pc);
     }
     __ Bind(&continue_label);
   }
@@ -1459,10 +1492,6 @@ bool FastCompilerARM64::SetupArguments(InvokeType invoke_type,
 }
 
 bool FastCompilerARM64::LoadMethod(Register reg, ArtMethod* method) {
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTLoadMethod";
-    return false;
-  }
   __ Ldr(reg, jit_patches_.DeduplicateUint64Literal(reinterpret_cast<uint64_t>(method)));
   return true;
 }
@@ -1634,10 +1663,6 @@ bool FastCompilerARM64::BuildLoadString(uint32_t vreg,
   if (HitUnimplemented()) {
     return false;
   }
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTLoadString";
-    return false;
-  }
 
   ScopedObjectAccess soa(Thread::Current());
   ClassLinker* const class_linker = dex_compilation_unit_.GetClassLinker();
@@ -1671,10 +1696,6 @@ bool FastCompilerARM64::BuildLoadClass(uint32_t vreg,
   if (HitUnimplemented()) {
     return false;
   }
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTLoadClass";
-    return false;
-  }
 
   ScopedObjectAccess soa(Thread::Current());
   ObjPtr<mirror::Class> klass = dex_compilation_unit_.GetClassLinker()->ResolveType(
@@ -1702,10 +1723,6 @@ bool FastCompilerARM64::BuildNewInstance(uint32_t vreg,
                                          uint32_t dex_pc,
                                          const Instruction* next) {
   if (!EnsureHasFrame()) {
-    return false;
-  }
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTNewInstance";
     return false;
   }
 
@@ -1761,10 +1778,6 @@ bool FastCompilerARM64::BuildNewArray(dex::TypeIndex type_index,
   QuickEntrypointEnum entrypoint =
       CodeGenerator::GetArrayAllocationEntrypoint(component_type_shift);
   DCHECK(has_frame_);
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTNewArray";
-    return false;
-  }
 
   InvokeRuntimeCallingConvention calling_convention;
   Register cls_reg = calling_convention.GetRegisterAt(0);
@@ -2068,11 +2081,16 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
   }
   int32_t target_offset = kCompareWithZero ? instruction.VRegB_21t() : instruction.VRegC_22t();
   DCHECK_EQ(target_offset, instruction.GetTargetOffset());
-  if (target_offset < 0 && !CanHandleBackwardsBranch(dex_pc + target_offset)) {
-    return false;
+  vixl::aarch64::Label* label = GetLabelOf(dex_pc + target_offset);
+  bool is_back_edge = (target_offset < 0);
+  vixl::aarch64::Label suspend_check;
+  if (is_back_edge) {
+    if (!CanHandleBackwardsBranch(dex_pc + target_offset)) {
+      return false;
+    }
+    label = &suspend_check;
   }
   int32_t register_index = kCompareWithZero ? instruction.VRegA_21t() : instruction.VRegA_22t();
-  vixl::aarch64::Label* label = GetLabelOf(dex_pc + target_offset);
   Location location = vreg_locations_[register_index];
 
   if (kCompareWithZero) {
@@ -2090,7 +2108,6 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
         DO_CASE(vixl::aarch64::gt, >, 0);
         DO_CASE(vixl::aarch64::ge, >=, 0);
       }
-      return true;
     } else {
       location = GetExistingRegisterLocation(register_index, DataType::Type::kInt32);
       if (HitUnimplemented()) {
@@ -2100,51 +2117,59 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
       switch (kCond) {
         case vixl::aarch64::eq: {
           __ Cbz(Register(reg), label);
-          return true;
+          break;
         }
         case vixl::aarch64::ne: {
           __ Cbnz(Register(reg), label);
-          return true;
+          break;
         }
         default: {
           __ Cmp(Register(reg), 0);
           __ B(kCond, label);
-          return true;
+          break;
         }
       }
     }
-    LOG(FATAL) << "UNREACHABLE";
-    UNREACHABLE();
+  } else {
+    // !kCompareWithZero
+    Location other_location = vreg_locations_[instruction.VRegB_22t()];
+    // We are going to branch, move all constants to registers to make the merge
+    // point use the same locations.
+    PrepareToBranch(dex_pc + target_offset);
+    if (location.IsConstant() && other_location.IsConstant()) {
+      int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
+      int32_t other_constant = other_location.GetConstant()->AsIntConstant()->GetValue();
+      switch (kCond) {
+        DO_CASE(vixl::aarch64::eq, ==, other_constant);
+        DO_CASE(vixl::aarch64::ne, !=, other_constant);
+        DO_CASE(vixl::aarch64::lt, <, other_constant);
+        DO_CASE(vixl::aarch64::le, <=, other_constant);
+        DO_CASE(vixl::aarch64::gt, >, other_constant);
+        DO_CASE(vixl::aarch64::ge, >=, other_constant);
+      }
+    } else {
+      // Reload the locations, which can now be registers.
+      location = GetExistingRegisterLocation(register_index, DataType::Type::kInt32);
+      other_location = GetExistingRegisterLocation(instruction.VRegB_22t(), DataType::Type::kInt32);
+      if (HitUnimplemented()) {
+        return false;
+      }
+      CPURegister reg = CPURegisterFrom(location, DataType::Type::kInt32);
+      CPURegister other_reg = CPURegisterFrom(other_location, DataType::Type::kInt32);
+      __ Cmp(Register(reg), Register(other_reg));
+      __ B(kCond, label);
+    }
   }
 
-  // !kCompareWithZero
-  Location other_location = vreg_locations_[instruction.VRegB_22t()];
-  // We are going to branch, move all constants to registers to make the merge
-  // point use the same locations.
-  PrepareToBranch(dex_pc + target_offset);
-  if (location.IsConstant() && other_location.IsConstant()) {
-    int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
-    int32_t other_constant = other_location.GetConstant()->AsIntConstant()->GetValue();
-    switch (kCond) {
-      DO_CASE(vixl::aarch64::eq, ==, other_constant);
-      DO_CASE(vixl::aarch64::ne, !=, other_constant);
-      DO_CASE(vixl::aarch64::lt, <, other_constant);
-      DO_CASE(vixl::aarch64::le, <=, other_constant);
-      DO_CASE(vixl::aarch64::gt, >, other_constant);
-      DO_CASE(vixl::aarch64::ge, >=, other_constant);
-    }
-    return true;
+  if (is_back_edge) {
+    vixl::aarch64::Label next_instruction;
+    __ B(&next_instruction);
+    __ Bind(label);
+    UseScratchRegisterScope temps(GetVIXLAssembler());
+    GenerateSuspendCheckAndIncrementHotness(dex_pc, temps.AcquireX());
+    __ B(GetLabelOf(dex_pc + target_offset));
+    __ Bind(&next_instruction);
   }
-  // Reload the locations, which can now be registers.
-  location = GetExistingRegisterLocation(register_index, DataType::Type::kInt32);
-  other_location = GetExistingRegisterLocation(instruction.VRegB_22t(), DataType::Type::kInt32);
-  if (HitUnimplemented()) {
-    return false;
-  }
-  CPURegister reg = CPURegisterFrom(location, DataType::Type::kInt32);
-  CPURegister other_reg = CPURegisterFrom(other_location, DataType::Type::kInt32);
-  __ Cmp(Register(reg), Register(other_reg));
-  __ B(kCond, label);
   return true;
 }
 #undef DO_CASE
@@ -2398,7 +2423,7 @@ bool FastCompilerARM64::BuildArrayAccess(const Instruction& instruction,
   Register temp = calling_convention.GetRegisterAt(1);
   // Fetch the length, and do a null pointer check.
   {
-    // Ensure the pc position is recorded immediately after the store instruction.
+    // Ensure the pc position is recorded immediately after the load instruction.
     EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
     __ Ldr(temp, mem);
     if (CanBeNull(array_reg)) {
@@ -2734,10 +2759,6 @@ bool FastCompilerARM64::BuildStaticFieldAccess(const Instruction& instruction,
                                                bool is_object,
                                                bool is_put,
                                                const Instruction* next) {
-  if (Runtime::Current()->IsAotCompiler()) {
-    unimplemented_reason_ = "AOTStaticFieldAccess";
-    return false;
-  }
   // We need a frame for the read barrier and the clinit check.
   if (!EnsureHasFrame()) {
     return false;
@@ -2745,8 +2766,7 @@ bool FastCompilerARM64::BuildStaticFieldAccess(const Instruction& instruction,
   ArtField* field = nullptr;
   uint16_t field_index = instruction.VRegB_21c();
   uint32_t source_or_dest_reg = instruction.VRegA_21c();
-  UseScratchRegisterScope temps(GetVIXLAssembler());
-  Register temp = temps.AcquireX();
+  Register temp = vixl::aarch64::XRegister(GetTempCoreRegister());
   bool generate_clinit_check = false;
   {
     ScopedObjectAccess soa(Thread::Current());
@@ -3009,7 +3029,7 @@ bool FastCompilerARM64::BuildSwitch(const Instruction& instruction, uint32_t dex
     return true;
   }
   UseScratchRegisterScope temps(GetVIXLAssembler());
-  Register temp = temps.AcquireW();
+  Register temp = temps.AcquireX();
   MoveConstantsAndFpusToRegisters();
   for (DexSwitchTableIterator it(table); !it.Done(); it.Advance()) {
     int32_t target_offset = it.CurrentTargetOffset();
@@ -3018,11 +3038,87 @@ bool FastCompilerARM64::BuildSwitch(const Instruction& instruction, uint32_t dex
     }
     vixl::aarch64::Label* label = GetLabelOf(dex_pc + target_offset);
     UpdateMasks(dex_pc + it.CurrentTargetOffset());
-    __ Mov(temp, it.CurrentKey());
-    __ Cmp(reg, temp);
-    __ B(eq, label);
+    AddToWorkQueue(dex_pc + it.CurrentTargetOffset());
+    __ Mov(temp.W(), it.CurrentKey());
+    __ Cmp(reg, temp.W());
+    if (target_offset <= 0) {
+      vixl::aarch64::Label cont;
+      __ B(ne, &cont);
+      GenerateSuspendCheckAndIncrementHotness(dex_pc, temp);
+      __ B(label);
+      __ Bind(&cont);
+    } else {
+      __ B(eq, label);
+    }
   }
   // The default case is a fallthrough to the next opcode..
+  return true;
+}
+
+bool FastCompilerARM64::BuildFillArrayData(const Instruction& instruction, uint32_t dex_pc) {
+  if (!EnsureHasFrame()) {
+    return false;
+  }
+
+  uint32_t array_reg = instruction.VRegA_31t();
+  Register array = RegisterFrom(
+      GetExistingRegisterLocation(array_reg, DataType::Type::kReference),
+      DataType::Type::kReference);
+  InvokeRuntimeCallingConvention calling_convention;
+  Register length = calling_convention.GetRegisterAt(1).W();
+  MemOperand mem = HeapOperand(array.W(), mirror::Array::LengthOffset().Uint32Value());
+  // Fetch the length, and do a null pointer check.
+  {
+    // Ensure the pc position is recorded immediately after the load instruction.
+    EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
+    __ Ldr(length, mem);
+    if (CanBeNull(array_reg)) {
+      RecordPcInfo(dex_pc);
+    }
+  }
+
+  int32_t payload_offset = instruction.VRegB_31t() + dex_pc;
+  const Instruction::ArrayDataPayload* payload =
+      reinterpret_cast<const Instruction::ArrayDataPayload*>(
+          GetCodeItemAccessor().Insns() + payload_offset);
+  uint32_t element_count = payload->element_count;
+  if (element_count == 0u) {
+    return true;
+  }
+  Register temp = calling_convention.GetRegisterAt(0);
+
+  {
+    __ Mov(temp.W(), element_count - 1);
+    // Bounds check.
+    __ Cmp(temp.W(), length.W());
+    vixl::aarch64::Label cont;
+    __ B(vixl::aarch64::lo, &cont);
+    InvokeRuntime(kQuickThrowArrayBounds, dex_pc);
+    __ Bind(&cont);
+  }
+
+  const uint8_t* data = payload->data;
+  uint16_t element_width = payload->element_width;
+#define STORE(type, data_type, instruction, reg) \
+  { \
+    size_t offset = mirror::Array::DataOffset(DataType::Size(data_type)).Uint32Value(); \
+    for (uint32_t i = 0; i < element_count; ++i) { \
+      __ Mov(reg, reinterpret_cast<const type*>(data)[i]); \
+      __ instruction(reg, HeapOperand(array, offset)); \
+      offset += DataType::Size(data_type); \
+    } \
+    break; \
+  }
+
+  switch (element_width) {
+    case 1: STORE(int8_t, DataType::Type::kInt8, Strb, temp.W())
+    case 2: STORE(int16_t, DataType::Type::kInt16, Strh, temp.W())
+    case 4: STORE(int32_t, DataType::Type::kInt32, Str, temp.W())
+    case 8: STORE(int64_t, DataType::Type::kInt64, Str, temp.X())
+    default:
+      LOG(FATAL) << "Unknown element width for " << element_width;
+  }
+#undef STORE
   return true;
 }
 
@@ -3165,9 +3261,16 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     case Instruction::GOTO:
     case Instruction::GOTO_16:
     case Instruction::GOTO_32: {
-      int32_t target_offset = instruction.GetTargetOffset();
-      if (target_offset <= 0 && !CanHandleBackwardsBranch(dex_pc + target_offset)) {
+      if (!EnsureHasFrame()) {
         return false;
+      }
+      int32_t target_offset = instruction.GetTargetOffset();
+      if (target_offset <= 0) {
+        if (!CanHandleBackwardsBranch(dex_pc + target_offset)) {
+          return false;
+        }
+        UseScratchRegisterScope temps(GetVIXLAssembler());
+        GenerateSuspendCheckAndIncrementHotness(dex_pc, temps.AcquireX());
       }
       PrepareToBranch(dex_pc + target_offset);
       vixl::aarch64::Label* label = GetLabelOf(dex_pc + target_offset);
@@ -3643,7 +3746,7 @@ bool FastCompilerARM64::ProcessDexInstruction(const Instruction& instruction,
     }
 
     case Instruction::FILL_ARRAY_DATA: {
-      break;
+      return BuildFillArrayData(instruction, dex_pc);
     }
 
     case Instruction::MOVE_RESULT_OBJECT:

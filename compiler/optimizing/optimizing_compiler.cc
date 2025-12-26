@@ -280,9 +280,8 @@ class OptimizingCompiler final : public Compiler {
                   jit::JitMemoryRegion* region,
                   ArtMethod* method,
                   CompilationKind compilation_kind,
-                  jit::JitLogger* jit_logger)
-      override
-      REQUIRES_SHARED(Locks::mutator_lock_);
+                  jit::JitLogger* jit_logger,
+                  bool dynamic_instrumentation) override REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   bool RunOptimizations(HGraph* graph,
@@ -346,6 +345,8 @@ class OptimizingCompiler final : public Compiler {
                        bool is_intrinsic,
                        const dex::CodeItem* item) const;
 
+  CompiledMethod* Emit(InstructionSet instruction_set, FastCompiler* compiler) const;
+
   // Try compiling a method and return the code generator used for
   // compiling it.
   // This method:
@@ -357,7 +358,8 @@ class OptimizingCompiler final : public Compiler {
                             const DexCompilationUnit& dex_compilation_unit,
                             ArtMethod* method,
                             CompilationKind compilation_kind,
-                            VariableSizedHandleScope* handles) const;
+                            VariableSizedHandleScope* handles,
+                            bool dynamic_instrumentation) const;
 
   CodeGenerator* TryCompileIntrinsic(ArenaAllocator* allocator,
                                      ArenaStack* arena_stack,
@@ -752,6 +754,21 @@ CompiledMethod* OptimizingCompiler::Emit(ArenaAllocator* allocator,
   return compiled_method;
 }
 
+CompiledMethod* OptimizingCompiler::Emit(InstructionSet instruction_set,
+                                         FastCompiler* compiler) const {
+  ScopedArenaVector<uint8_t> stack_map = compiler->BuildStackMaps();
+  CompiledCodeStorage* storage = GetCompiledCodeStorage();
+  CompiledMethod* compiled_method = storage->CreateCompiledMethod(
+      instruction_set,
+      compiler->GetCode(),
+      ArrayRef<const uint8_t>(stack_map),
+      ArrayRef<const uint8_t>(compiler->GetCfiData()),
+      // TODO: Support linker patches for the fast compiler.
+      ArrayRef<const linker::LinkerPatch>(),
+      /* is_intrinsic= */ false);
+  return compiled_method;
+}
+
 #ifdef ART_USE_RESTRICTED_MODE
 
 // This class acts as a filter and enables gradual enablement of ART Simulator work - we
@@ -805,7 +822,8 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
                                               const DexCompilationUnit& dex_compilation_unit,
                                               ArtMethod* method,
                                               CompilationKind compilation_kind,
-                                              VariableSizedHandleScope* handles) const {
+                                              VariableSizedHandleScope* handles,
+                                              bool dynamic_instrumentation) const {
   MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kAttemptBytecodeCompilation);
   const CompilerOptions& compiler_options = GetCompilerOptions();
   InstructionSet instruction_set = compiler_options.GetInstructionSet();
@@ -863,17 +881,18 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
     dead_reference_safe = false;
   }
 
-  HGraph* graph = new (allocator) HGraph(
-      allocator,
-      arena_stack,
-      handles,
-      dex_file,
-      method_idx,
-      compiler_options.GetInstructionSet(),
-      kInvalidInvokeType,
-      dead_reference_safe,
-      compiler_options.GetDebuggable(),
-      compilation_kind);
+  HGraph* graph = new (allocator) HGraph(allocator,
+                                         arena_stack,
+                                         handles,
+                                         dex_file,
+                                         method_idx,
+                                         compiler_options.GetInstructionSet(),
+                                         kInvalidInvokeType,
+                                         dead_reference_safe,
+                                         compiler_options.GetDebuggable(),
+                                         compilation_kind,
+                                         /* start_instruction_id= */ 0,
+                                         /* dynamic_instrumentation= */ dynamic_instrumentation);
 
   if (method != nullptr) {
     graph->SetArtMethod(method);
@@ -894,6 +913,9 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
     return nullptr;
   }
   codegen->GetAssembler()->cfi().SetEnabled(compiler_options.GenerateAnyDebugInfo());
+  if (dynamic_instrumentation) {
+    codegen->SetRequiresCurrentMethod(true);
+  }
 
   PassObserver pass_observer(graph,
                              codegen.get(),
@@ -1174,15 +1196,28 @@ CompiledMethod* OptimizingCompiler::Compile(const dex::CodeItem* code_item,
       }
     }
     if (codegen == nullptr) {
-      codegen.reset(
-          TryCompile(&allocator,
-                     &arena_stack,
-                     dex_compilation_unit,
-                     method,
-                     compiler_options.IsBaseline()
-                        ? CompilationKind::kBaseline
-                        : CompilationKind::kOptimized,
-                     &handles));
+      if (compiler_options.IsFast()) {
+        std::unique_ptr<FastCompiler> fast_compiler =
+            FastCompiler::Compile(method,
+                                  &allocator,
+                                  &arena_stack,
+                                  &handles,
+                                  compiler_options,
+                                  dex_compilation_unit);
+        if (fast_compiler != nullptr) {
+          return Emit(compiler_options.GetInstructionSet(), fast_compiler.get());
+        } else {
+          return nullptr;
+        }
+      }
+      codegen.reset(TryCompile(
+          &allocator,
+          &arena_stack,
+          dex_compilation_unit,
+          method,
+          compiler_options.IsBaseline() ? CompilationKind::kBaseline : CompilationKind::kOptimized,
+          &handles,
+          /* dynamic_instrumentation= */ false));
     }
   }
   if (codegen.get() != nullptr) {
@@ -1320,7 +1355,8 @@ bool OptimizingCompiler::JitCompile(Thread* self,
                                     jit::JitMemoryRegion* region,
                                     ArtMethod* method,
                                     CompilationKind compilation_kind,
-                                    jit::JitLogger* jit_logger) {
+                                    jit::JitLogger* jit_logger,
+                                    bool dynamic_instrumentation) {
   const CompilerOptions& compiler_options = GetCompilerOptions();
   DCHECK(compiler_options.IsJitCompiler());
   DCHECK_EQ(compiler_options.IsJitCompilerForSharedCode(), code_cache->IsSharedRegion(*region));
@@ -1533,13 +1569,13 @@ bool OptimizingCompiler::JitCompile(Thread* self,
     {
       // Go to native so that we don't block GC during compilation.
       ScopedThreadSuspension sts(self, ThreadState::kNative);
-      codegen.reset(
-          TryCompile(&allocator,
-                     &arena_stack,
-                     dex_compilation_unit,
-                     method,
-                     compilation_kind,
-                     &handles));
+      codegen.reset(TryCompile(&allocator,
+                               &arena_stack,
+                               dex_compilation_unit,
+                               method,
+                               compilation_kind,
+                               &handles,
+                               dynamic_instrumentation));
       if (codegen.get() == nullptr) {
         return false;
       }

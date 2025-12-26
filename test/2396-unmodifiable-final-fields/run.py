@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # Copyright (C) 2025 The Android Open Source Project
 #
@@ -13,19 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.class public LTest;
-.super Ljava/lang/Object;
 
-.method public static foo()I
-   .registers 2
-   const/4 v0, 0x0
-   const/4 v1, 0x0
-   # Note that the array is null.
-   aget-object v0, v1, v0
-   # Compare null reference against non-zero integral => error.
-   const/4 v1, 0x2
-   if-eq v0, v1, :end
-   return v1
-:end
-   return v1
-.end method
+def run(ctx, args):
+  # By the time VMRuntime.setTargetSdkVersion can be called bootimage classes are
+  # already initialized.
+  ctx.default_run(args, runtime_option=["-Xtarget-sdk-version:31"])
+  ctx.default_run(args, runtime_option=["-Xtarget-sdk-version:37"])

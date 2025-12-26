@@ -44,6 +44,7 @@
 #include "base/file_utils.h"
 #include "base/hash_map.h"
 #include "base/hash_set.h"
+#include "base/inlined_vector.h"
 #include "base/leb128.h"
 #include "base/logging.h"
 #include "base/mem_map_arena_pool.h"
@@ -169,6 +170,7 @@
 namespace art HIDDEN {
 
 using android::base::StringPrintf;
+using std::string_view_literals::operator""sv;
 
 static constexpr bool kCheckImageObjects = kIsDebugBuild;
 static constexpr bool kVerifyArtMethodDeclaringClasses = kIsDebugBuild;
@@ -2507,6 +2509,29 @@ bool ClassLinker::AddImageSpaces(ArrayRef<gc::space::ImageSpace*> spaces,
   return true;
 }
 
+void ClassLinker::PruneDexCacheAndBssStringEntries(Thread* self) {
+  ReaderMutexLock mu(self, *Locks::dex_lock_);
+  InlinedVector<const OatFile*, 32u> pruned_oat_files;
+  for (const auto& entry : dex_caches_) {
+    const DexFile* dex_file = entry.first;
+    ObjPtr<mirror::DexCache> dex_cache =
+        ObjPtr<mirror::DexCache>::DownCast(self->DecodeJObject(entry.second.weak_root));
+    if (dex_cache != nullptr) {
+      dex_cache->ClearAllStrings();
+      if (dex_file->GetOatDexFile() != nullptr &&
+          dex_file->GetOatDexFile()->GetOatFile() != nullptr &&
+          !ContainsElement(pruned_oat_files.GetArray(), dex_file->GetOatDexFile()->GetOatFile())) {
+        const OatFile* oat_file = dex_file->GetOatDexFile()->GetOatFile();
+        pruned_oat_files.push_back(oat_file);
+        for (GcRoot<mirror::Object>& root : oat_file->GetBssStrings()) {
+          DCHECK_IMPLIES(!root.IsNull(), root.Read<kWithoutReadBarrier>()->IsString());
+          root = GcRoot<mirror::Object>(nullptr);
+        }
+      }
+    }
+  }
+}
+
 void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
   // Acquire tracing_enabled before locking class linker lock to prevent lock order violation. Since
   // enabling tracing requires the mutator lock, there are no race conditions here.
@@ -2959,10 +2984,10 @@ ObjPtr<mirror::Class> ClassLinker::EnsureResolved(Thread* self,
                                                   std::string_view descriptor,
                                                   ObjPtr<mirror::Class> klass) {
   DCHECK(klass != nullptr);
-  if (kIsDebugBuild) {
+  if (kObjPtrPoisoning) {
     StackHandleScope<1> hs(self);
     HandleWrapperObjPtr<mirror::Class> h = hs.NewHandleWrapper(&klass);
-    Thread::PoisonObjectPointersIfDebug();
+    Thread::PoisonObjectPointersOnCurrentThread();
   }
 
   // Helper lambda to make sure we wait for a particular status (i.e. retired or resolved) while
@@ -3528,7 +3553,7 @@ struct ScopedDefiningClass {
     CHECK(!returned_);
     self_->DecrDefineClassCount();
     Runtime::Current()->GetRuntimeCallbacks()->EndDefineClass();
-    Thread::PoisonObjectPointersIfDebug();
+    Thread::PoisonObjectPointersOnCurrentThread();
     returned_ = true;
     return h_klass.Get();
   }
@@ -3716,6 +3741,71 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
   self->AssertNoPendingException();
   CHECK(h_new_class != nullptr) << descriptor;
   CHECK(h_new_class->IsResolved()) << descriptor << " " << h_new_class->GetStatus();
+
+  bool all_final_fields_are_monotonic = false;
+  if (h_new_class->IsRecordClass()) {
+    // According to JLS all instance fields in record classes are final (with extra immutability
+    // guarantees), but there seems to be nothing in JVMS which enforces that.
+    // TODO(mingaleev): sort out how record classes with non-final fields should be handled.
+    all_final_fields_are_monotonic = true;
+  } else if (h_new_class->IsBootStrapClassLoaded()
+             && !h_new_class->IsArrayClass()
+             && !h_new_class->IsPrimitive()
+             && !h_new_class->IsProxyClass()) {
+    // `final` fields in box and Atomic*FieldUpdater implementation classes and classes defined in
+    // java.lang.invoke package classes are unmodifiable too.
+    std::string_view class_name = h_new_class->GetDescriptorView();
+    if (class_name.starts_with("Ljava/")) {
+      static constexpr const std::string_view kBoxClasses[] = {
+          "Ljava/lang/Boolean;"sv,
+          "Ljava/lang/Byte;"sv,
+          "Ljava/lang/Character;"sv,
+          "Ljava/lang/Short;"sv,
+          "Ljava/lang/Integer;"sv,
+          "Ljava/lang/Float;"sv,
+          "Ljava/lang/Long;"sv,
+          "Ljava/lang/Double;"sv
+      };
+
+      // Ideally this should be applied to all java.lang.* classes, but there is at least one app
+      // which overwrites ClassLoader.parent field.
+      for (const std::string_view box_class : kBoxClasses) {
+        if (class_name == box_class) {
+          all_final_fields_are_monotonic = true;
+        }
+      }
+
+      if (class_name.starts_with("Ljava/lang/invoke/")) {
+        all_final_fields_are_monotonic = true;
+      }
+
+      if (class_name.starts_with("Ljava/util/concurrent/atomic/")) {
+        // Exact implementations of Atomic*FieldUpdater classes.
+        static constexpr const std::string_view kAtomicUpdaterImplClasses[] = {
+            "Ljava/util/concurrent/atomic/"
+                "AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl;"sv,
+            "Ljava/util/concurrent/atomic/"
+                "AtomicIntegerFieldUpdater$AtomicIntegerFieldUpdaterImpl;"sv,
+            "Ljava/util/concurrent/atomic/"
+                "AtomicLongFieldUpdater$CASUpdater;"sv
+        };
+
+        for (const std::string_view updater : kAtomicUpdaterImplClasses) {
+          if (class_name == updater) {
+            all_final_fields_are_monotonic = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (all_final_fields_are_monotonic) {
+    for (ArtField& field : h_new_class->GetFields()) {
+      if (field.IsFinal()) {
+        field.SetMonotonicField();
+      }
+    }
+  }
 
   // Instrumentation may have updated entrypoints for all methods of all
   // classes. However it could not update methods of this class while we
@@ -4628,10 +4718,6 @@ void ClassLinker::RegisterExistingDexCache(ObjPtr<mirror::DexCache> dex_cache,
     WriterMutexLock mu(self, *Locks::classlinker_classes_lock_);
     table = InsertClassTableForClassLoader(h_class_loader.Get());
   }
-  // Avoid a deadlock between a garbage collecting thread running a checkpoint,
-  // a thread holding the dex lock and blocking on a condition variable regarding
-  // weak references access, and a thread blocking on the dex lock.
-  gc::ScopedGCCriticalSection gcs(self, gc::kGcCauseClassLinker, gc::kCollectorTypeClassLinker);
   WriterMutexLock mu(self, *Locks::dex_lock_);
   RegisterDexFileLocked(*dex_file, h_dex_cache.Get(), h_class_loader.Get());
   table->InsertStrongRoot(h_dex_cache.Get());
@@ -4714,10 +4800,6 @@ ObjPtr<mirror::DexCache> ClassLinker::RegisterDexFile(const DexFile& dex_file,
   Handle<mirror::ClassLoader> h_class_loader(hs.NewHandle(class_loader));
   Handle<mirror::DexCache> h_dex_cache(hs.NewHandle(AllocDexCache(self, dex_file)));
   {
-    // Avoid a deadlock between a garbage collecting thread running a checkpoint,
-    // a thread holding the dex lock and blocking on a condition variable regarding
-    // weak references access, and a thread blocking on the dex lock.
-    gc::ScopedGCCriticalSection gcs(self, gc::kGcCauseClassLinker, gc::kCollectorTypeClassLinker);
     WriterMutexLock mu(self, *Locks::dex_lock_);
     const DexCacheData* old_data = FindDexCacheDataLocked(dex_file);
     old_dex_cache = DecodeDexCacheLocked(self, old_data);
@@ -10449,8 +10531,8 @@ ArtMethod* ClassLinker::ResolveMethodId(uint32_t method_idx,
                                         Handle<mirror::DexCache> dex_cache,
                                         Handle<mirror::ClassLoader> class_loader) {
   DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
+  Thread::PoisonObjectPointersOnCurrentThread();
   ArtMethod* resolved = dex_cache->GetResolvedMethod(method_idx);
-  Thread::PoisonObjectPointersIfDebug();
   if (resolved != nullptr) {
     DCHECK(!resolved->IsRuntimeMethod());
     DCHECK(resolved->GetDeclaringClassUnchecked() != nullptr) << resolved->GetDexMethodIndex();
@@ -10491,8 +10573,8 @@ ArtField* ClassLinker::ResolveFieldJLS(uint32_t field_idx,
                                        Handle<mirror::ClassLoader> class_loader) {
   DCHECK(dex_cache != nullptr);
   DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
+  Thread::PoisonObjectPointersOnCurrentThread();
   ArtField* resolved = dex_cache->GetResolvedField(field_idx);
-  Thread::PoisonObjectPointersIfDebug();
   if (resolved != nullptr) {
     return resolved;
   }

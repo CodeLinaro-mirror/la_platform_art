@@ -44,6 +44,7 @@
 #include "base/time_utils.h"
 #include "base/utils.h"
 #include "class_root-inl.h"
+#include "com_android_art_flags.h"
 #include "common_throws.h"
 #include "debugger.h"
 #include "dex/dex_file-inl.h"
@@ -308,6 +309,7 @@ Heap::Heap(size_t initial_size,
            bool verify_pre_sweeping_rosalloc,
            bool verify_post_gc_rosalloc,
            bool gc_stress_mode,
+           bool continuous_gc_mode,
            bool measure_gc_performance,
            bool use_homogeneous_space_compaction_for_oom,
            bool use_generational_gc,
@@ -354,7 +356,6 @@ Heap::Heap(size_t initial_size,
       process_state_update_lock_("process state update lock", kPostMonitorLock),
       min_foreground_target_footprint_(0),
       min_foreground_concurrent_start_bytes_(0),
-      min_foreground_time_based_gc_threshold_(0),
       concurrent_start_bytes_(std::numeric_limits<size_t>::max()),
       total_bytes_freed_ever_(0),
       total_objects_freed_ever_(0),
@@ -393,7 +394,7 @@ Heap::Heap(size_t initial_size,
       max_free_(max_free),
       target_utilization_(target_utilization),
       enable_time_based_gc_trigger_(enable_time_based_gc_trigger),
-      memory_gc_cost_factor_(memory_gc_cost_factor),
+      time_based_gc_threshold_factor_(ComputeTimeBasedGcThresholdFactor(memory_gc_cost_factor)),
       foreground_heap_growth_multiplier_(foreground_heap_growth_multiplier),
       stop_for_native_allocs_(stop_for_native_allocs),
       total_wait_time_(0),
@@ -818,6 +819,8 @@ Heap::Heap(size_t initial_size,
   if (gc_stress_mode_) {
     backtrace_lock_ = new Mutex("GC complete lock");
   }
+  continuous_gc_mode_ = continuous_gc_mode && IsGcConcurrent();
+
   if (is_running_on_memory_tool_ || gc_stress_mode_) {
     instrumentation->InstrumentQuickAllocEntryPoints();
   }
@@ -1127,11 +1130,6 @@ void Heap::GrowHeapOnJankPerceptibleSwitch() {
   if (IsGcConcurrent()) {
     if (concurrent_start_bytes_ < min_foreground_concurrent_start_bytes_) {
       concurrent_start_bytes_ = min_foreground_concurrent_start_bytes_;
-    }
-    if (com::android::art::rw::flags::enable_time_based_gc_triggering()) {
-      if (time_based_gc_threshold_ < min_foreground_time_based_gc_threshold_) {
-        time_based_gc_threshold_ = min_foreground_time_based_gc_threshold_;
-      }
     }
   }
 }
@@ -1912,6 +1910,12 @@ void Heap::RecordFree(uint64_t freed_objects, int64_t freed_bytes) {
                    static_cast<int64_t>(num_bytes_allocated_.load(std::memory_order_relaxed)));
   // Note: This relies on 2s complement for handling negative freed_bytes.
   num_bytes_allocated_.fetch_sub(static_cast<ssize_t>(freed_bytes), std::memory_order_relaxed);
+  if (freed_bytes > 0 && TraceEnabled()) {
+    // Use release memory-order to ensure that the updation of num_bytes_allocated_
+    // above doesn't get reordered with this store.
+    TraceHeapSize(last_reported_heap_size_.fetch_sub(freed_bytes, std::memory_order_release) -
+                  freed_bytes);
+  }
   if (Runtime::Current()->HasStatsEnabled()) {
     RuntimeStats* thread_stats = Thread::Current()->GetStats();
     thread_stats->freed_objects += freed_objects;
@@ -2937,6 +2941,15 @@ collector::GcType Heap::CollectGarbageInternal(collector::GcType gc_type,
     CHECK(collector != nullptr) << "Could not find garbage collector with collector_type="
                                 << static_cast<size_t>(collector_type_)
                                 << " and gc_type=" << gc_type;
+
+    if (com::android::art::flags::weak_const_string() && gc_type != collector::kGcTypeSticky) {
+      // For full collection, prune `DexCache` and .bss references to `const-string`
+      // strings, so that weak interns may be collected. Strings promoted to strong
+      // interns or reachable by some other path shall be kept.
+      ReaderMutexLock mu(self, *Locks::mutator_lock_);
+      Runtime::Current()->GetClassLinker()->PruneDexCacheAndBssStringEntries(self);
+    }
+
     collector->Run(gc_cause, clear_soft_references || runtime->IsZygote());
     IncrementFreedEver();
     RequestTrim(self);
@@ -2980,7 +2993,7 @@ void Heap::LogGC(GcCause gc_cause, collector::GarbageCollector* collector) {
     }
   }
   bool is_sampled = false;
-  if (UNLIKELY(gc_stress_mode_)) {
+  if (UNLIKELY(gc_stress_mode_ || continuous_gc_mode_)) {
     static std::atomic_int64_t accumulated_duration_ns = 0;
     accumulated_duration_ns += duration;
     if (accumulated_duration_ns >= kGcStressModeGcLogSampleFrequencyNs) {
@@ -3819,14 +3832,6 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
   // This doesn't actually resize any memory. It just lets the heap grow more when necessary.
   const size_t bytes_allocated = GetBytesAllocated();
 
-  // Report the new heap size after the GC is finished and bytes_allocated has
-  // been adjusted with freed bytes.
-  if (TraceEnabled()) {
-    // Use release memory-order to ensure that the updation of num_bytes_allocated_
-    // (in RecordFree()) doesn't get reordered with this store.
-    last_reported_heap_size_.store(bytes_allocated, std::memory_order_release);
-    TraceHeapSize(bytes_allocated);
-  }
   uint64_t target_size, grow_bytes;
   collector::GcType gc_type = collector_ran->GetGcType();
   MutexLock mu(Thread::Current(), process_state_update_lock_);
@@ -3906,20 +3911,11 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
         // generous value for target footprint as a fallback to ensure we
         // start concurrent GC before running out of heap and provide
         // reasonable values for use in things like GetTotalMemory.
-        SetIdealFootprint(std::numeric_limits<size_t>::max());
+        SetIdealFootprint(growth_limit_);
 
         uint64_t expected_gc_cost_ms = NsToMs(current_gc_iteration_.GetThreadCpuTimeNs());
-        uint64_t memory_gc_cost_factor_kb = memory_gc_cost_factor_ / KB;
-        time_based_gc_threshold_ = 100 * expected_gc_cost_ms * memory_gc_cost_factor_kb;
+        time_based_gc_threshold_ = time_based_gc_threshold_factor_ * expected_gc_cost_ms;
         last_gc_start_time_ = current_gc_iteration_.GetStartTime();
-
-        // Apply growth multiplier.
-        // Store time_based_gc_threshold_ (computed with foreground heap
-        // growth multiplier) for update itself when process state switches to
-        // foreground.
-        min_foreground_time_based_gc_threshold_ =
-            (multiplier <= 1.0) ? time_based_gc_threshold_ * foreground_heap_growth_multiplier_ : 0;
-        time_based_gc_threshold_ *= multiplier;
 
         RequestTimeBasedGcThresholdCheck(Thread::Current());
       }
@@ -4052,6 +4048,15 @@ class Heap::ConcurrentGCTask : public HeapTask {
     DCHECK(GCNumberLt(my_gc_num_, heap->GetCurrentGcNum() + 2));  // <= current_gc_num + 1
     heap->ConcurrentGC(self, cause_, force_full_, my_gc_num_);
     CHECK_IMPLIES(GCNumberLt(heap->GetCurrentGcNum(), my_gc_num_), runtime->IsShuttingDown(self));
+    if (UNLIKELY(heap->continuous_gc_mode_) && heap->task_processor_->IsRunning()) {
+      // Add some delay to ensure that gc-thread doesn't saturate mutators in
+      // case they want to enter GC critical-section.
+      usleep(1'000);
+      // Add another concurrent GC task. If somebody else beat us with their
+      // gc-num, then this task won't be added. That is fine as the succeeding
+      // task with then add a task.
+      heap->RequestConcurrentGC(self, kGcCauseBackground, /*force_full_=*/false, my_gc_num_);
+    }
   }
 
  private:
@@ -4269,29 +4274,24 @@ void Heap::RevokeAllThreadLocalBuffers() {
   }
 }
 
-size_t Heap::GetDefaultMemoryGcCostFactor() {
-  if (com::android::art::rw::flags::auto_tune_time_based_gc_triggering()) {
-    // For the default value, use the ratio of total memory to compute resources
-    // on device, which should get us in a good ballpark.
-    int64_t num_cpus = sysconf(_SC_NPROCESSORS_CONF);
-    int64_t num_pages = sysconf(_SC_PHYS_PAGES);
-    int64_t page_size = sysconf(_SC_PAGESIZE);
-
-    if (num_cpus > 0 && num_pages > 0 && page_size > 0) {
-      return static_cast<size_t>(page_size * (num_pages / (100 * num_cpus)));
-    }
-  }
-
-  // We don't know how much memory or compute resources the device has. Pick
-  // something suitable for 2025 era phones and hope for the best.
-  // The default value was set to 32MB initially to match how aggressive GC
-  // was without time based GC triggering in lab tests. In a field study we
-  // saw GC was 44% more aggressive than before, so we increased the default
-  // value to compensate. In theory GC effort is inversely proportional to the
-  // square root of this tuning knob. The 2.25x increase in the tuning knob
-  // value from 32MB to 72MB should result in √(2.25) = 1.5x, or 50% less
-  // aggressive GC behavior.
-  return static_cast<size_t>(72 * MB);
+size_t Heap::ComputeTimeBasedGcThresholdFactor(double memory_gc_cost_factor) {
+  // memory_gc_cost_factor = (C/T) / (G/M), by definition
+  //  where C is the cost of a single GC.
+  //        T is the time between GCs.
+  //        C / T is fraction of a CPU spent doing GC.
+  //        G is memory saved by doing the GC.
+  //        M is total memory on device
+  //        G / M is fraction of device memory saved doing GC.
+  // time_based_gc_threshold = G * T, by definition.
+  // time_based_gc_threshold_factor = G * T / C, by definition.
+  //
+  // Solving for time_based_gc_threshold_factor in terms of
+  // memory_gc_cost_factor gives:
+  //   G * T / C = M / memory_gc_cost_factor
+  double num_pages = static_cast<double>(sysconf(_SC_PHYS_PAGES));
+  double page_size = static_cast<double>(sysconf(_SC_PAGESIZE));
+  double total_memory_kb = num_pages * page_size / KB;
+  return static_cast<size_t>(total_memory_kb / memory_gc_cost_factor);
 }
 
 class Heap::TimeBasedGcThresholdCheckTask : public HeapTask {

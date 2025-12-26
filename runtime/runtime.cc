@@ -1200,7 +1200,10 @@ bool Runtime::Start() {
         /*ref_profile_filename=*/ "",
         kVMRuntimePrimaryApk);
   }
-
+  // Add a concurrent-gc task after runtime has started if we are in continuous-gc mode.
+  if (heap_->InContinuousGCMode()) {
+    heap_->RequestConcurrentGC(self, gc::kGcCauseBackground, false, heap_->GetCurrentGcNum());
+  }
   return true;
 }
 
@@ -1828,12 +1831,17 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                         (gUseUserfaultfd ? BackgroundGcOption(gc::kCollectorTypeCMCBackground) :
                                            runtime_options.GetOrDefault(Opt::BackgroundGc));
 
+  bool enable_time_based_gc_trigger =
+      runtime_options.GetOrDefault(Opt::EnableTimeBasedGcTrigger) &&
+      !GetBoolProperty(
+          "persist.device_config.runtime_native_boot.force_disable_time_based_gc_trigger", false);
+
   heap_ = new gc::Heap(runtime_options.GetOrDefault(Opt::MemoryInitialSize),
                        runtime_options.GetOrDefault(Opt::HeapGrowthLimit),
                        runtime_options.GetOrDefault(Opt::HeapMinFree),
                        runtime_options.GetOrDefault(Opt::HeapMaxFree),
                        runtime_options.GetOrDefault(Opt::HeapTargetUtilization),
-                       runtime_options.GetOrDefault(Opt::EnableTimeBasedGcTrigger),
+                       enable_time_based_gc_trigger,
                        runtime_options.GetOrDefault(Opt::HeapMemoryGcCostFactor),
                        foreground_heap_growth_multiplier,
                        runtime_options.GetOrDefault(Opt::StopForNativeAllocs),
@@ -1867,6 +1875,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                        xgc_option.verify_pre_sweeping_rosalloc_,
                        xgc_option.verify_post_gc_rosalloc_,
                        xgc_option.gcstress_,
+                       xgc_option.continuous_gc_,
                        xgc_option.measure_,
                        runtime_options.GetOrDefault(Opt::EnableHSpaceCompactForOOM),
                        use_generational_gc,

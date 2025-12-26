@@ -111,12 +111,10 @@ constexpr bool IsDataSectionType(DexFile::MapItemType map_item_type) {
 // Fields and methods may have only one of public/protected/private.
 ALWAYS_INLINE
 constexpr bool CheckAtMostOneOfPublicProtectedPrivate(uint32_t flags) {
-  // Semantically we want 'return POPCOUNT(flags & kAcc) <= 1;'.
-  static_assert(IsPowerOfTwo(0), "0 not marked as power of two");
   static_assert(IsPowerOfTwo(kAccPublic), "kAccPublic not marked as power of two");
   static_assert(IsPowerOfTwo(kAccProtected), "kAccProtected not marked as power of two");
   static_assert(IsPowerOfTwo(kAccPrivate), "kAccPrivate not marked as power of two");
-  return IsPowerOfTwo(flags & (kAccPublic | kAccProtected | kAccPrivate));
+  return POPCOUNT(flags & (kAccPublic | kAccProtected | kAccPrivate)) <= 1;
 }
 
 }  // namespace
@@ -1458,6 +1456,11 @@ bool DexFileVerifier::CheckIntraClassDefItem(uint32_t class_def_index) {
 
   const dex::ClassDef* class_def = reinterpret_cast<const dex::ClassDef*>(ptr_);
   if (!CheckIndex(class_def->class_idx_.index_, header_->type_ids_size_, "class_def.class")) {
+    return false;
+  }
+  if (class_def->source_file_idx_.IsValid() &&
+      !CheckIndex(
+          class_def->source_file_idx_.index_, header_->string_ids_size_, "class_def.source_file")) {
     return false;
   }
 
