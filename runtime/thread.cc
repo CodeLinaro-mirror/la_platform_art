@@ -86,6 +86,8 @@
 #include "mirror/object_array-inl.h"
 #include "mirror/stack_frame_info.h"
 #include "mirror/stack_trace_element.h"
+#include "mirror/virtual_thread_context-inl.h"
+#include "mirror/virtual_thread_context.h"
 #include "monitor.h"
 #include "monitor_objects_stack_visitor.h"
 #include "native_stack_dump.h"
@@ -690,13 +692,12 @@ void* Thread::CreateCallback(void* arg) {
     // When the runnable is a VirtualThreadContext, don't run thread.run() and treat it as a virtual
     // thread.
     if (kIsVirtualThreadEnabled &&
-        UNLIKELY(
-            !runnable.IsNull() &&
-            runnable->InstanceOf(WellKnownClasses::dalvik_system_VirtualThreadContext.Get()))) {
+        UNLIKELY(!runnable.IsNull() &&
+                 runnable->InstanceOf(GetClassRoot<mirror::VirtualThreadContext>()))) {
       self->SetVirtualThreadFlags(VirtualThreadFlag::kIsVirtual, true);
-      ObjPtr<mirror::Object> parked_states =
-          WellKnownClasses::dalvik_system_VirtualThreadContext_parkedStates->GetObject(runnable);
-      if (parked_states != nullptr) {
+      ObjPtr<mirror::VirtualThreadContext> v_context =
+          ObjPtr<mirror::VirtualThreadContext>::DownCast(runnable);
+      if (v_context->GetParkedStates() != nullptr) {
         self->SetVirtualThreadFlags(VirtualThreadFlag::kUnparking, true);
       }
 
@@ -3302,13 +3303,18 @@ static ObjPtr<mirror::StackTraceElement> CreateStackTraceElement(
       soa.Self()->AssertPendingOOMException();
       return nullptr;
     }
+    char source_file_buffer[64];
     const char* source_file = method->GetDeclaringClassSourceFile();
-    if (source_file != nullptr) {
-      source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
-      if (source_name_object == nullptr) {
-        soa.Self()->AssertPendingOOMException();
-        return nullptr;
-      }
+    if (source_file == nullptr) {
+      // Create artificial filename based on SHA1 of the dex file.
+      DexFile::Sha1 hash = method->GetDeclaringClass()->GetDexFile().GetSha1();
+      snprintf(source_file_buffer, sizeof(source_file_buffer), "dex-id-%s", hash.ToHex().data());
+      source_file = source_file_buffer;
+    }
+    source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
+    if (source_name_object == nullptr) {
+      soa.Self()->AssertPendingOOMException();
+      return nullptr;
     }
     if (line_number == -1) {
       // Make the line_number field of StackTraceElement hold the dex pc.
@@ -4749,6 +4755,7 @@ void Thread::SweepInterpreterCache(IsMarkedVisitor* visitor) {
 // http://b/197647048
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wframe-larger-than="
+NO_INLINE
 void Thread::VisitRoots(RootVisitor* visitor, VisitRootFlags flags) {
   if ((flags & VisitRootFlags::kVisitRootFlagPrecise) != 0) {
     VisitRoots</* kPrecise= */ true>(visitor);
@@ -5169,7 +5176,17 @@ int Thread::SetNativeNiceness(int niceness) {
 int Thread::GetNativeNiceness() const {
   errno = 0;
   int niceness = getpriority(PRIO_PROCESS, static_cast<id_t>(GetTid()));
-  CHECK(niceness != -1 || errno == 0) << " " << strerror(errno);
+  if (niceness == -1 && errno != 0) {
+    LOG(gAborting == 0 ? FATAL_WITHOUT_ABORT : ERROR)
+        << "getpriority() in GetNativeNiceness() failed: " << strerror(errno);
+    // This may mean the world is badly broken. Tread carefully, producing as much information as
+    // possible before crashing, one way or another.
+    LOG(gAborting == 0 ? FATAL_WITHOUT_ABORT : ERROR) << "\ttid: " << GetTid();
+    std::string name;
+    GetThreadName(name);
+    LOG(gAborting == 0 ? FATAL : ERROR) << "\tthread name: " << name;
+    niceness = 19;  // A valid result that will hopefully stand out.
+  }
   return niceness;
 }
 

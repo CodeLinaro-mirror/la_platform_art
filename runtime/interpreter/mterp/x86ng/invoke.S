@@ -18,9 +18,8 @@
 1:
    // Load the first argument (the 'this' pointer).
    movzwl 4(rPC), %ecx // arguments
-   .if !$range
-   andl $$0xf, %ecx
-   .endif
+%  if not range:
+     andl $$0xf, %ecx
    movl (rFP, %ecx, 4), %ecx
    // NullPointerException check.
    testl %ecx, %ecx
@@ -32,18 +31,16 @@
    movl rPC, ARG2
    movl rFP, ARG3
    call nterp_get_method
-   .if $is_super
-   jmp 1b
-   .else
-   testl MACRO_LITERAL(1), %eax
-   je 1b
-   andl $$-2, %eax  // Remove the extra bit that marks it's a String.<init> method.
-   .if $range
-   jmp NterpHandleStringInitRange
-   .else
-   jmp NterpHandleStringInit
-   .endif
-   .endif
+%  if is_super:
+     jmp 1b
+%  else:
+     testl MACRO_LITERAL(1), %eax
+     je 1b
+     andl $$-2, %eax  // Remove the extra bit that marks it's a String.<init> method.
+%    if range:
+       jmp NterpHandleStringInitRange
+%    else:
+       jmp NterpHandleStringInit
 
 %def op_invoke_direct():
 %  invoke_direct_or_super(helper="NterpCommonInvokeInstance")
@@ -82,9 +79,8 @@
 .L${opcode}_resume:
    // First argument is the 'this' pointer.
    movzwl 4(rPC), %ecx // arguments
-   .if !$range
-   andl $$0xf, %ecx
-   .endif
+%  if not range:
+     andl $$0xf, %ecx
    movl (rFP, %ecx, 4), %ecx
    movl MIRROR_OBJECT_CLASS_OFFSET(%ecx), %edx
    UNPOISON_HEAP_REF edx
@@ -102,11 +98,10 @@
    jmp $helper
 2:
    testl $$1, %eax
-   .if $range
-   jne NterpHandleInvokeInterfaceOnObjectMethodRange
-   .else
-   jne NterpHandleInvokeInterfaceOnObjectMethod
-   .endif
+%  if range:
+     jne NterpHandleInvokeInterfaceOnObjectMethodRange
+%  else:
+     jne NterpHandleInvokeInterfaceOnObjectMethod
    // Default method
    andl $$-4, %eax
    // Save interface method as hidden argument.
@@ -161,9 +156,8 @@
 1:
    // First argument is the 'this' pointer.
    movzwl 4(rPC), %ecx // arguments
-   .if !$range
-   andl $$0xf, %ecx
-   .endif
+%  if not range:
+     andl $$0xf, %ecx
    movl (rFP, %ecx, 4), %ecx
    // Note: if ecx is null, this will be handled by our SIGSEGV handler.
    movl MIRROR_OBJECT_CLASS_OFFSET(%ecx), %edx

@@ -1,22 +1,22 @@
 %def op_check_cast():
-%  slow_path = add_slow_path(op_check_cast_slow_path)
+%  slow_path = add_slow_path_for_last_prefix(op_check_cast_slow_path)
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r1", miss_label="2f")
+%  fetch_from_thread_cache("r1", miss_label="3f")
 1:
    lsr     r2, rINST, #8               // r2<- A
    GET_VREG r0, r2                     // r0<- vA (object)
    cmp     r0, #0
-   beq     .L${opcode}_resume
+   beq     2f
    ldr     r2, [r0, #MIRROR_OBJECT_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    // Fast path: do a comparison without read barrier.
    cmp     r1, r2
    bne     ${slow_path}
-.L${opcode}_resume:
-   FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
 2:
+   FETCH_ADVANCE_INST 2
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
+3:
    EXPORT_PC
    mov     r0, rSELF
    ldr     r1, [sp]
@@ -37,7 +37,7 @@
    ldr     r2, [r2, #MIRROR_CLASS_SUPER_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    cmp     r1, r2
-   beq     .L${opcode}_resume
+   beq     6f
    cmp     r2, #0
    bne     1b
 2:
@@ -45,7 +45,7 @@
 3:
    EXPORT_PC
    bl      art_quick_check_instance_of
-   b       .L${opcode}_resume
+   b       6f
 4:
    bl      art_quick_read_barrier_mark_reg01
    b       3b
@@ -65,34 +65,36 @@
    // Check if the object is a primitive array.
    ldrh    r2, [r2, #MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET]
    orrs    r2, r3
-   beq     .L${opcode}_resume
    // Go slow path for throwing the exception.
-   b 2b
+   bne     2b
+6:
+   FETCH_ADVANCE_INST 2
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_instance_of():
-%  slow_path = add_slow_path(op_instance_of_slow_path)
+%  slow_path = add_slow_path_for_last_prefix(op_instance_of_slow_path)
    /* instance-of vA, vB, class@CCCC */
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r1", miss_label="2f")
+%  fetch_from_thread_cache("r1", miss_label="3f")
 1:
    lsr     r2, rINST, #12              // r2<- B
    GET_VREG r0, r2                     // r0<- vB (object)
    cmp     r0, #0
-   beq     .L${opcode}_resume
+   beq     2f
    ldr     r2, [r0, #MIRROR_OBJECT_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    // Fast path: do a comparison without read barrier.
    cmp     r1, r2
    bne     ${slow_path}
-.L${opcode}_set_one:
    mov     r0, #1
-.L${opcode}_resume:
+2:
    ubfx    r1, rINST, #8, #4           // r1<- A
    SET_VREG r0, r1
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
-2:
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
+3:
    EXPORT_PC
    mov     r0, rSELF
    ldr     r1, [sp]
@@ -112,16 +114,18 @@
    UNPOISON_HEAP_REF r3
    cmp     r3, #0
    bne     3f
+   // Prepare result value 1 for a match in the loop below.
+   mov     r0, #1
 1:
    ldr     r2, [r2, #MIRROR_CLASS_SUPER_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    cmp     r1, r2
-   beq     .L${opcode}_set_one
+   beq     6f
    cmp     r2, #0
    bne     1b
 2:
    mov     r0, #0
-   b       .L${opcode}_resume
+   b       6f
 3:
    // Class in r1 is an array, r3 is the component type.
    ldr     r2, [r2, #MIRROR_CLASS_COMPONENT_TYPE_OFFSET]
@@ -139,13 +143,18 @@
    orr     r0, r2, r3
    clz     r0, r0
    lsrs    r0, r0, #5
-   b       .L${opcode}_resume
+   b       6f
 4:
    bl      art_quick_read_barrier_mark_reg01
 5:
    EXPORT_PC
    bl      artInstanceOfFromCode
-   b       .L${opcode}_resume
+6:
+   ubfx    r1, rINST, #8, #4           // r1<- A
+   SET_VREG r0, r1
+   FETCH_ADVANCE_INST 2
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_iget_boolean():
 %  op_iget(load="ldrb")
@@ -169,30 +178,28 @@
    ubfx    r2, rINST, #8, #4           // r2<- A
    cmp     r3, #0
    beq     common_errNullObject        // object was null
-   .if $wide
-   add     r3, r3, r0
-   ldrd    r0, r1, [r3]
-   CLEAR_SHADOW_PAIR r2, ip, lr
-   VREG_INDEX_TO_ADDR r2, r2
-   SET_VREG_WIDE_BY_ADDR r0, r1, r2    // fp[A] <- value
-   .elseif $is_object
-   $load   r0, [r3, r0]
-   UNPOISON_HEAP_REF r0
-   TEST_IF_MARKING .L${opcode}_read_barrier
+%  if wide:
+     add     r3, r3, r0
+     ldrd    r0, r1, [r3]
+     CLEAR_SHADOW_PAIR r2, ip, lr
+     VREG_INDEX_TO_ADDR r2, r2
+     SET_VREG_WIDE_BY_ADDR r0, r1, r2  // fp[A] <- value
+%  elif is_object:
+     $load   r0, [r3, r0]
+     UNPOISON_HEAP_REF r0
+     TEST_IF_MARKING .L${opcode}_read_barrier
 .L${opcode}_resume_after_read_barrier:
-   SET_VREG_OBJECT r0, r2              // fp[A] <- value
-   .else
-   $load   r0, [r3, r0]
-   SET_VREG r0, r2                     // fp[A] <- value
-   .endif
+     SET_VREG_OBJECT r0, r2            // fp[A] <- value
+%  else:
+     $load   r0, [r3, r0]
+     SET_VREG r0, r2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
-   .if $is_object
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
+%  if is_object:
 .L${opcode}_read_barrier:
-   bl      art_quick_read_barrier_mark_reg00
-   b       .L${opcode}_resume_after_read_barrier
-   .endif
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_resume_after_read_barrier
 
 %def op_iget_slow_path(load, wide, is_object):
    ldr     r0, [sp]
@@ -221,27 +228,25 @@
    ubfx    r2, rINST, #8, #4           // r2<- A
    cmp     r3, #0
    beq     common_errNullObject            // object was null
-   .if $wide
-   add     ip, r3, r0
-   ATOMIC_LOAD64 ip, r0, r1, r3, .L${opcode}_slow_path_atomic_load
-   dmb     ish
-   CLEAR_SHADOW_PAIR r2, ip, lr
-   VREG_INDEX_TO_ADDR r2, r2
-   SET_VREG_WIDE_BY_ADDR r0, r1, r2    // fp[A] <- value
-   .else
-   $load   r0, [r3, r0]
-   dmb     ish
-   .if $is_object
-   UNPOISON_HEAP_REF r0
-   TEST_IF_MARKING .L${opcode}_read_barrier
-   SET_VREG_OBJECT r0, r2              // fp[A] <- value
-   .else
-   SET_VREG r0, r2                     // fp[A] <- value
-   .endif
-   .endif
+%  if wide:
+     add     ip, r3, r0
+     ATOMIC_LOAD64 ip, r0, r1, r3, .L${opcode}_slow_path_atomic_load
+     dmb     ish
+     CLEAR_SHADOW_PAIR r2, ip, lr
+     VREG_INDEX_TO_ADDR r2, r2
+     SET_VREG_WIDE_BY_ADDR r0, r1, r2  // fp[A] <- value
+%  else:
+     $load   r0, [r3, r0]
+     dmb     ish
+%    if is_object:
+       UNPOISON_HEAP_REF r0
+       TEST_IF_MARKING .L${opcode}_read_barrier
+       SET_VREG_OBJECT r0, r2          // fp[A] <- value
+%    else:
+       SET_VREG r0, r2                 // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_iget_wide():
 %  op_iget(load="ldr", wide=True)
@@ -263,10 +268,9 @@
 
 %def op_iput(store="str", wide=False, is_object=False):
 %  slow_path = add_slow_path(op_iput_slow_path, store, wide, is_object)
-   .if !$wide
-   ubfx    r4, rINST, #8, #4           // r4<- A
-   GET_VREG r4, r4                     // r4 <- v[A]
-   .endif
+%  if not wide:
+     ubfx    r4, rINST, #8, #4           // r4<- A
+     GET_VREG r4, r4                     // r4 <- v[A]
    // Fast-path which gets the field from thread-local cache.
 %  fetch_from_thread_cache("r0", miss_label=slow_path)
 .L${opcode}_resume:
@@ -274,20 +278,19 @@
    GET_VREG r1, r1                     // vB (object we're operating on)
    cmp     r1, #0
    beq     common_errNullObject
-   .if $wide
-   ubfx    r4, rINST, #8, #4           // r4<- A
-   VREG_INDEX_TO_ADDR r4, r4
-   GET_VREG_WIDE_BY_ADDR r2, r3, r4      // fp[A] <- value
-   add     r1, r1, r0
-   strd    r2, r3, [r1]
-   .else
-   POISON_HEAP_REF_IF_OBJECT $is_object, r4
-   $store  r4, [r1, r0]
-   WRITE_BARRIER_IF_OBJECT $is_object, r4, r1, .L${opcode}_skip_write_barrier, r0
-   .endif
+%  if wide:
+     ubfx    r4, rINST, #8, #4         // r4<- A
+     VREG_INDEX_TO_ADDR r4, r4
+     GET_VREG_WIDE_BY_ADDR r2, r3, r4  // fp[A] <- value
+     add     r1, r1, r0
+     strd    r2, r3, [r1]
+%  else:
+     POISON_HEAP_REF_IF_OBJECT $is_object, r4
+     $store  r4, [r1, r0]
+     WRITE_BARRIER_IF_OBJECT $is_object, r4, r1, .L${opcode}_skip_write_barrier, r0
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_iput_slow_path(store, wide, is_object):
    ldr     r0, [sp]
@@ -298,11 +301,10 @@
    // See comment in `NterpGetLocalStaticFieldInternal`.
    ldr     r0, [r0, ART_METHOD_DECLARING_CLASS_OFFSET]
    mov     r1, rPC
-   .if $is_object
-   bl      NterpGetLocalInstanceFieldForIPutObject
-   .else
-   bl      NterpGetLocalInstanceField
-   .endif
+%  if is_object:
+     bl      NterpGetLocalInstanceFieldForIPutObject
+%  else:
+     bl      NterpGetLocalInstanceField
    cmp     r0, #0
    bge     .L${opcode}_resume
 .L${opcode}_slow_path_continue:
@@ -312,40 +314,38 @@
    mov     r3, rFP
    EXPORT_PC
    bl      nterp_get_instance_field_offset
-   .if $is_object
-   // Reload the value as it may have moved.
-   ubfx    r4, rINST, #8, #4           // r4<- A
-   GET_VREG r4, r4                     // r4 <- v[A]
-   .endif
+%  if is_object:
+     // Reload the value as it may have moved.
+     ubfx    r4, rINST, #8, #4         // r4<- A
+     GET_VREG r4, r4                   // r4 <- v[A]
    cmp     r0, #0
    bge     .L${opcode}_resume
    CLEAR_INSTANCE_VOLATILE_MARKER r0
-   .if $wide
-   lsr     r4, rINST, #12              // r4<- B
-   ubfx    r1, rINST, #8, #4           // r1<- A
-   GET_VREG r4, r4                     // vB (object we're operating on)
-   cmp     r4, #0
-   beq     common_errNullObject
-   VREG_INDEX_TO_ADDR r1, r1
-   GET_VREG_WIDE_BY_ADDR r2, r3, r1
-   add     ip, r4, r0
-   dmb     ish
-   ATOMIC_STORE64 ip, r2, r3, r0, r1, .L${opcode}_slow_path_atomic_store
-   dmb     ish
-   .else
-   lsr     r1, rINST, #12              // r4<- B
-   GET_VREG r1, r1                     // vB (object we're operating on)
-   cmp     r1, #0
-   beq     common_errNullObject
-   dmb     ish
-   POISON_HEAP_REF_IF_OBJECT $is_object, r4
-   $store  r4, [r1, r0]
-   dmb     ish
-   WRITE_BARRIER_IF_OBJECT $is_object, r4, r1, .L${opcode}_slow_path_skip_write_barrier, r0
-   .endif
+%  if wide:
+     lsr     r4, rINST, #12              // r4<- B
+     ubfx    r1, rINST, #8, #4           // r1<- A
+     GET_VREG r4, r4                     // vB (object we're operating on)
+     cmp     r4, #0
+     beq     common_errNullObject
+     VREG_INDEX_TO_ADDR r1, r1
+     GET_VREG_WIDE_BY_ADDR r2, r3, r1
+     add     ip, r4, r0
+     dmb     ish
+     ATOMIC_STORE64 ip, r2, r3, r0, r1, .L${opcode}_slow_path_atomic_store
+     dmb     ish
+%  else:
+     lsr     r1, rINST, #12              // r4<- B
+     GET_VREG r1, r1                     // vB (object we're operating on)
+     cmp     r1, #0
+     beq     common_errNullObject
+     dmb     ish
+     POISON_HEAP_REF_IF_OBJECT $is_object, r4
+     $store  r4, [r1, r0]
+     dmb     ish
+     WRITE_BARRIER_IF_OBJECT $is_object, r4, r1, .L${opcode}_slow_path_skip_write_barrier, r0
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_iput_wide():
 %  op_iput(store="str", wide=True)
@@ -375,37 +375,35 @@
    ldr     r0, [r0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_read_barrier
 .L${opcode}_resume_after_read_barrier:
-   .if $wide
-   add     r0, r0, r1
-   ldrd    r0, r1, [r0]
-   CLEAR_SHADOW_PAIR r2, ip, lr
-   VREG_INDEX_TO_ADDR r2, r2
-   SET_VREG_WIDE_BY_ADDR r0, r1, r2    // fp[A] <- value
-   .elseif $is_object
-   $load   r0, [r0, r1]
-   UNPOISON_HEAP_REF r0
-   // No need to check the marking register, we know it's not set here.
+%  if wide:
+     add     r0, r0, r1
+     ldrd    r0, r1, [r0]
+     CLEAR_SHADOW_PAIR r2, ip, lr
+     VREG_INDEX_TO_ADDR r2, r2
+     SET_VREG_WIDE_BY_ADDR r0, r1, r2  // fp[A] <- value
+%  elif is_object:
+     $load   r0, [r0, r1]
+     UNPOISON_HEAP_REF r0
+     // No need to check the marking register, we know it's not set here.
 .L${opcode}_after_reference_load:
-   SET_VREG_OBJECT r0, r2              // fp[A] <- value
-   .else
-   $load   r0, [r0, r1]
-   SET_VREG r0, r2                     // fp[A] <- value
-   .endif
+     SET_VREG_OBJECT r0, r2            // fp[A] <- value
+%  else:
+     $load   r0, [r0, r1]
+     SET_VREG r0, r2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 .L${opcode}_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
-   .if $is_object
-   ldr     r0, [r0, r1]
-   UNPOISON_HEAP_REF r0
+%  if is_object:
+     ldr     r0, [r0, r1]
+     UNPOISON_HEAP_REF r0
 .L${opcode}_mark_after_load:
-   // Here, we know the marking register is set.
-   bl      art_quick_read_barrier_mark_reg00
-   b       .L${opcode}_after_reference_load
-   .else
-   b       .L${opcode}_resume_after_read_barrier
-   .endif
+     // Here, we know the marking register is set.
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_after_reference_load
+%  else:
+     b       .L${opcode}_resume_after_read_barrier
 
 %def op_sget_slow_path(load, wide, is_object):
    ldr     r0, [sp]
@@ -434,27 +432,25 @@
    ldr     r0, [r0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_slow_path_read_barrier
 .L${opcode}_slow_path_resume_after_read_barrier:
-   .if $wide
-   add     ip, r0, r1
-   ATOMIC_LOAD64 ip, r0, r1, r3, .L${opcode}_slow_path_atomic_load
-   dmb     ish
-   CLEAR_SHADOW_PAIR r2, ip, lr
-   VREG_INDEX_TO_ADDR r2, r2
-   SET_VREG_WIDE_BY_ADDR r0, r1, r2    // fp[A] <- value
-   .else
-   $load   r0, [r0, r1]
-   dmb     ish
-   .if $is_object
-   UNPOISON_HEAP_REF r0
-   TEST_IF_MARKING .L${opcode}_mark_after_load
-   SET_VREG_OBJECT r0, r2              // fp[A] <- value
-   .else
-   SET_VREG r0, r2                     // fp[A] <- value
-   .endif
-   .endif
+%  if wide:
+     add     ip, r0, r1
+     ATOMIC_LOAD64 ip, r0, r1, r3, .L${opcode}_slow_path_atomic_load
+     dmb     ish
+     CLEAR_SHADOW_PAIR r2, ip, lr
+     VREG_INDEX_TO_ADDR r2, r2
+     SET_VREG_WIDE_BY_ADDR r0, r1, r2    // fp[A] <- value
+%  else:
+     $load   r0, [r0, r1]
+     dmb     ish
+%    if is_object:
+       UNPOISON_HEAP_REF r0
+       TEST_IF_MARKING .L${opcode}_mark_after_load
+       SET_VREG_OBJECT r0, r2            // fp[A] <- value
+%    else:
+       SET_VREG r0, r2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 .L${opcode}_slow_path_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
    b       .L${opcode}_slow_path_resume_after_read_barrier
@@ -479,10 +475,9 @@
 
 %def op_sput(store="str", wide=False, is_object=False):
 %  slow_path = add_slow_path(op_sput_slow_path, store, wide, is_object)
-   .if !$wide
-   lsr     r4, rINST, #8               // r4 <- A
-   GET_VREG r4, r4                     // r4 <- v[A]
-   .endif
+%  if not wide:
+     lsr     r4, rINST, #8             // r4 <- A
+     GET_VREG r4, r4                   // r4 <- v[A]
    // Fast-path which gets the field from thread-local cache.
 %  fetch_from_thread_cache("r0", miss_label=slow_path)
 .L${opcode}_resume:
@@ -490,20 +485,19 @@
    ldr     r0, [r0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_read_barrier
 .L${opcode}_resume_after_read_barrier:
-   .if $wide
-   lsr     r2, rINST, #8               // r2 <- A
-   VREG_INDEX_TO_ADDR r2, r2
-   GET_VREG_WIDE_BY_ADDR r2, r3, r2    // fp[A] <- value
-   add     r0, r0, r1
-   strd    r2, r3, [r0]
-   .else
-   POISON_HEAP_REF_IF_OBJECT $is_object, r4
-   $store  r4, [r0, r1]
-   WRITE_BARRIER_IF_OBJECT $is_object, r4, r0, .L${opcode}_skip_write_barrier, r1
-   .endif
+%  if wide:
+     lsr     r2, rINST, #8             // r2 <- A
+     VREG_INDEX_TO_ADDR r2, r2
+     GET_VREG_WIDE_BY_ADDR r2, r3, r2  // fp[A] <- value
+     add     r0, r0, r1
+     strd    r2, r3, [r0]
+%  else:
+     POISON_HEAP_REF_IF_OBJECT $is_object, r4
+     $store  r4, [r0, r1]
+     WRITE_BARRIER_IF_OBJECT $is_object, r4, r0, .L${opcode}_skip_write_barrier, r1
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 .L${opcode}_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
    b       .L${opcode}_resume_after_read_barrier
@@ -517,29 +511,26 @@
    // See comment in `NterpGetLocalStaticFieldInternal`.
    ldr     r0, [r0, ART_METHOD_DECLARING_CLASS_OFFSET]
    mov     r1, rPC
-   .if $is_object
-   bl      NterpGetLocalStaticFieldForSPutObject
-   .else
-   bl      NterpGetLocalStaticField
-   .endif
+%  if is_object:
+     bl      NterpGetLocalStaticFieldForSPutObject
+%  else:
+     bl      NterpGetLocalStaticField
    cmp     r0, #0
    bne     .L${opcode}_resume
 .L${opcode}_slow_path_continue:
    mov     r0, rSELF
    ldr     r1, [sp]
    mov     r2, rPC
-   .if $is_object
-   mov     r3, r4
-   .else
-   mov     r3, #0
-   .endif
+%  if is_object:
+     mov     r3, r4
+%  else:
+     mov     r3, #0
    EXPORT_PC
    bl      nterp_get_static_field
-   .if $is_object
-   // Reload the value as it may have moved.
-   lsr     r4, rINST, #8               // r4 <- A
-   GET_VREG r4, r4                     // r4 <- v[A]
-   .endif
+%  if is_object:
+     // Reload the value as it may have moved.
+     lsr     r4, rINST, #8             // r4 <- A
+     GET_VREG r4, r4                   // r4 <- v[A]
    tst     r0, #1
    beq     .L${opcode}_resume
    CLEAR_STATIC_VOLATILE_MARKER r0
@@ -547,24 +538,23 @@
    ldr     r0, [r0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_slow_path_read_barrier
 .L${opcode}_slow_path_resume_after_read_barrier:
-   .if $wide
-   lsr     r2, rINST, #8               // r2 <- A
-   VREG_INDEX_TO_ADDR r2, r2
-   GET_VREG_WIDE_BY_ADDR r2, r3, r2
-   add     ip, r0, r1
-   dmb     ish
-   ATOMIC_STORE64 ip, r2, r3, r0, r1, .L${opcode}_slow_path_atomic_store
-   dmb     ish
-   .else
-   dmb     ish
-   POISON_HEAP_REF_IF_OBJECT $is_object r4
-   $store  r4, [r0, r1]
-   dmb     ish
-   WRITE_BARRIER_IF_OBJECT $is_object, r4, r0, .L${opcode}_slow_path_skip_write_barrier, r1
-   .endif
+%  if wide:
+     lsr     r2, rINST, #8             // r2 <- A
+     VREG_INDEX_TO_ADDR r2, r2
+     GET_VREG_WIDE_BY_ADDR r2, r3, r2
+     add     ip, r0, r1
+     dmb     ish
+     ATOMIC_STORE64 ip, r2, r3, r0, r1, .L${opcode}_slow_path_atomic_store
+     dmb     ish
+%  else:
+     dmb     ish
+     POISON_HEAP_REF_IF_OBJECT $is_object r4
+     $store  r4, [r0, r1]
+     dmb     ish
+     WRITE_BARRIER_IF_OBJECT $is_object, r4, r0, .L${opcode}_slow_path_skip_write_barrier, r1
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 .L${opcode}_slow_path_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
    b       .L${opcode}_slow_path_resume_after_read_barrier
@@ -589,8 +579,8 @@
    lsr     r1, rINST, #8                // r1 <- A
    SET_VREG_OBJECT r0, r1               // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   GET_INST_OPCODE ip
-   GOTO_OPCODE ip
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 2:
    mov     r0, rSELF
    ldr     r1, [sp]

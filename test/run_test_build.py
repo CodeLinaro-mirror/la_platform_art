@@ -32,14 +32,13 @@ from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from fcntl import lockf, LOCK_EX, LOCK_NB
 from importlib.machinery import SourceFileLoader
-from os import environ, getcwd, cpu_count
+from os import environ, getcwd
 from os.path import relpath
 from pathlib import Path
-from pprint import pprint
 from shutil import copytree, rmtree
-from subprocess import PIPE, run
+from subprocess import STDOUT, PIPE, run
 from tempfile import TemporaryDirectory, NamedTemporaryFile
-from typing import Dict, List, Union, Set, Optional
+from typing import Dict, List, Union, Set, Optional, Any
 from multiprocessing import cpu_count
 
 from globals import BOOTCLASSPATH
@@ -67,6 +66,16 @@ TRADEFED_DISABLED = {
   "817-hiddenapi",
   "900-hello-plugin",
 }
+
+TRADEFED_VARIANTS = [
+    ["--debug", "--baseline"],
+    ["--debug", "--interpreter"],
+    ["--debug", "--jit", "--debuggable"],
+    ["--debug", "--jit"],
+    ["--debug", "--optimizing", "--debuggable"],
+    ["--debug", "--optimizing"],
+    ["--debug", "--speed-profile"],
+]
 
 # Debug option. Report commands that are taking a lot of user CPU time.
 REPORT_SLOW_COMMANDS = False
@@ -160,8 +169,8 @@ class BuildTestContext:
                        encoding=sys.stdout.encoding,
                        cwd=self.test_dir,
                        env=self.bash_env,
-                       stderr=subprocess.STDOUT,
-                       stdout=subprocess.PIPE)
+                       stderr=STDOUT,
+                       stdout=PIPE)
     if REPORT_SLOW_COMMANDS:
       m = re.search(r"([0-9\.]+)user", p.stdout)
       assert m, p.stdout
@@ -356,7 +365,9 @@ class BuildTestContext:
       args = []
       if d8_dex_container:
         args += ["-JDcom.android.tools.r8.dexContainerExperiment"]
-      args += d8_flags + ["--min-api", str(api_level), "--output", dst_jar]
+      args += (d8_flags +
+              ["--min-api", str(api_level), "--output", dst_jar,
+               "--verbose-synthetic-names"])
       args += ["--lib", self.bootclasspath] if use_desugar else ["--no-desugaring"]
       args += sorted(src_dir.glob("**/*.class"))
       self.d8(args)
@@ -538,12 +549,12 @@ class BuildTestContext:
 # Create bash script that compiles the boot image on device.
 # This is currently only used for eng-prod testing (which is different
 # to the local and LUCI code paths that use buildbot-sync.sh script).
-def create_setup_script(is64: bool):
+def create_setup_script(bitness, isa):
+  assert bitness in {32, 64}
   out = "/data/local/tmp/art/apex/art_boot_images"
-  isa = 'arm64' if is64 else 'arm'
   jar = BOOTCLASSPATH
   cmd = [
-    f"/apex/com.android.art/bin/{'dex2oat64' if is64 else 'dex2oat32'}",
+    f"/apex/com.android.art/bin/{'dex2oat64' if bitness == 64 else 'dex2oat32'}",
     "--runtime-arg", f"-Xbootclasspath:{':'.join(jar)}",
     "--runtime-arg", f"-Xbootclasspath-locations:{':'.join(jar)}",
   ] + [f"--dex-file={j}" for j in jar] + [f"--dex-location={j}" for j in jar] + [
@@ -561,7 +572,7 @@ def create_setup_script(is64: bool):
     f"--oat-file={out}/{isa}/boot.oat",
   ]
   return [
-    f"su root setenforce 0",
+    "su root setenforce 0",
     f"rm -rf {out}/{isa}",
     f"mkdir -p {out}/{isa}",
     " ".join(cmd),
@@ -571,38 +582,37 @@ def create_setup_script(is64: bool):
 # This can be used in CI to execute the tests without running `testrunner.py`.
 # This takes into account any custom behaviour defined in per-test `run.py`.
 # We generate distinct scripts for all of the pre-defined variants.
-def create_ci_runner_scripts(out, mode, test_names):
+def create_ci_runner_scripts(out, mode, test_names, bitness, isa, tags) -> List[Dict[str, Any]]:
+  assert bitness in {32, 64}
   DEVICE_DIR = "/data/local/tmp/art"
-
-  out.mkdir(parents=True)
+  out.mkdir(parents=True, exist_ok=True)
+  old_files = set(Path(out).glob("*/*.sh"))
 
   # Very simple wrapper to isolate the test execution.
   # It is not full/proper chroot, and uses simpler solution for now.
   # It runs in 'unshare' and makes the mount points independent for this process.
   # This means we keep most of the file system as-is, but re-mount only ART apex.
   # (which is visible only to this process, so there is no unmount needed later)
-  chroot = out / "chroot.sh"
+  chroot = out / f"chroot.{isa}.sh"
   chroot.write_text("\n".join([
     "#!/bin/sh",
     "set -e",
-    f"su root unshare --mount sh {DEVICE_DIR}/chroot2.sh $@",
+    f"su root unshare --mount sh {DEVICE_DIR}/chroot2.{isa}.sh $@",
   ]))
-  chroot2 = out / "chroot2.sh"
+  chroot2 = out / f"chroot2.{isa}.sh"
   chroot2.write_text("\n".join([
     "#!/bin/sh",
     "set -e",
     f"mount --bind {DEVICE_DIR}/apex/com.android.art /apex/com.android.art",
-    "script=$1",
-    "shift",
-    "sh $script $@",
+    "sh $@",
   ]))
 
-  setup = out / "setup.sh"
+  setup = out / f"setup.{isa}.sh"
   setup_script = [
     "#!/bin/sh",
     "set -e",
     f"chmod +x {DEVICE_DIR}/apex/com.android.art/bin/*",
-  ] + create_setup_script(False) + create_setup_script(True)
+  ] + create_setup_script(bitness, isa)
   setup.write_text("\n".join(setup_script))
   test_names = list(set(test_names) - TRADEFED_DISABLED)
   if not test_names:
@@ -613,48 +623,50 @@ def create_ci_runner_scripts(out, mode, test_names):
   envs = {
     "ANDROID_BUILD_TOP": str(Path(getcwd()).absolute()),
     "ART_TEST_RUN_FROM_SOONG": "true",
-    # TODO: Make the runner scripts target agnostic.
-    #       The only dependency is setting of "-Djava.library.path".
-    "TARGET_ARCH": "arm64",
-    "TARGET_2ND_ARCH": "arm",
+    "TARGET_ARCH": isa,
     "TMPDIR": Path(getcwd()) / "tmp",
   }
-  args = [
-    f"--run-test-option=--create-runner={out}",
-    f"-j={cpu_count()}",
-    f"--{mode}",
-  ]
-  run([python, script] + args + test_names, env=envs, check=True)
-  tests = {
-    "setup#compile-boot-image": {
-      "adb push": [
-        ["../apex/com.android.art", f"{DEVICE_DIR}/apex/com.android.art"],
-        ["chroot.sh", f"{DEVICE_DIR}/chroot.sh"],
-        ["chroot2.sh", f"{DEVICE_DIR}/chroot2.sh"],
-        ["setup.sh", f"{DEVICE_DIR}/setup.sh"],
-      ],
-      "adb shell": [
-        ["rm", "-rf", f"{DEVICE_DIR}/test"],
-        ["sh", f"{DEVICE_DIR}/chroot.sh", f"{DEVICE_DIR}/setup.sh"],
+  for variant in TRADEFED_VARIANTS :
+    args = [
+      f"--run-test-option=--create-runner={out}",
+      f"-j={cpu_count()}",
+      f"--{mode}",
+      f"--{bitness}",
+    ] + variant
+    run([python, script] + args + test_names, env=envs, check=True)
+  tests: List[Dict[str, Any]] = [
+    {
+      "name": f"run-test-{isa}.setup#compile-boot-image",
+      "tags": tags,
+      "cmds": [
+        {"kind": "push", "args": ["../apex/com.android.art", f"{DEVICE_DIR}/apex/com.android.art"]},
+        {"kind": "push", "args": [f"{chroot.name}", f"{DEVICE_DIR}/{chroot.name}"]},
+        {"kind": "push", "args": [f"{chroot2.name}", f"{DEVICE_DIR}/{chroot2.name}"]},
+        {"kind": "push", "args": [f"{setup.name}", f"{DEVICE_DIR}/{setup.name}"]},
+        {"kind": "shell", "args": ["rm", "-rf", f"{DEVICE_DIR}/test"]},
+        {"kind": "shell", "args": ["sh", f"{DEVICE_DIR}/{chroot.name}",
+                                   f"{DEVICE_DIR}/{setup.name}"]},
       ],
     },
-  }
-  for runner in Path(out).glob("*/*.sh"):
+  ]
+  for runner in sorted(set(Path(out).glob("*/*.sh")) - old_files):
     test_name = runner.parent.name
     m = re.search("FULL_TEST_NAME=(.*)", runner.read_text())
     assert m, f"Can not find full test name of {test_name}"
-    full_name = f"run-test.{test_name}#{m.group(1).replace(test_name, "")}"
+    full_name = f"run-test-{isa}.{test_name}#{m.group(1).replace(test_name, "")}"
 
     test_hash = runner.stem
     target_dir = f"{DEVICE_DIR}/test/{test_hash}"
-    tests[full_name] = {
-      "dependencies": ["setup#compile-boot-image"],
-      "adb push": [
-        [f"../{mode}/{test_name}", f"{target_dir}"],
-        [str(runner.relative_to(out)), f"{target_dir}/run.sh"]
+    tests.append({
+      "name": full_name,
+      "tags": tags,
+      "deps": [f"run-test-{isa}.setup#compile-boot-image"],
+      "cmds": [
+        {"kind": "push", "args": [f"../{mode}/{test_name}", f"{target_dir}"]},
+        {"kind": "push", "args": [str(runner.relative_to(out)), f"{target_dir}/run.sh"]},
+        {"kind": "shell", "args": ["sh", f"{DEVICE_DIR}/{chroot.name}", f"{target_dir}/run.sh"]},
       ],
-      "adb shell": [["sh", f"{DEVICE_DIR}/chroot.sh", f"{target_dir}/run.sh"]],
-    }
+    })
   return tests
 
 # If we build just individual shard, we want to split the work among all the cores,
@@ -724,9 +736,17 @@ def main() -> None:
   if args.mode == "target":
     os.chdir(android_build_top)
     test_names = [ctx.test_name for ctx in tests]
-    dst = ziproot / "runner" / args.out.with_suffix(".tests.json").name
-    tests = create_ci_runner_scripts(dst.parent, args.mode, test_names)
-    dst.write_text(json.dumps(tests, indent=2, sort_keys=True))
+    out = ziproot / "runner"
+    dst = out / args.out.with_suffix(".tests.json").name
+    tests: List[Dict[str, Any]] = []
+    for bitness, isa, tags in [
+        (32, "arm", ["armeabi-v7a"]),
+        (64, "arm64", ["arm64-v8a"]),
+        (32, "x86", ["x86"]),
+        (64, "x86_64", ["x86_64"]),
+      ]:
+      tests += create_ci_runner_scripts(out, args.mode, test_names, bitness, isa, tags)
+    dst.write_text(json.dumps(tests, indent=2))
 
   # Create the final zip file which contains the content of the temporary directory.
   soong_zip = android_build_top / args.soong_zip

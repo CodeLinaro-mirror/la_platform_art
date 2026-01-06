@@ -136,13 +136,9 @@ ArtField* WellKnownClasses::dalvik_system_DexFile_fileName;
 ArtField* WellKnownClasses::dalvik_system_DexPathList_dexElements;
 ArtField* WellKnownClasses::dalvik_system_DexPathList__Element_dexFile;
 ArtField* WellKnownClasses::dalvik_system_VMRuntime_nonSdkApiUsageConsumer;
-ArtField* WellKnownClasses::dalvik_system_VirtualThreadContext_parkedStates;
-ArtField* WellKnownClasses::dalvik_system_VirtualThreadContext_pinnedCarrierThread;
 ArtField* WellKnownClasses::dalvik_system_VirtualThreadParkedStates_frames;
-ArtField* WellKnownClasses::dalvik_system_VirtualThreadFrame_frame;
-ArtField* WellKnownClasses::dalvik_system_VirtualThreadFrame_refs;
-ArtField* WellKnownClasses::dalvik_system_VirtualThreadFrame_declaringClass;
 ArtField* WellKnownClasses::java_io_FileDescriptor_descriptor;
+ArtField* WellKnownClasses::java_lang_invoke_MethodHandle_type;
 ArtField* WellKnownClasses::java_lang_ref_Reference_disableIntrinsic;
 ArtField* WellKnownClasses::java_lang_ref_Reference_slowPathEnabled;
 ArtField* WellKnownClasses::java_lang_ClassLoader_parent;
@@ -482,12 +478,8 @@ void WellKnownClasses::InitFieldsAndMethodsOnly(JNIEnv* env) {
       hs.NewHandle(FindSystemClass(class_linker, self, "Ldalvik/system/PathClassLoader;"));
   Handle<mirror::Class> d_s_vmr =
       hs.NewHandle(FindSystemClass(class_linker, self, "Ldalvik/system/VMRuntime;"));
-  Handle<mirror::Class> d_s_vtc =
-      hs.NewHandle(FindSystemClass(class_linker, self, "Ldalvik/system/VirtualThreadContext;"));
   Handle<mirror::Class> d_s_vtps = hs.NewHandle(
       FindSystemClass(class_linker, self, "Ldalvik/system/VirtualThreadParkedStates;"));
-  Handle<mirror::Class> d_s_vtf =
-      hs.NewHandle(FindSystemClass(class_linker, self, "Ldalvik/system/VirtualThreadFrame;"));
   Handle<mirror::Class> j_i_fd =
       hs.NewHandle(FindSystemClass(class_linker, self, "Ljava/io/FileDescriptor;"));
   Handle<mirror::Class> j_l_bcl =
@@ -830,6 +822,9 @@ void WellKnownClasses::InitFieldsAndMethodsOnly(JNIEnv* env) {
       "(I[BII)Lorg/apache/harmony/dalvik/ddmc/Chunk;",
       pointer_size);
 
+  java_lang_invoke_MethodHandle_type = CacheField(
+      j_l_i_MethodHandle.Get(), /*is_static=*/ false, "type", "Ljava/lang/invoke/MethodType;");
+
   ObjPtr<mirror::Class> j_l_Object = GetClassRoot<mirror::Object>(class_linker);
   java_lang_Object_shadowKlass = CacheField(
       j_l_Object, /*is_static=*/ false, "shadow$_klass_", "Ljava/lang/Class;");
@@ -858,37 +853,15 @@ void WellKnownClasses::InitFieldsAndMethodsOnly(JNIEnv* env) {
   dalvik_system_DexPathList__Element_dexFile = CacheField(
       d_s_dpl_e.Get(), /*is_static=*/ false, "dexFile", "Ldalvik/system/DexFile;");
 
-  dalvik_system_VMRuntime_nonSdkApiUsageConsumer = CacheField(
-      d_s_vmr.Get(),
-      /*is_static=*/ true,
-      "nonSdkApiUsageConsumer",
-      "Ljava/util/function/Consumer;");
-  dalvik_system_VirtualThreadContext_parkedStates =
-      CacheField(d_s_vtc.Get(),
-                 /*is_static=*/false,
-                 "parkedStates",
-                 "Ldalvik/system/VirtualThreadParkedStates;");
-  dalvik_system_VirtualThreadContext_pinnedCarrierThread = CacheField(d_s_vtc.Get(),
-                                                                      /*is_static=*/false,
-                                                                      "pinnedCarrierThread",
-                                                                      "Ljava/lang/Thread;");
+  dalvik_system_VMRuntime_nonSdkApiUsageConsumer = CacheField(d_s_vmr.Get(),
+                                                              /*is_static=*/true,
+                                                              "nonSdkApiUsageConsumer",
+                                                              "Ljava/util/function/Consumer;");
   dalvik_system_VirtualThreadParkedStates_frames =
       CacheField(d_s_vtps.Get(),
                  /*is_static=*/false,
                  "frames",
                  "[Ldalvik/system/VirtualThreadFrame;");
-  dalvik_system_VirtualThreadFrame_frame = CacheField(d_s_vtf.Get(),
-                                                      /*is_static=*/false,
-                                                      "frame",
-                                                      "[B");
-  dalvik_system_VirtualThreadFrame_refs = CacheField(d_s_vtf.Get(),
-                                                     /*is_static=*/false,
-                                                     "refs",
-                                                     "[Ljava/lang/Object;");
-  dalvik_system_VirtualThreadFrame_declaringClass = CacheField(d_s_vtf.Get(),
-                                                               /*is_static=*/false,
-                                                               "declaringClass",
-                                                               "Ljava/lang/Class;");
 
   java_io_FileDescriptor_descriptor = CacheField(
       j_i_fd.Get(), /*is_static=*/ false, "descriptor", "I");
@@ -1119,6 +1092,7 @@ void WellKnownClasses::Clear() {
   dalvik_system_DexPathList_dexElements = nullptr;
   dalvik_system_DexPathList__Element_dexFile = nullptr;
   dalvik_system_VMRuntime_nonSdkApiUsageConsumer = nullptr;
+  java_lang_invoke_MethodHandle_type = nullptr;
   java_lang_ref_Reference_disableIntrinsic = nullptr;
   java_lang_ref_Reference_slowPathEnabled = nullptr;
   java_lang_ClassLoader_parent = nullptr;

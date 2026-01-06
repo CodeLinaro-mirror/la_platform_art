@@ -71,9 +71,8 @@
 
 %def op_instance_of():
 %  slow_path = add_slow_path(op_instance_of_slow_path)
-%  check_hierarchy = add_slow_path_for_last_prefix(
+%  check_hierarchy = add_slow_path_for_last_prefix( \
 %      op_instance_check_hierarchy, suffix="_check_hierarchy")
-%  # Reset python indentation.
    /* instance-of vA, vB, class@CCCC */
    // Fast-path which gets the class from thread-local cache.
 %  fetch_from_thread_cache("x1", miss_label=slow_path)
@@ -171,25 +170,30 @@
    GET_VREG w3, w2                     // w3<- object we're operating on
    ubfx    w2, wINST, #8, #4           // w2<- A
    cbz     w3, common_errNullObject    // object was null
-   .if $wide
-   $load   x0, [x3, x0]
-   SET_VREG_WIDE x0, w2                // fp[A] <- value
-   .elseif $is_object
-   $load   w0, [x3, x0]
-   UNPOISON_HEAP_REF w0
-   TEST_IF_MARKING .L${opcode}_slow_path_mark_and_store_r0_to_vreg_r2_fetch_advance_2_dispatch
-   SET_VREG_OBJECT w0, w2              // fp[A] <- value
-   .else
-   $load   w0, [x3, x0]
-   SET_VREG w0, w2                     // fp[A] <- value
-   .endif
+%  if wide:
+     $load   x0, [x3, x0]
+     SET_VREG_WIDE x0, w2              // fp[A] <- value
+%  elif is_object:
+     $load   w0, [x3, x0]
+     UNPOISON_HEAP_REF w0
+     TEST_IF_MARKING .L${opcode}_slow_path_mark_and_store_r0_to_vreg_r2_fetch_advance_2_dispatch
+     SET_VREG_OBJECT w0, w2            // fp[A] <- value
+%  else:
+     $load   w0, [x3, x0]
+     SET_VREG w0, w2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   .if $wide || $is_object
-   b .L${opcode}_slow_path_dispatch
-   .else
+#ifdef USE_HEAP_POISONING
+%  if is_object:
+     b .L${opcode}_slow_path_dispatch  // Dispatch would not fit in 64B.
+%  else:
+     PREPARE_OPCODE_DISPATCH
+     GOTO_OPCODE
+%  pass
+#else
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-   .endif
+#endif
+%  pass
 
 %def op_iget_slow_path(volatile_load, maybe_extend, wide, is_object):
    ldr     x0, [sp]
@@ -219,32 +223,30 @@
    ubfx    w2, wINST, #8, #4           // w2<- A
    cbz     w3, common_errNullObject    // object was null
    add     x3, x3, x0
-   .if $wide
-   $volatile_load x0, [x3]
-   SET_VREG_WIDE x0, w2                // fp[A] <- value
-   .elseif $is_object
-   $volatile_load w0, [x3]
-   UNPOISON_HEAP_REF w0
-   TEST_IF_MARKING .L${opcode}_slow_path_mark_and_store_r0_to_vreg_r2_fetch_advance_2_dispatch
+%  if wide:
+     $volatile_load x0, [x3]
+     SET_VREG_WIDE x0, w2              // fp[A] <- value
+%  elif is_object:
+     $volatile_load w0, [x3]
+     UNPOISON_HEAP_REF w0
+     TEST_IF_MARKING .L${opcode}_slow_path_mark_and_store_r0_to_vreg_r2_fetch_advance_2_dispatch
    // `new-array` handler jumps here to shorten the code.
 .L${opcode}_slow_path_store_r0_to_vreg_r2_fetch_advance_2_dispatch:
-   SET_VREG_OBJECT w0, w2              // fp[A] <- value
-   .else
-   $volatile_load w0, [x3]
-   $maybe_extend
-   SET_VREG w0, w2                     // fp[A] <- value
-   .endif
+     SET_VREG_OBJECT w0, w2            // fp[A] <- value
+%  else:
+     $volatile_load w0, [x3]
+     $maybe_extend
+     SET_VREG w0, w2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   // `aget-wide`, `aget-object` and `new-instance` handlers jump here to shorten the code.
+   // `aget-object` handler jumps here to shorten the code for heap poisoning.
 .L${opcode}_slow_path_dispatch:
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-   .if $is_object
-   // `aget-object` handler jumps here when marking to shorten the code.
+%  if is_object:
+     // `aget-object` handler jumps here when marking to shorten the code.
 .L${opcode}_slow_path_mark_and_store_r0_to_vreg_r2_fetch_advance_2_dispatch:
-   bl      art_quick_read_barrier_mark_reg00
-   b       .L${opcode}_slow_path_store_r0_to_vreg_r2_fetch_advance_2_dispatch
-   .endif
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_slow_path_store_r0_to_vreg_r2_fetch_advance_2_dispatch
 
 %def op_iget_wide():
 %  op_iget(load="ldr", volatile_load="ldar", maybe_extend="", wide=True)
@@ -272,34 +274,22 @@
    lsr     w2, wINST, #12              // w2<- B
    ubfx    w1, wINST, #8, #4           // w1<- A
    GET_VREG w2, w2                     // vB (object we're operating on)
-   .if $wide
-   GET_VREG_WIDE x1, w1                // x1<- fp[A]/fp[A+1]
-   .else
-   GET_VREG w1, w1                     // w1 <- v[A]
-   .endif
+%  if wide:
+     GET_VREG_WIDE x1, w1              // x1<- fp[A]/fp[A+1]
+%  else:
+     GET_VREG w1, w1                   // w1 <- v[A]
    cbz w2, common_errNullObject
-   .if $wide
-   $store  x1, [x2, x0]
-   .elseif $is_object
-   POISON_HEAP_REF w1
-   $store  w1, [x2, x0]
-   cbnz w1, .L${opcode}_slow_path_write_barrier  // Write barrier would not fit in 64B.
-   .else
-   $store  w1, [x2, x0]
-   .endif
-#ifdef USE_HEAP_POISONING
-   .if $is_object
-   b .L${opcode}_slow_path_skip_write_barrier  // Dispatch would not fit in 64B.
-   .else
+%  if wide:
+     $store  x1, [x2, x0]
+%  elif is_object:
+     POISON_HEAP_REF w1
+     $store  w1, [x2, x0]
+     cbnz w1, .L${opcode}_slow_path_write_barrier  // Write barrier would not fit in 64B.
+%  else:
+     $store  w1, [x2, x0]
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-   .endif
-#else
-   FETCH_ADVANCE_INST 2
-   PREPARE_OPCODE_DISPATCH
-   GOTO_OPCODE
-#endif
 
 %def op_iput_slow_path(volatile_store, wide, is_object):
    ldr     x0, [sp]
@@ -309,11 +299,10 @@
    // See comment in `NterpGetLocalInstanceFieldInternal`.
    ldr     w0, [x0, ART_METHOD_DECLARING_CLASS_OFFSET]
    mov     x1, xPC
-   .if $is_object
-   bl      NterpGetLocalInstanceFieldForIPutObject
-   .else
-   bl      NterpGetLocalInstanceField
-   .endif
+%  if is_object:
+     bl      NterpGetLocalInstanceFieldForIPutObject
+%  else:
+     bl      NterpGetLocalInstanceField
    tbz     w0, #31, .L${opcode}_resume
 .L${opcode}_slow_path_continue:
    mov     x0, xSELF
@@ -331,25 +320,24 @@
    lsr     w2, wINST, #12              // w2<- B
    ubfx    w1, wINST, #8, #4           // w1<- A
    GET_VREG w2, w2                     // vB (object we're operating on)
-   .if $wide
-   GET_VREG_WIDE x1, w1                // x1<- fp[A]/fp[A+1]
-   .else
-   GET_VREG w1, w1                     // w1 <- v[A]
-   .endif
+%  if wide:
+     GET_VREG_WIDE x1, w1              // x1<- fp[A]/fp[A+1]
+%  else:
+     GET_VREG w1, w1                   // w1 <- v[A]
    cbz     w2, common_errNullObject
    add     x3, x2, x0
-   .if $wide
-   $volatile_store x1, [x3]
-   .elseif $is_object
-   POISON_HEAP_REF w1
-   $volatile_store w1, [x3]
-   cbz     w1, .L${opcode}_slow_path_skip_write_barrier
+%  if wide:
+     $volatile_store x1, [x3]
+%  elif is_object:
+     POISON_HEAP_REF w1
+     $volatile_store w1, [x3]
+     cbz     w1, .L${opcode}_slow_path_skip_write_barrier
 .L${opcode}_slow_path_write_barrier:
-   WRITE_BARRIER_NOT_NULL w2
+     WRITE_BARRIER_NOT_NULL w2
 .L${opcode}_slow_path_skip_write_barrier:
-   .else
-   $volatile_store w1, [x3]
-   .endif
+%    pass
+%  else:
+     $volatile_store w1, [x3]
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
@@ -382,35 +370,21 @@
    ldr     w0, [x0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_read_barrier
 .L${opcode}_resume_after_read_barrier:
-   .if $wide
-   ldr     x0, [x0, x1]
-   SET_VREG_WIDE x0, w2                // fp[A] <- value
-   .elseif $is_object
-   $load   w0, [x0, x1]
-   UNPOISON_HEAP_REF w0
-   // No need to check the marking register, we know it's not set here.
+%  if wide:
+     ldr     x0, [x0, x1]
+     SET_VREG_WIDE x0, w2              // fp[A] <- value
+%  elif is_object:
+     $load   w0, [x0, x1]
+     UNPOISON_HEAP_REF w0
+     // No need to check the marking register, we know it's not set here.
 .L${opcode}_after_reference_load:
-   SET_VREG_OBJECT w0, w2              // fp[A] <- value
-   .else
-   $load   w0, [x0, x1]
-   SET_VREG w0, w2                     // fp[A] <- value
-   .endif
+     SET_VREG_OBJECT w0, w2            // fp[A] <- value
+%  else:
+     $load   w0, [x0, x1]
+     SET_VREG w0, w2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
-#ifdef USE_HEAP_POISONING
-   .if $wide || $is_object
-   b .L${opcode}_slow_path_dispatch    // Dispatch would not fit in 64B.
-   .else
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-   .endif
-#else
-   .if $wide
-   b .L${opcode}_slow_path_dispatch    // Dispatch would not fit in 64B.
-   .else
-   PREPARE_OPCODE_DISPATCH
-   GOTO_OPCODE
-   .endif
-#endif
 
 %def op_sget_slow_path(load, volatile_load, maybe_extend, wide, is_object):
    ldr     x0, [sp]
@@ -437,19 +411,18 @@
    TEST_IF_MARKING .L${opcode}_slow_path_read_barrier
 .L${opcode}_slow_path_resume_after_read_barrier:
    add     x0, x0, x1
-   .if $wide
-   ldar    x0, [x0]
-   SET_VREG_WIDE x0, w2                // fp[A] <- value
-   .elseif $is_object
-   $volatile_load w0, [x0]
-   UNPOISON_HEAP_REF w0
-   TEST_IF_MARKING .L${opcode}_mark_after_load
-   SET_VREG_OBJECT w0, w2              // fp[A] <- value
-   .else
-   $volatile_load w0, [x0]
-   $maybe_extend
-   SET_VREG w0, w2                     // fp[A] <- value
-   .endif
+%  if wide:
+     ldar    x0, [x0]
+     SET_VREG_WIDE x0, w2              // fp[A] <- value
+%  elif is_object:
+     $volatile_load w0, [x0]
+     UNPOISON_HEAP_REF w0
+     TEST_IF_MARKING .L${opcode}_mark_after_load
+     SET_VREG_OBJECT w0, w2            // fp[A] <- value
+%  else:
+     $volatile_load w0, [x0]
+     $maybe_extend
+     SET_VREG w0, w2                   // fp[A] <- value
    FETCH_ADVANCE_INST 2
 .L${opcode}_slow_path_dispatch:
    PREPARE_OPCODE_DISPATCH
@@ -459,16 +432,15 @@
    b       .L${opcode}_slow_path_resume_after_read_barrier
 .L${opcode}_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
-   .if $is_object
-   $load   w0, [x0, x1]
-   UNPOISON_HEAP_REF w0
+%  if is_object:
+     $load   w0, [x0, x1]
+     UNPOISON_HEAP_REF w0
 .L${opcode}_mark_after_load:
-   // Here, we know the marking register is set.
-   bl      art_quick_read_barrier_mark_reg00
-   b       .L${opcode}_after_reference_load
-   .else
-   b       .L${opcode}_resume_after_read_barrier
-   .endif
+     // Here, we know the marking register is set.
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_after_reference_load
+%  else:
+     b       .L${opcode}_resume_after_read_barrier
 
 %def op_sget_wide():
 %  op_sget(load="ldr", volatile_load="ldar", maybe_extend="", wide=True)
@@ -498,31 +470,24 @@
    ldr     w0, [x0, #ART_FIELD_DECLARING_CLASS_OFFSET]
    TEST_IF_MARKING .L${opcode}_read_barrier
 .L${opcode}_resume_after_read_barrier:
-   .if $wide
-   GET_VREG_WIDE x2, wINST             // x2 <- v[A]
-   $store  x2, [x0, x1]
-   .elseif $is_object
-   GET_VREG w2, wINST                  // w2 <- v[A]
-   POISON_HEAP_REF w2
-   $store  w2, [x0, x1]
-   cbnz    w2, .L${opcode}_slow_path_write_barrier  // Write barrier would not fit in 64B.
-   .else
-   GET_VREG w2, wINST                  // w2 <- v[A]
-   $store  w2, [x0, x1]
-   .endif
-#ifdef USE_HEAP_POISONING
-   .if $is_object
-   b .L${opcode}_slow_path_skip_write_barrier  // Dispatch would not fit in 64B.
-   .else
+%  if wide:
+     GET_VREG_WIDE x2, wINST           // x2 <- v[A]
+     $store  x2, [x0, x1]
+%  elif is_object:
+     GET_VREG w2, wINST                // w2 <- v[A]
+     POISON_HEAP_REF w2
+     $store  w2, [x0, x1]
+     cbnz    w2, .L${opcode}_slow_path_write_barrier  // Write barrier would not fit in 64B.
+%  else:
+     GET_VREG w2, wINST                // w2 <- v[A]
+     $store  w2, [x0, x1]
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-   .endif
-#else
-   FETCH_ADVANCE_INST 2
-   PREPARE_OPCODE_DISPATCH
-   GOTO_OPCODE
-#endif
+%  if not wide and not is_object:
+.L${opcode}_read_barrier:
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_resume_after_read_barrier
 
 %def op_sput_slow_path(volatile_store, wide, is_object):
    ldr     x0, [sp]
@@ -532,21 +497,19 @@
    // See comment in `NterpGetLocalStaticFieldInternal`.
    ldr     w0, [x0, ART_METHOD_DECLARING_CLASS_OFFSET]
    mov     x1, xPC
-   .if $is_object
-   bl      NterpGetLocalStaticFieldForSPutObject
-   .else
-   bl      NterpGetLocalStaticField
-   .endif
+%  if is_object:
+     bl      NterpGetLocalStaticFieldForSPutObject
+%  else:
+     bl      NterpGetLocalStaticField
    cbnz    x0, .L${opcode}_resume
 .L${opcode}_slow_path_continue:
    mov     x0, xSELF
    ldr     x1, [sp]
    mov     x2, xPC
-   .if $is_object
-   GET_VREG w3, wINST                 // w3 <- v[A]
-   .else
-   mov     x3, #0
-   .endif
+%  if is_object:
+     GET_VREG w3, wINST               // w3 <- v[A]
+%  else:
+     mov     x3, #0
    EXPORT_PC
    bl      nterp_get_static_field
    tbz     x0, #0, .L${opcode}_resume
@@ -556,30 +519,31 @@
    TEST_IF_MARKING .L${opcode}_slow_path_read_barrier
 .L${opcode}_slow_path_resume_after_read_barrier:
    add     x1, x0, x1
-   .if $wide
-   GET_VREG_WIDE x2, wINST             // x2 <- v[A]
-   $volatile_store    x2, [x1]
-   .elseif $is_object
-   GET_VREG w2, wINST                  // w2 <- v[A]
-   POISON_HEAP_REF w2
-   $volatile_store    w2, [x1]
-   cbz     w2, .L${opcode}_slow_path_skip_write_barrier
+%  if wide:
+     GET_VREG_WIDE x2, wINST           // x2 <- v[A]
+     $volatile_store    x2, [x1]
+%  elif is_object:
+     GET_VREG w2, wINST                // w2 <- v[A]
+     POISON_HEAP_REF w2
+     $volatile_store    w2, [x1]
+     cbz     w2, .L${opcode}_slow_path_skip_write_barrier
 .L${opcode}_slow_path_write_barrier:
-   WRITE_BARRIER_NOT_NULL w0
+     WRITE_BARRIER_NOT_NULL w0
 .L${opcode}_slow_path_skip_write_barrier:
-   .else
-   GET_VREG w2, wINST                  // w2 <- v[A]
-   $volatile_store    w2, [x1]
-   .endif
+%    pass
+%  else:
+     GET_VREG w2, wINST                // w2 <- v[A]
+     $volatile_store    w2, [x1]
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
 .L${opcode}_slow_path_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
    b       .L${opcode}_slow_path_resume_after_read_barrier
+%  if wide or is_object:
 .L${opcode}_read_barrier:
-   bl      art_quick_read_barrier_mark_reg00
-   b       .L${opcode}_resume_after_read_barrier
+     bl      art_quick_read_barrier_mark_reg00
+     b       .L${opcode}_resume_after_read_barrier
 
 %def op_sput_wide():
 %  op_sput(store="str", volatile_store="stlr", wide=True)
@@ -601,9 +565,8 @@
    lsr     w1, wINST, #8               // w1 <- A
    SET_VREG_OBJECT w0, w1              // fp[A] <- value
    FETCH_ADVANCE_INST 2
-   // To fit the handler in 64B, use the instruction dispatch in `iget-char` slow path.
-%  iget_char_opcode = re.sub("op_new_instance", "op_iget_char", opcode)
-   b .L${iget_char_opcode}_slow_path_dispatch
+   PREPARE_OPCODE_DISPATCH
+   GOTO_OPCODE
 
 %def op_new_instance_slow_path():
    mov     x0, xSELF

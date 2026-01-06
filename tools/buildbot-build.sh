@@ -63,17 +63,8 @@ if [[ $TARGET_ARCH = "riscv64" && ! ( -d frameworks/base ) ]]; then
 fi
 
 java_libraries_dir=${out_dir}/target/common/obj/JAVA_LIBRARIES
-libcore_tests_classpath="core-tests core-ojtests jsr166-tests mockito-target"
-libjdwp_tests_classpath="apache-harmony-jdwp-tests-hostdex"
-common_targets="vogar ${libjdwp_tests_classpath} ${libcore_tests_classpath}"
-# Add classpath for libjdwp tests.
-for jar in ${libjdwp_tests_classpath} ; do
-  common_targets="$common_targets out/host/common/obj/JAVA_LIBRARIES/${jar}_intermediates/classes.jar"
-done
-# Add classpath for libcore tests.
-for jar in ${libcore_tests_classpath} ; do
-  common_targets="$common_targets out/target/common/obj/JAVA_LIBRARIES/${jar}_intermediates/classes.jar"
-done
+common_targets="vogar"
+
 # These build targets have different names on device and host.
 specific_targets="libjavacoretests libwrapagentproperties libwrapagentpropertiesd"
 build_host="no"
@@ -164,6 +155,7 @@ build_targets_for_py=()
 
 build_targets_for_py+=(${common_targets})
 art_build_py_args+=("${j_arg}")
+art_build_py_args+=("--build-art-libcore-jdwp-test-jars")
 
 if [[ $build_host == "yes" ]]; then
   # Pass generic internal target flags to art_build.py
@@ -209,7 +201,7 @@ if [[ $build_target == "yes" ]]; then
   build_targets_for_py+=("linkerconfig" "conv_linker_config" "sanitizer.libraries.txt" "llndk.libraries.txt")
 
   # Additional targets needed for the chroot environment.
-  build_targets_for_py+=("event-log-tags")
+  build_targets_for_py+=("${ANDROID_PRODUCT_OUT#$ANDROID_BUILD_TOP/}/system/etc/event-log-tags")
 
   # Needed to extract prebuilt APEXes.
   build_targets_for_py+=("deapexer")

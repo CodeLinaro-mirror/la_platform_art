@@ -762,14 +762,13 @@ static void GenUnsafeGet(HInvoke* invoke,
 
   if (type == DataType::Type::kReference && codegen->EmitBakerReadBarrier()) {
     // UnsafeGetObject/UnsafeGetObjectVolatile with Baker's read barrier case.
-    Register temp = WRegisterFrom(locations->GetTemp(0));
     MacroAssembler* masm = codegen->GetVIXLAssembler();
     // Piggy-back on the field load path using introspection for the Baker read barrier.
     if (offset_loc.IsConstant()) {
       uint32_t offset = Int64FromLocation(offset_loc);
+      DCHECK_EQ(locations->GetTempCount(), ReadBarrierNeedsTemp(is_volatile, invoke));
       Location maybe_temp = ReadBarrierNeedsTemp(is_volatile, invoke)
           ? locations->GetTemp(0) : Location::NoLocation();
-      DCHECK_EQ(locations->GetTempCount(), ReadBarrierNeedsTemp(is_volatile, invoke));
       codegen->GenerateFieldLoadWithBakerReadBarrier(invoke,
                                                      trg_loc,
                                                      base.W(),
@@ -778,6 +777,7 @@ static void GenUnsafeGet(HInvoke* invoke,
                                                      /* needs_null_check= */ false,
                                                      is_volatile);
     } else {
+      Register temp = WRegisterFrom(locations->GetTemp(0));
       __ Add(temp, base, WRegisterFrom(offset_loc));  // Offset should not exceed 32 bits.
       codegen->GenerateFieldLoadWithBakerReadBarrier(invoke,
                                                      trg_loc,
@@ -1398,16 +1398,18 @@ static void GenerateCompareAndSet(CodeGeneratorARM64* codegen,
                                   DataType::Type type,
                                   std::memory_order order,
                                   bool strong,
+                                  bool use_lse,
                                   vixl::aarch64::Label* cmp_failure,
                                   Register ptr,
                                   Register new_value,
                                   Register old_value,
                                   Register store_result,
                                   Register expected,
-                                  Register expected2 = Register()) {
+                                  Register expected2) {
   // The `expected2` is valid only for reference slow path and represents the unmarked old value
   // from the main path attempt to emit CAS when the marked old value matched `expected`.
   DCHECK_IMPLIES(expected2.IsValid(), type == DataType::Type::kReference);
+  DCHECK_IMPLIES(expected2.IsValid(), !use_lse);
 
   DCHECK(ptr.IsX());
   DCHECK_EQ(new_value.IsX(), type == DataType::Type::kInt64);
@@ -1425,25 +1427,85 @@ static void GenerateCompareAndSet(CodeGeneratorARM64* codegen,
       (order == std::memory_order_release) || (order == std::memory_order_seq_cst);
   DCHECK(use_load_acquire || use_store_release || order == std::memory_order_relaxed);
 
-  // repeat: {
-  //   old_value = [ptr];  // Load exclusive.
-  //   if (old_value != expected && old_value != expected2) goto cmp_failure;
-  //   store_result = failed([ptr] <- new_value);  // Store exclusive.
-  // }
-  // if (strong) {
-  //   if (store_result) goto repeat;  // Repeat until compare fails or store exclusive succeeds.
-  // } else {
-  //   store_result = store_result ^ 1;  // Report success as 1, failure as 0.
-  // }
+  // Compare-and-set, using LSE atomics if available.
   //
-  // Flag Z indicates whether `old_value == expected || old_value == expected2`.
-  // (If `expected2` is not valid, the `old_value == expected2` part is not emitted.)
+  // Without LSE, the code is a standard `ldxr`/`stxr` loop for strong CAS:
+  //   loop:
+  //     ldxr old_value, [ptr]
+  //     cmp old_value, expected
+  //     b.ne failure
+  //     stxr store_result, new_value, [ptr]
+  //     cbnz store_result, loop
+  // For weak CAS, there is no loop and the `stxr` result is returned.
+  //
+  // With LSE, the code is:
+  //   mov old_value, expected
+  //   cas old_value, new_value, [ptr]
+  //   cmp old_value, expected
+  // For strong CAS, the final Z flag from the `cmp` is used by the caller to determine
+  // the result. For weak CAS, the result is computed with a `cset` and returned in
+  // `store_result`.
+  //
+  // `expected2` is used for an additional comparison if valid.
 
   vixl::aarch64::Label loop_head;
-  if (strong) {
-    __ Bind(&loop_head);
+  if (use_lse) {
+    __ Mov(old_value, expected);
+    switch (type) {
+      case DataType::Type::kBool:
+      case DataType::Type::kUint8:
+      case DataType::Type::kInt8:
+        if (use_load_acquire && use_store_release) {
+          __ Casalb(old_value, new_value, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Caslb(old_value, new_value, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Casab(old_value, new_value, MemOperand(ptr));
+        } else {
+          __ Casb(old_value, new_value, MemOperand(ptr));
+        }
+        break;
+      case DataType::Type::kUint16:
+      case DataType::Type::kInt16:
+        if (use_load_acquire && use_store_release) {
+          __ Casalh(old_value, new_value, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Caslh(old_value, new_value, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Casah(old_value, new_value, MemOperand(ptr));
+        } else {
+          __ Cash(old_value, new_value, MemOperand(ptr));
+        }
+        break;
+      case DataType::Type::kReference:
+        assembler->MaybePoisonHeapReference(new_value);
+        FALLTHROUGH_INTENDED;
+      case DataType::Type::kInt32:
+      case DataType::Type::kInt64:
+        if (use_load_acquire && use_store_release) {
+          __ Casal(old_value, new_value, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Casl(old_value, new_value, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Casa(old_value, new_value, MemOperand(ptr));
+        } else {
+          __ Cas(old_value, new_value, MemOperand(ptr));
+        }
+        if (type == DataType::Type::kReference) {
+          assembler->MaybeUnpoisonHeapReference(new_value);
+        }
+        break;
+      default:
+        LOG(FATAL) << "Unexpected type: " << type;
+        UNREACHABLE();
+    }
+  } else {
+    if (strong) {
+      __ Bind(&loop_head);
+    }
+    EmitLoadExclusive(codegen, type, ptr, old_value, use_load_acquire);
   }
-  EmitLoadExclusive(codegen, type, ptr, old_value, use_load_acquire);
+
   __ Cmp(old_value, expected);
   if (expected2.IsValid()) {
     __ Ccmp(old_value, expected2, ZFlag, ne);
@@ -1451,13 +1513,22 @@ static void GenerateCompareAndSet(CodeGeneratorARM64* codegen,
   // If the comparison failed, the Z flag is cleared as we branch to the `cmp_failure` label.
   // If the comparison succeeded, the Z flag is set and remains set after the end of the
   // code emitted here, unless we retry the whole operation.
-  __ B(cmp_failure, ne);
-  EmitStoreExclusive(codegen, type, ptr, store_result, new_value, use_store_release);
-  if (strong) {
-    __ Cbnz(store_result, &loop_head);
+  if (cmp_failure != nullptr) {
+    __ B(cmp_failure, ne);
+  }
+
+  if (use_lse) {
+    if (!strong) {
+      __ Cset(store_result, eq);
+    }
   } else {
-    // Flip the `store_result` register to indicate success by 1 and failure by 0.
-    __ Eor(store_result, store_result, 1);
+    EmitStoreExclusive(codegen, type, ptr, store_result, new_value, use_store_release);
+    if (strong) {
+      __ Cbnz(store_result, &loop_head);
+    } else {
+      // Flip the `store_result` register to indicate success by 1 and failure by 0.
+      __ Eor(store_result, store_result, 1);
+    }
   }
 }
 
@@ -1552,6 +1623,7 @@ class ReadBarrierCasSlowPathARM64 : public SlowPathCodeARM64 {
                           DataType::Type::kReference,
                           order_,
                           strong_,
+                          /*use_lse=*/ false,
                           /*cmp_failure=*/ update_old_value_ ? &mark_old_value : GetExitLabel(),
                           tmp_ptr,
                           new_value_,
@@ -1626,6 +1698,7 @@ static void GenUnsafeCas(HInvoke* invoke, DataType::Type type, CodeGeneratorARM6
   vixl::aarch64::Label exit_loop_label;
   vixl::aarch64::Label* exit_loop = &exit_loop_label;
   vixl::aarch64::Label* cmp_failure = &exit_loop_label;
+  bool use_lse = codegen->ShouldUseLSE();
 
   if (type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
     // We need to store the `old_value` in a non-scratch register to make sure
@@ -1653,6 +1726,9 @@ static void GenUnsafeCas(HInvoke* invoke, DataType::Type type, CodeGeneratorARM6
     cmp_failure = slow_path->GetEntryLabel();
   } else {
     old_value = temps.AcquireSameSizeAs(new_value);
+    if (use_lse) {
+      cmp_failure = nullptr;
+    }
   }
 
   __ Add(tmp_ptr, base.X(), Operand(offset));
@@ -1661,12 +1737,14 @@ static void GenUnsafeCas(HInvoke* invoke, DataType::Type type, CodeGeneratorARM6
                         type,
                         std::memory_order_seq_cst,
                         /*strong=*/ true,
+                        use_lse,
                         cmp_failure,
                         tmp_ptr,
                         new_value,
                         old_value,
                         /*store_result=*/ old_value.W(),  // Reuse `old_value` for ST*XR* result.
-                        expected);
+                        expected,
+                        /*expected2=*/ Register());
   __ Bind(exit_loop);
   __ Cset(out, eq);
 }
@@ -1811,44 +1889,90 @@ static void GenerateGetAndUpdate(CodeGeneratorARM64* codegen,
       (order == std::memory_order_release) || (order == std::memory_order_seq_cst);
   DCHECK(use_load_acquire || use_store_release);
 
-  vixl::aarch64::Label loop_label;
-  __ Bind(&loop_label);
-  EmitLoadExclusive(codegen, load_store_type, ptr, old_value_reg, use_load_acquire);
-  switch (get_and_update_op) {
-    case GetAndUpdateOp::kSet:
-      break;
-    case GetAndUpdateOp::kAddWithByteSwap:
-      // To avoid unnecessary sign extension before REV16, the caller must specify `kUint16`
-      // instead of `kInt16` and do the sign-extension explicitly afterwards.
-      DCHECK_NE(load_store_type, DataType::Type::kInt16);
-      GenerateReverseBytes(masm, load_store_type, old_value_reg, old_value_reg);
-      FALLTHROUGH_INTENDED;
-    case GetAndUpdateOp::kAdd:
-      if (arg.IsVRegister()) {
-        VRegister old_value_vreg = old_value.IsD() ? old_value.D() : old_value.S();
-        VRegister sum = temps.AcquireSameSizeAs(old_value_vreg);
-        __ Fmov(old_value_vreg, old_value_reg);
-        __ Fadd(sum, old_value_vreg, arg.IsD() ? arg.D() : arg.S());
-        __ Fmov(new_value, sum);
-      } else {
-        __ Add(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
-      }
-      if (get_and_update_op == GetAndUpdateOp::kAddWithByteSwap) {
-        GenerateReverseBytes(masm, load_store_type, new_value, new_value);
-      }
-      break;
-    case GetAndUpdateOp::kAnd:
-      __ And(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
-      break;
-    case GetAndUpdateOp::kOr:
-      __ Orr(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
-      break;
-    case GetAndUpdateOp::kXor:
-      __ Eor(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
-      break;
+  if (codegen->ShouldUseLSE() && get_and_update_op == GetAndUpdateOp::kAdd && !arg.IsVRegister()) {
+    DCHECK(arg.IsX() || arg.IsW());
+    Register arg_reg = arg.IsX() ? arg.X() : arg.W();
+    switch (load_store_type) {
+      case DataType::Type::kUint8:
+      case DataType::Type::kInt8:
+        if (use_load_acquire && use_store_release) {
+          __ Ldaddalb(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Ldaddab(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Ldaddlb(arg_reg, old_value_reg, MemOperand(ptr));
+        } else {
+          __ Ldaddb(arg_reg, old_value_reg, MemOperand(ptr));
+        }
+        break;
+      case DataType::Type::kUint16:
+      case DataType::Type::kInt16:
+        if (use_load_acquire && use_store_release) {
+          __ Ldaddalh(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Ldaddah(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Ldaddlh(arg_reg, old_value_reg, MemOperand(ptr));
+        } else {
+          __ Ldaddh(arg_reg, old_value_reg, MemOperand(ptr));
+        }
+        break;
+      case DataType::Type::kInt32:
+      case DataType::Type::kInt64:
+        if (use_load_acquire && use_store_release) {
+          __ Ldaddal(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_load_acquire) {
+          __ Ldadda(arg_reg, old_value_reg, MemOperand(ptr));
+        } else if (use_store_release) {
+          __ Ldaddl(arg_reg, old_value_reg, MemOperand(ptr));
+        } else {
+          __ Ldadd(arg_reg, old_value_reg, MemOperand(ptr));
+        }
+        break;
+      default:
+        LOG(FATAL) << "Unexpected type: " << load_store_type;
+        UNREACHABLE();
+    }
+  } else {
+    vixl::aarch64::Label loop_label;
+    __ Bind(&loop_label);
+    EmitLoadExclusive(codegen, load_store_type, ptr, old_value_reg, use_load_acquire);
+    switch (get_and_update_op) {
+      case GetAndUpdateOp::kSet:
+        break;
+      case GetAndUpdateOp::kAddWithByteSwap:
+        // To avoid unnecessary sign extension before REV16, the caller must specify `kUint16`
+        // instead of `kInt16` and do the sign-extension explicitly afterwards.
+        DCHECK_NE(load_store_type, DataType::Type::kInt16);
+        GenerateReverseBytes(masm, load_store_type, old_value_reg, old_value_reg);
+        FALLTHROUGH_INTENDED;
+      case GetAndUpdateOp::kAdd:
+        if (arg.IsVRegister()) {
+          VRegister old_value_vreg = old_value.IsD() ? old_value.D() : old_value.S();
+          VRegister sum = temps.AcquireSameSizeAs(old_value_vreg);
+          __ Fmov(old_value_vreg, old_value_reg);
+          __ Fadd(sum, old_value_vreg, arg.IsD() ? arg.D() : arg.S());
+          __ Fmov(new_value, sum);
+        } else {
+          __ Add(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
+        }
+        if (get_and_update_op == GetAndUpdateOp::kAddWithByteSwap) {
+          GenerateReverseBytes(masm, load_store_type, new_value, new_value);
+        }
+        break;
+      case GetAndUpdateOp::kAnd:
+        __ And(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
+        break;
+      case GetAndUpdateOp::kOr:
+        __ Orr(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
+        break;
+      case GetAndUpdateOp::kXor:
+        __ Eor(new_value, old_value_reg, arg.IsX() ? arg.X() : arg.W());
+        break;
+    }
+    EmitStoreExclusive(codegen, load_store_type, ptr, store_result, new_value, use_store_release);
+    __ Cbnz(store_result, &loop_label);
   }
-  EmitStoreExclusive(codegen, load_store_type, ptr, store_result, new_value, use_store_release);
-  __ Cbnz(store_result, &loop_label);
 }
 
 static void CreateUnsafeGetAndUpdateLocations(ArenaAllocator* allocator,
@@ -2910,47 +3034,18 @@ static constexpr int32_t kSystemArrayCopyPrimThreshold = 384;
 static void CreateSystemArrayCopyLocations(HInvoke* invoke, DataType::Type type) {
   int32_t copy_threshold = kSystemArrayCopyPrimThreshold / DataType::Size(type);
 
-  // Check to see if we have known failures that will cause us to have to bail out
-  // to the runtime, and just generate the runtime call directly.
-  HIntConstant* src_pos = invoke->InputAt(1)->AsIntConstantOrNull();
-  HIntConstant* dst_pos = invoke->InputAt(3)->AsIntConstantOrNull();
+  constexpr size_t kInitialNumTemps = 3u;
+  LocationSummary* locations = CodeGenerator::CreateSystemArrayCopyLocationSummary(
+      invoke, copy_threshold, kInitialNumTemps);
 
-  // The positions must be non-negative.
-  if ((src_pos != nullptr && src_pos->GetValue() < 0) ||
-      (dst_pos != nullptr && dst_pos->GetValue() < 0)) {
-    // We will have to fail anyways.
-    return;
+  if (locations != nullptr) {
+    // arraycopy(char[] src, int src_pos, char[] dst, int dst_pos, int length).
+    DCHECK(locations->InAt(0).Equals(Location::RequiresCoreRegister()));
+    locations->SetInAt(1, LocationForSystemArrayCopyInput(invoke->InputAt(1)));
+    DCHECK(locations->InAt(2).Equals(Location::RequiresCoreRegister()));
+    locations->SetInAt(3, LocationForSystemArrayCopyInput(invoke->InputAt(3)));
+    locations->SetInAt(4, LocationForSystemArrayCopyInput(invoke->InputAt(4)));
   }
-
-  // The length must be >= 0 and not so long that we would (currently) prefer libcore's
-  // native implementation.
-  HIntConstant* length = invoke->InputAt(4)->AsIntConstantOrNull();
-  if (length != nullptr) {
-    int32_t len = length->GetValue();
-    if (len < 0 || len > copy_threshold) {
-      // Just call as normal.
-      return;
-    }
-  }
-
-  // If source and destination are the same, take the slow path. Overlapping copy regions must be
-  // copied in reverse and we can't know in all cases if it's needed.
-  SystemArrayCopyOptimizations optimizations(invoke);
-  if (optimizations.GetDestinationIsSource()) {
-    return;
-  }
-
-  ArenaAllocator* allocator = invoke->GetBlock()->GetGraph()->GetAllocator();
-  LocationSummary* locations =
-      LocationSummary::Create(allocator, invoke, LocationSummary::kCallOnSlowPath, kIntrinsified);
-  // arraycopy(char[] src, int src_pos, char[] dst, int dst_pos, int length).
-  locations->SetInAt(0, Location::RequiresCoreRegister());
-  locations->SetInAt(1, LocationForSystemArrayCopyInput(invoke->InputAt(1)));
-  locations->SetInAt(2, Location::RequiresCoreRegister());
-  locations->SetInAt(3, LocationForSystemArrayCopyInput(invoke->InputAt(3)));
-  locations->SetInAt(4, LocationForSystemArrayCopyInput(invoke->InputAt(4)));
-
-  locations->AddRegisterTemps(3);
 }
 
 void IntrinsicLocationsBuilderARM64::VisitSystemArrayCopyByte(HInvoke* invoke) {
@@ -3061,6 +3156,78 @@ static void GenSystemArrayCopyAddresses(MacroAssembler* masm,
   }
 }
 
+static void CheckSystemArrayCopyNullOrOverlap(HInvoke* invoke,
+                                              MacroAssembler* masm,
+                                              SlowPathCodeARM64* slow_path,
+                                              Register src,
+                                              Register dest,
+                                              Location src_pos,
+                                              Location dest_pos,
+                                              Location length,
+                                              int32_t copy_threshold) {
+  SystemArrayCopyOptimizations optimizations(invoke);
+  vixl::aarch64::Label conditions_on_positions_validated;
+
+  // If source and destination are the same, then the copied arrays may overlap.
+  // For overlapping arrays we can only guarantee correctness if `src_pos >= dst_pos`, otherwise
+  // copying the elements at the beginning of source array may clobber the elements at the end.
+  if (!optimizations.GetSourcePositionIsDestinationPosition()) {
+    if (src_pos.IsConstant()) {
+      int32_t src_pos_constant = src_pos.GetConstant()->AsIntConstant()->GetValue();
+      if (dest_pos.IsConstant()) {
+        int32_t dest_pos_constant = dest_pos.GetConstant()->AsIntConstant()->GetValue();
+        if (optimizations.GetDestinationIsSource()) {
+          // Checked when building locations.
+          DCHECK_GE(src_pos_constant, dest_pos_constant);
+        } else if (src_pos_constant < dest_pos_constant) {
+          __ Cmp(src, dest);
+          __ B(slow_path->GetEntryLabel(), eq);
+        }
+      } else {
+        if (!optimizations.GetDestinationIsSource()) {
+          __ Cmp(src, dest);
+          __ B(&conditions_on_positions_validated, ne);
+        }
+        __ Cmp(WRegisterFrom(dest_pos), src_pos_constant);
+        __ B(slow_path->GetEntryLabel(), gt);
+      }
+    } else {
+      if (!optimizations.GetDestinationIsSource()) {
+        __ Cmp(src, dest);
+        __ B(&conditions_on_positions_validated, ne);
+      }
+      __ Cmp(RegisterFrom(src_pos, invoke->InputAt(1)->GetType()),
+             OperandFrom(dest_pos, invoke->InputAt(3)->GetType()));
+      __ B(slow_path->GetEntryLabel(), lt);
+    }
+  }
+
+  __ Bind(&conditions_on_positions_validated);
+
+  if (!optimizations.GetSourceIsNotNull()) {
+    // Bail out if the source is null.
+    __ Cbz(src, slow_path->GetEntryLabel());
+  }
+
+  if (!optimizations.GetDestinationIsNotNull() && !optimizations.GetDestinationIsSource()) {
+    // Bail out if the destination is null.
+    __ Cbz(dest, slow_path->GetEntryLabel());
+  }
+
+  // We have already checked in the LocationsBuilder for the constant case.
+  if (!length.IsConstant()) {
+    // Merge the following two comparisons into one:
+    //   If the length is negative, bail out (delegate to libcore's native implementation).
+    //   If the length >= 128 then (currently) prefer native implementation.
+    __ Cmp(WRegisterFrom(length), copy_threshold);
+    __ B(slow_path->GetEntryLabel(), hs);
+  } else {
+    // We have already checked in the LocationsBuilder for the constant case.
+    DCHECK_GE(length.GetConstant()->AsIntConstant()->GetValue(), 0);
+    DCHECK_LE(length.GetConstant()->AsIntConstant()->GetValue(), copy_threshold);
+  }
+}
+
 static void SystemArrayCopyPrimitive(HInvoke* invoke,
                                      CodeGeneratorARM64* codegen,
                                      DataType::Type type) {
@@ -3076,41 +3243,17 @@ static void SystemArrayCopyPrimitive(HInvoke* invoke,
       new (codegen->GetScopedAllocator()) IntrinsicSlowPathARM64(invoke);
   codegen->AddSlowPath(slow_path);
 
-  SystemArrayCopyOptimizations optimizations(invoke);
-
-  // If source and destination are the same, take the slow path. Overlapping copy regions must be
-  // copied in reverse and we can't know in all cases if it's needed.
-  DCHECK(!optimizations.GetDestinationIsSource());  // already handled in location builder
-  __ Cmp(src, dst);
-  __ B(slow_path->GetEntryLabel(), eq);
-
-  if (!optimizations.GetSourceIsNotNull()) {
-    // Bail out if the source is null.
-    __ Cbz(src, slow_path->GetEntryLabel());
-  }
-
-  if (!optimizations.GetDestinationIsNotNull()) {
-    // Bail out if the destination is null.
-    __ Cbz(dst, slow_path->GetEntryLabel());
-  }
-
+  // Check that source and position are different, or if they are the same check that copy
+  // direction is backward. Also check for null pointers.
   int32_t copy_threshold = kSystemArrayCopyPrimThreshold / DataType::Size(type);
-  if (!length.IsConstant()) {
-    // Merge the following two comparisons into one:
-    //   If the length is negative, bail out (delegate to libcore's native implementation).
-    //   If the length > copy_threshold then (currently) prefer libcore's native implementation.
-    __ Cmp(WRegisterFrom(length), copy_threshold);
-    __ B(slow_path->GetEntryLabel(), hi);
-  } else {
-    // We have already checked in the LocationsBuilder for the constant case.
-    DCHECK_GE(length.GetConstant()->AsIntConstant()->GetValue(), 0);
-    DCHECK_LE(length.GetConstant()->AsIntConstant()->GetValue(), copy_threshold);
-  }
+  CheckSystemArrayCopyNullOrOverlap(
+      invoke, masm, slow_path, src, dst, src_pos, dst_pos, length, copy_threshold);
 
   Register src_curr_addr = WRegisterFrom(locations->GetTemp(0));
   Register dst_curr_addr = WRegisterFrom(locations->GetTemp(1));
   Register src_stop_addr = WRegisterFrom(locations->GetTemp(2));
 
+  // Check that source position is within bounds.
   CheckSystemArrayCopyPosition(masm,
                                src,
                                src_pos,
@@ -3120,6 +3263,7 @@ static void SystemArrayCopyPrimitive(HInvoke* invoke,
                                /*length_is_array_length=*/ false,
                                /*position_sign_checked=*/ false);
 
+  // Check that destination position is within bounds.
   CheckSystemArrayCopyPosition(masm,
                                dst,
                                dst_pos,
@@ -3311,63 +3455,21 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopy(HInvoke* invoke) {
       new (codegen_->GetScopedAllocator()) IntrinsicSlowPathARM64(invoke);
   codegen_->AddSlowPath(intrinsic_slow_path);
 
-  vixl::aarch64::Label conditions_on_positions_validated;
+  // Check that source and position are different, or if they are the same check that copy
+  // direction is backward. Also check for null pointers.
+  CheckSystemArrayCopyNullOrOverlap(invoke,
+                                    masm,
+                                    intrinsic_slow_path,
+                                    src,
+                                    dest,
+                                    src_pos,
+                                    dest_pos,
+                                    length,
+                                    kSystemArrayCopyThreshold);
+
   SystemArrayCopyOptimizations optimizations(invoke);
 
-  // If source and destination are the same, we go to slow path if we need to do forward copying.
-  // We do not need to do this check if the source and destination positions are the same.
-  if (!optimizations.GetSourcePositionIsDestinationPosition()) {
-    if (src_pos.IsConstant()) {
-      int32_t src_pos_constant = src_pos.GetConstant()->AsIntConstant()->GetValue();
-      if (dest_pos.IsConstant()) {
-        int32_t dest_pos_constant = dest_pos.GetConstant()->AsIntConstant()->GetValue();
-        if (optimizations.GetDestinationIsSource()) {
-          // Checked when building locations.
-          DCHECK_GE(src_pos_constant, dest_pos_constant);
-        } else if (src_pos_constant < dest_pos_constant) {
-          __ Cmp(src, dest);
-          __ B(intrinsic_slow_path->GetEntryLabel(), eq);
-        }
-      } else {
-        if (!optimizations.GetDestinationIsSource()) {
-          __ Cmp(src, dest);
-          __ B(&conditions_on_positions_validated, ne);
-        }
-        __ Cmp(WRegisterFrom(dest_pos), src_pos_constant);
-        __ B(intrinsic_slow_path->GetEntryLabel(), gt);
-      }
-    } else {
-      if (!optimizations.GetDestinationIsSource()) {
-        __ Cmp(src, dest);
-        __ B(&conditions_on_positions_validated, ne);
-      }
-      __ Cmp(RegisterFrom(src_pos, invoke->InputAt(1)->GetType()),
-             OperandFrom(dest_pos, invoke->InputAt(3)->GetType()));
-      __ B(intrinsic_slow_path->GetEntryLabel(), lt);
-    }
-  }
-
-  __ Bind(&conditions_on_positions_validated);
-
-  if (!optimizations.GetSourceIsNotNull()) {
-    // Bail out if the source is null.
-    __ Cbz(src, intrinsic_slow_path->GetEntryLabel());
-  }
-
-  if (!optimizations.GetDestinationIsNotNull() && !optimizations.GetDestinationIsSource()) {
-    // Bail out if the destination is null.
-    __ Cbz(dest, intrinsic_slow_path->GetEntryLabel());
-  }
-
-  // We have already checked in the LocationsBuilder for the constant case.
-  if (!length.IsConstant()) {
-    // Merge the following two comparisons into one:
-    //   If the length is negative, bail out (delegate to libcore's native implementation).
-    //   If the length >= 128 then (currently) prefer native implementation.
-    __ Cmp(WRegisterFrom(length), kSystemArrayCopyThreshold);
-    __ B(intrinsic_slow_path->GetEntryLabel(), hs);
-  }
-  // Validity checks: source.
+  // Check that source position is within bounds.
   CheckSystemArrayCopyPosition(masm,
                                src,
                                src_pos,
@@ -3377,7 +3479,7 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopy(HInvoke* invoke) {
                                optimizations.GetCountIsSourceLength(),
                                /*position_sign_checked=*/ false);
 
-  // Validity checks: dest.
+  // Check that destination position is within bounds.
   bool dest_position_sign_checked = optimizations.GetSourcePositionIsDestinationPosition();
   CheckSystemArrayCopyPosition(masm,
                                dest,
@@ -5421,6 +5523,7 @@ static void GenerateVarHandleCompareAndSetOrExchange(HInvoke* invoke,
   vixl::aarch64::Label* exit_loop = &exit_loop_label;
   vixl::aarch64::Label* cmp_failure = &exit_loop_label;
 
+  bool use_lse = codegen->ShouldUseLSE();
   if (value_type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
     // The `old_value_temp` is used first for the marked `old_value` and then for the unmarked
     // reloaded old value for subsequent CAS in the slow path. It cannot be a scratch register.
@@ -5447,23 +5550,30 @@ static void GenerateVarHandleCompareAndSetOrExchange(HInvoke* invoke,
     codegen->AddSlowPath(rb_slow_path);
     exit_loop = rb_slow_path->GetExitLabel();
     cmp_failure = rb_slow_path->GetEntryLabel();
+  } else if (use_lse) {
+    cmp_failure = nullptr;
   }
 
   GenerateCompareAndSet(codegen,
                         cas_type,
                         order,
                         strong,
+                        use_lse,
                         cmp_failure,
                         tmp_ptr,
                         new_value_reg,
                         old_value,
                         store_result,
-                        expected_reg);
+                        expected_reg,
+                        /*expected2=*/ Register());
   __ Bind(exit_loop);
 
   if (return_success) {
     if (strong) {
       __ Cset(out.W(), eq);
+    } else if (use_lse) {
+      // The result from `GenerateCompareAndSet()` is already final with LSE.
+      DCHECK(store_result.Is(out));
     } else {
       // On success, the Z flag is set and the store result is 1, see GenerateCompareAndSet().
       // On failure, either the Z flag is clear or the store result is 0.
@@ -5689,11 +5799,13 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
     // For floating point GetAndSet, do the GenerateGetAndUpdate() with core registers,
     // rather than moving between core and FP registers in the loop.
     arg = MoveToTempIfFpRegister(arg, value_type, masm, &temps);
-    if (is_fp && !arg.IsZero()) {
-      // We need a temporary register but we have already used a scratch register for
-      // the new value unless it is zero bit pattern (+0.0f or +0.0) and need another one
-      // in GenerateGetAndUpdate(). We have allocated a normal temporary to handle that.
-      old_value = CPURegisterFrom(locations->GetTemp(1u), load_store_type);
+    if (is_fp) {
+      // `old_value` needs to be a core register for `GenerateGetAndUpdate`. If the argument
+      // is zero bit pattern (+0.0f or +0.0), we can use a scratch register. Otherwise it's used
+      // by the argument, and we should use a temporary that has been allocated for nonzero case.
+      old_value = arg.IsZero()
+          ? (old_value.IsD() ? temps.AcquireX() : temps.AcquireW())
+          : CPURegisterFrom(locations->GetTemp(1u), load_store_type);
     } else if (value_type == DataType::Type::kReference && codegen->EmitBakerReadBarrier()) {
       // Load the old value initially to a scratch register.
       // We shall move it to `out` later with a read barrier.
@@ -5991,8 +6103,10 @@ void IntrinsicLocationsBuilderARM64::VisitMethodHandleInvokeExact(HInvoke* invok
   Location receiver_mh_loc = calling_convention.GetNextLocation(DataType::Type::kReference);
   locations->SetInAt(0, receiver_mh_loc);
 
-  // The last input is MethodType object corresponding to the call-site.
-  locations->SetInAt(number_of_args, Location::RequiresCoreRegister());
+  if (invoke->AsInvokePolymorphic()->NeedsCallSiteTypeCheck()) {
+    // The last input is MethodType object corresponding to the call-site.
+    locations->SetInAt(number_of_args, Location::RequiresCoreRegister());
+  }
 
   locations->AddTemp(calling_convention.GetMethodLocation());
   locations->AddRegisterTemps(4);
@@ -6020,14 +6134,17 @@ void IntrinsicCodeGeneratorARM64::VisitMethodHandleInvokeExact(HInvoke* invoke) 
       new (codegen_->GetScopedAllocator()) InvokePolymorphicSlowPathARM64(invoke, method_handle);
   codegen_->AddSlowPath(slow_path);
 
-  Register call_site_type = InputRegisterAt(invoke, invoke->GetNumberOfArguments());
-
-  // Call site should match with MethodHandle's type.
   Register temp = WRegisterFrom(locations->GetTemp(1));
-  __ Ldr(temp, HeapOperand(method_handle.W(), mirror::MethodHandle::MethodTypeOffset()));
-  codegen_->GetAssembler()->MaybeUnpoisonHeapReference(temp);
-  __ Cmp(call_site_type, temp);
-  __ B(ne, slow_path->GetEntryLabel());
+
+  if (invoke->AsInvokePolymorphic()->NeedsCallSiteTypeCheck()) {
+    Register call_site_type = InputRegisterAt(invoke, invoke->GetNumberOfArguments());
+
+    // Call site should match with MethodHandle's type.
+    __ Ldr(temp, HeapOperand(method_handle.W(), mirror::MethodHandle::MethodTypeOffset()));
+    codegen_->GetAssembler()->MaybeUnpoisonHeapReference(temp);
+    __ Cmp(call_site_type, temp);
+    __ B(ne, slow_path->GetEntryLabel());
+  }
 
   Register method = XRegisterFrom(locations->GetTemp(0));
   __ Ldr(method, HeapOperand(method_handle.W(), mirror::MethodHandle::ArtFieldOrMethodOffset()));

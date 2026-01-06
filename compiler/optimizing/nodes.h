@@ -2703,7 +2703,7 @@ class HTryBoundary final : public HExpression<0> {
   HBasicBlock* GetNormalFlowSuccessor() const { return GetBlock()->GetSuccessors()[0]; }
 
   ArrayRef<HBasicBlock* const> GetExceptionHandlers() const {
-    return ArrayRef<HBasicBlock* const>(GetBlock()->GetSuccessors()).SubArray(1u);
+    return GetBlock()->GetExceptionalSuccessors();
   }
 
   // Returns whether `handler` is among its exception handlers (non-zero index
@@ -4066,7 +4066,8 @@ class HInvokePolymorphic final : public HInvoke {
                 resolved_method_reference,
                 kPolymorphic,
                 /* enable_intrinsic_opt= */ true),
-        proto_idx_(proto_idx) {}
+        proto_idx_(proto_idx),
+        needs_callsite_type_check_(true) {}
 
   bool IsClonable() const override { return true; }
 
@@ -4082,10 +4083,24 @@ class HInvokePolymorphic final : public HInvoke {
         InputAt(1)->GetType() == DataType::Type::kReference;
   }
 
+  void SkipCallSiteTypeCheck() {
+    DCHECK(IsMethodHandleInvokeExact());
+    DCHECK(needs_callsite_type_check_);
+    needs_callsite_type_check_ = false;
+  }
+
+  bool NeedsCallSiteTypeCheck() const {
+    DCHECK(IsMethodHandleInvokeExact());
+    return needs_callsite_type_check_;
+  }
+
+  bool NeedsReturnTypeCheck();
+
   DECLARE_INSTRUCTION(InvokePolymorphic);
 
  protected:
   dex::ProtoIndex proto_idx_;
+  bool needs_callsite_type_check_;
   DEFAULT_COPY_CONSTRUCTOR(InvokePolymorphic);
 };
 
@@ -5086,20 +5101,20 @@ class HParameterValue final : public HExpression<0> {
  public:
   HParameterValue(const DexFile& dex_file,
                   dex::TypeIndex type_index,
-                  uint8_t index,
+                  uint8_t input_vreg_index,
                   DataType::Type parameter_type,
                   bool is_this = false)
       : HExpression(kParameterValue, parameter_type, SideEffects::None(), kNoDexPc),
         dex_file_(dex_file),
         type_index_(type_index),
-        index_(index) {
+        input_vreg_index_(input_vreg_index) {
     SetPackedFlag<kFlagIsThis>(is_this);
     SetPackedFlag<kFlagCanBeNull>(!is_this);
   }
 
   const DexFile& GetDexFile() const { return dex_file_; }
   dex::TypeIndex GetTypeIndex() const { return type_index_; }
-  uint8_t GetIndex() const { return index_; }
+  uint8_t GetInputVRegIndex() const { return input_vreg_index_; }
   bool IsThis() const { return GetPackedFlag<kFlagIsThis>(); }
 
   bool CanBeNull() const override { return GetPackedFlag<kFlagCanBeNull>(); }
@@ -5122,7 +5137,7 @@ class HParameterValue final : public HExpression<0> {
   const dex::TypeIndex type_index_;
   // The index of this parameter in the parameters list. Must be less
   // than HGraph::number_of_in_vregs_.
-  const uint8_t index_;
+  const uint8_t input_vreg_index_;
 };
 
 class HNot final : public HUnaryOperation {
