@@ -829,7 +829,7 @@ static void GenUnsafeGetAbsolute(HInvoke* invoke,
 
 static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
-                                     CodeGeneratorARM64* codegen,
+                                     const CodeGeneratorARM64* codegen,
                                      bool is_volatile = false) {
   bool can_call = codegen->EmitReadBarrier() && IsUnsafeGetReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
@@ -1275,7 +1275,7 @@ void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePutByte(HInvoke* invoke) {
 
 static void CreateUnsafeCASLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
-                                     CodeGeneratorARM64* codegen) {
+                                     const CodeGeneratorARM64* codegen) {
   const bool can_call = codegen->EmitReadBarrier() && IsUnsafeCASReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
       allocator,
@@ -1822,6 +1822,120 @@ enum class GetAndUpdateOp {
   kXor
 };
 
+static void EmitLSEAdd(CodeGeneratorARM64* codegen,
+                       DataType::Type type,
+                       Register value,
+                       Register old_value,
+                       MemOperand ptr,
+                       bool acquire,
+                       bool release) {
+  MacroAssembler* masm = codegen->GetVIXLAssembler();
+  switch (type) {
+    case DataType::Type::kUint8:
+    case DataType::Type::kInt8:
+      if (acquire && release) {
+        __ Ldaddalb(value, old_value, ptr);
+      } else if (acquire) {
+        __ Ldaddab(value, old_value, ptr);
+      } else if (release) {
+        __ Ldaddlb(value, old_value, ptr);
+      } else {
+        __ Ldaddb(value, old_value, ptr);
+      }
+      break;
+    case DataType::Type::kUint16:
+    case DataType::Type::kInt16:
+      if (acquire && release) {
+        __ Ldaddalh(value, old_value, ptr);
+      } else if (acquire) {
+        __ Ldaddah(value, old_value, ptr);
+      } else if (release) {
+        __ Ldaddlh(value, old_value, ptr);
+      } else {
+        __ Ldaddh(value, old_value, ptr);
+      }
+      break;
+    case DataType::Type::kInt32:
+    case DataType::Type::kInt64:
+      if (acquire && release) {
+        __ Ldaddal(value, old_value, ptr);
+      } else if (acquire) {
+        __ Ldadda(value, old_value, ptr);
+      } else if (release) {
+        __ Ldaddl(value, old_value, ptr);
+      } else {
+        __ Ldadd(value, old_value, ptr);
+      }
+      break;
+    default:
+      LOG(FATAL) << "Unexpected type: " << type;
+      UNREACHABLE();
+  }
+}
+
+static void EmitLSESwap(CodeGeneratorARM64* codegen,
+                        DataType::Type type,
+                        Register value,
+                        Register old_value,
+                        MemOperand ptr,
+                        bool acquire,
+                        bool release) {
+  MacroAssembler* masm = codegen->GetVIXLAssembler();
+  Arm64Assembler* assembler = codegen->GetAssembler();
+  if (type == DataType::Type::kReference) {
+    assembler->MaybePoisonHeapReference(value);
+  }
+  switch (type) {
+    case DataType::Type::kUint8:
+    case DataType::Type::kInt8:
+      if (acquire && release) {
+        __ Swpalb(value, old_value, ptr);
+      } else if (acquire) {
+        __ Swpab(value, old_value, ptr);
+      } else if (release) {
+        __ Swplb(value, old_value, ptr);
+      } else {
+        __ Swpb(value, old_value, ptr);
+      }
+      break;
+    case DataType::Type::kUint16:
+    case DataType::Type::kInt16:
+      if (acquire && release) {
+        __ Swpalh(value, old_value, ptr);
+      } else if (acquire) {
+        __ Swpah(value, old_value, ptr);
+      } else if (release) {
+        __ Swplh(value, old_value, ptr);
+      } else {
+        __ Swph(value, old_value, ptr);
+      }
+      break;
+    case DataType::Type::kReference:
+      FALLTHROUGH_INTENDED;
+    case DataType::Type::kInt32:
+    case DataType::Type::kInt64:
+      if (acquire && release) {
+        __ Swpal(value, old_value, ptr);
+      } else if (acquire) {
+        __ Swpa(value, old_value, ptr);
+      } else if (release) {
+        __ Swpl(value, old_value, ptr);
+      } else {
+        __ Swp(value, old_value, ptr);
+      }
+      break;
+    default:
+      LOG(FATAL) << "Unexpected type: " << type;
+      UNREACHABLE();
+  }
+
+  if (type == DataType::Type::kReference) {
+    DCHECK(!value.Is(old_value));
+    assembler->MaybeUnpoisonHeapReference(value);
+    assembler->MaybeUnpoisonHeapReference(old_value);
+  }
+}
+
 static void GenerateGetAndUpdate(CodeGeneratorARM64* codegen,
                                  GetAndUpdateOp get_and_update_op,
                                  DataType::Type load_store_type,
@@ -1863,48 +1977,32 @@ static void GenerateGetAndUpdate(CodeGeneratorARM64* codegen,
       (order == std::memory_order_release) || (order == std::memory_order_seq_cst);
   DCHECK(use_load_acquire || use_store_release);
 
-  if (codegen->ShouldUseLSE() && get_and_update_op == GetAndUpdateOp::kAdd && !arg.IsVRegister()) {
+  if (codegen->ShouldUseLSE() &&
+      (get_and_update_op == GetAndUpdateOp::kAdd || get_and_update_op == GetAndUpdateOp::kSet) &&
+      !arg.IsVRegister()) {
     DCHECK(arg.IsX() || arg.IsW());
     Register arg_reg = arg.IsX() ? arg.X() : arg.W();
-    switch (load_store_type) {
-      case DataType::Type::kUint8:
-      case DataType::Type::kInt8:
-        if (use_load_acquire && use_store_release) {
-          __ Ldaddalb(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_load_acquire) {
-          __ Ldaddab(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_store_release) {
-          __ Ldaddlb(arg_reg, old_value_reg, MemOperand(ptr));
-        } else {
-          __ Ldaddb(arg_reg, old_value_reg, MemOperand(ptr));
-        }
+    switch (get_and_update_op) {
+      case GetAndUpdateOp::kAdd:
+        EmitLSEAdd(codegen,
+                   load_store_type,
+                   arg_reg,
+                   old_value_reg,
+                   MemOperand(ptr),
+                   use_load_acquire,
+                   use_store_release);
         break;
-      case DataType::Type::kUint16:
-      case DataType::Type::kInt16:
-        if (use_load_acquire && use_store_release) {
-          __ Ldaddalh(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_load_acquire) {
-          __ Ldaddah(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_store_release) {
-          __ Ldaddlh(arg_reg, old_value_reg, MemOperand(ptr));
-        } else {
-          __ Ldaddh(arg_reg, old_value_reg, MemOperand(ptr));
-        }
-        break;
-      case DataType::Type::kInt32:
-      case DataType::Type::kInt64:
-        if (use_load_acquire && use_store_release) {
-          __ Ldaddal(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_load_acquire) {
-          __ Ldadda(arg_reg, old_value_reg, MemOperand(ptr));
-        } else if (use_store_release) {
-          __ Ldaddl(arg_reg, old_value_reg, MemOperand(ptr));
-        } else {
-          __ Ldadd(arg_reg, old_value_reg, MemOperand(ptr));
-        }
+      case GetAndUpdateOp::kSet:
+        EmitLSESwap(codegen,
+                    load_store_type,
+                    arg_reg,
+                    old_value_reg,
+                    MemOperand(ptr),
+                    use_load_acquire,
+                    use_store_release);
         break;
       default:
-        LOG(FATAL) << "Unexpected type: " << load_store_type;
+        LOG(FATAL) << "Unexpected LSE path for GetAndUpdateOp.";
         UNREACHABLE();
     }
   } else {
@@ -1951,7 +2049,7 @@ static void GenerateGetAndUpdate(CodeGeneratorARM64* codegen,
 
 static void CreateUnsafeGetAndUpdateLocations(ArenaAllocator* allocator,
                                               HInvoke* invoke,
-                                              CodeGeneratorARM64* codegen) {
+                                              const CodeGeneratorARM64* codegen) {
   const bool can_call = codegen->EmitReadBarrier() && IsUnsafeGetAndSetReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
       allocator,
@@ -4297,7 +4395,7 @@ void IntrinsicCodeGeneratorARM64::VisitFP16Rint(HInvoke* invoke) {
 
 void FP16ComparisonLocations(HInvoke* invoke,
                              ArenaAllocator* allocator_,
-                             CodeGeneratorARM64* codegen_,
+                             const CodeGeneratorARM64* codegen_,
                              int requiredTemps) {
   if (!codegen_->GetInstructionSetFeatures().HasFP16()) {
     return;
@@ -4994,7 +5092,7 @@ static void GenerateVarHandleTarget(HInvoke* invoke,
 }
 
 static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke,
-                                                       CodeGeneratorARM64* codegen) {
+                                                       const CodeGeneratorARM64* codegen) {
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
   DataType::Type return_type = invoke->GetType();
 
@@ -5045,7 +5143,7 @@ static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke,
   return locations;
 }
 
-static void CreateVarHandleGetLocations(HInvoke* invoke, CodeGeneratorARM64* codegen) {
+static void CreateVarHandleGetLocations(HInvoke* invoke, const CodeGeneratorARM64* codegen) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
     return;
@@ -5175,7 +5273,7 @@ void IntrinsicCodeGeneratorARM64::VisitVarHandleGetVolatile(HInvoke* invoke) {
   GenerateVarHandleGet(invoke, codegen_, std::memory_order_seq_cst);
 }
 
-static void CreateVarHandleSetLocations(HInvoke* invoke, CodeGeneratorARM64* codegen) {
+static void CreateVarHandleSetLocations(HInvoke* invoke, const CodeGeneratorARM64* codegen) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
     return;
@@ -5285,7 +5383,7 @@ void IntrinsicCodeGeneratorARM64::VisitVarHandleSetVolatile(HInvoke* invoke) {
 }
 
 static void CreateVarHandleCompareAndSetOrExchangeLocations(HInvoke* invoke,
-                                                            CodeGeneratorARM64* codegen,
+                                                            const CodeGeneratorARM64* codegen,
                                                             bool return_success) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
@@ -5644,7 +5742,7 @@ void IntrinsicCodeGeneratorARM64::VisitVarHandleWeakCompareAndSetRelease(HInvoke
 }
 
 static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
-                                                 CodeGeneratorARM64* codegen,
+                                                 const CodeGeneratorARM64* codegen,
                                                  GetAndUpdateOp get_and_update_op) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {

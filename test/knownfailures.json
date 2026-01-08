@@ -1242,6 +1242,9 @@
                   "870-constant-if",
                   "871-switch",
                   "873-dead-handler",
+                  "874-filled-new-array",
+                  "875-shifts",
+                  "876-ifconst",
                   "999-redefine-hiddenapi",
                   "1000-non-moving-space-stress",
                   "1001-app-image-regions",
@@ -1305,7 +1308,8 @@
                   "2279-aconfig-flags",
                   "2286-method-tracing-aot-code",
                   "2396-unmodifiable-final-fields",
-                  "2398-method-trace-opt-code"],
+                  "2398-method-trace-opt-code",
+	          "2401-serialize-constructor"],
         "variant": "jvm",
         "description": ["Doesn't run on RI."]
     },
@@ -1791,5 +1795,12 @@
         "description": ["Test for ART simulator, not very useful for jvm. The exepectations",
                         "are slightly different so the test needs a special expectations",
                         "file to work on jvm and not worth the additional bookkeeping."]
+    },
+    {
+        "tests": ["2401-pop-frame-on-throw"],
+        "variant": "jvm",
+        "description": ["jvm doesn't seem to pop the frame when requested from exception thrown",
+                        "listener when method exit callbacks are enabled. It works without method",
+                        "exit callbacks. It seems like a bug in jvm."]
     }
 ]

@@ -1889,11 +1889,11 @@ bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState wait_st
       // This waits while holding the mutator lock. Effectively `self` becomes
       // impossible to suspend until `this` responds to the suspend request.
       // Arguably that's not making anything qualitatively worse.
-      bool success = !Runtime::Current()
-                          ->GetThreadList()
-                          ->WaitForSuspendBarrier(self, &wrapped_barrier.barrier_)
-                          .has_value();
-      CHECK(success);
+      auto opt_fail_string = Runtime::Current()->GetThreadList()->WaitForSuspendBarrier(
+          self, &wrapped_barrier.barrier_);
+      if (opt_fail_string.has_value()) {
+        AbortInThis("Synchronous checkpoint failed to suspend: " + opt_fail_string.value());
+      }
     }
 
     // Ensure that the flip function for this thread, if pending, is finished *before*
@@ -4589,7 +4589,8 @@ class ReferenceMapVisitor : public StackVisitor {
             code_info(_code_info),
             dex_register_map(code_info.GetDexRegisterMapOf(map)),
             visitor(_visitor) {
-        DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
+        DCHECK_IMPLIES(code_info.IsDebuggable(), dex_register_map.size() == number_of_dex_registers)
+            << method->PrettyMethod();
       }
 
       // TODO: If necessary, we should consider caching a reverse map instead of the linear
@@ -4599,6 +4600,14 @@ class ReferenceMapVisitor : public StackVisitor {
                         mirror::Object** ref,
                         const StackVisitor* stack_visitor)
           REQUIRES_SHARED(Locks::mutator_lock_) {
+        if (dex_register_map.empty() && number_of_dex_registers != 0) {
+          // It is possible to see optimized code that isn't compiled with
+          // debuggable even in debuggable runtimes. For ex: zygote frames.
+          DCHECK(!code_info.IsDebuggable());
+          visitor(ref, JavaFrameRootInfo::kImpreciseVreg, stack_visitor);
+          return;
+        }
+
         bool found = false;
         for (size_t dex_reg = 0; dex_reg != number_of_dex_registers; ++dex_reg) {
           DexRegisterLocation location = dex_register_map[dex_reg];
