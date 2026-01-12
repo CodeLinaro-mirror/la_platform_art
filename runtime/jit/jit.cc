@@ -1267,7 +1267,7 @@ static bool SupportsFastCompiler() {
 uint16_t Jit::GetInitialHotnessThreshold() {
   Runtime* runtime = Runtime::Current();
   Jit* jit = runtime->GetJit();
-  if (jit == nullptr || !jit->UseFastCompiler()) {
+  if (jit == nullptr || !jit->UseFastCompiler() || Runtime::Current()->IsJavaDebuggable()) {
     return runtime->GetJITOptions()->GetWarmupThreshold();
   }
   static constexpr uint16_t kFastThreshold = 4;
@@ -1817,7 +1817,7 @@ bool Jit::CompileMethod(ArtMethod* method,
         MutexLock mu(self, lock_);
         shared_method_info_map_[method].previously_warm = true;
       }
-    } else if (!UseFastCompiler()) {
+    } else {
       // We set the method as warm when being baseline compiled.
       method->SetPreviouslyWarm();
     }
