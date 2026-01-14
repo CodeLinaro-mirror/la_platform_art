@@ -1419,10 +1419,6 @@ static void MaybeAddToImageClasses(Thread* self,
     }
     klass = klass->GetSuperClass();
   }
-  if (klass->IsObjectClass() && array_dim > 0) {
-    TypeReference type_ref(&klass->GetDexFile(), klass->GetDexTypeIndex());
-    image_classes->Add(type_ref, array_dim);
-  }
 }
 
 // Keeps all the data for the update together. Also doubles as the reference visitor.
