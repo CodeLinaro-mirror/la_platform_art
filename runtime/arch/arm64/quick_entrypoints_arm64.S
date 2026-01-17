@@ -864,8 +864,18 @@ END art_quick_do_long_jump
      * x0 holds the possibly null object to lock.
      */
 ENTRY art_quick_lock_object
-    LOCK_OBJECT_FAST_PATH x0, art_quick_lock_object_no_inline, /*can_be_null*/ 1
+    LOCK_OBJECT_FAST_PATH x0, art_quick_lock_object_no_inline, /*can_be_null*/ 1, /*use_lse*/ 0
 END art_quick_lock_object
+
+    /*
+     * Entry from managed code that tries to lock the object in a fast path and
+     * calls `artLockObjectFromCode()` for the difficult cases, may block for GC.
+     * x0 holds the possibly null object to lock.
+     * Used only if runtime LSE support is detected.
+     */
+ENTRY art_quick_lock_object_lse
+    LOCK_OBJECT_FAST_PATH x0, art_quick_lock_object_no_inline, /*can_be_null*/ 1, /*use_lse*/ 1
+END art_quick_lock_object_lse
 
     /*
      * Entry from managed code that calls `artLockObjectFromCode()`, may block for GC.
@@ -888,8 +898,18 @@ END art_quick_lock_object_no_inline
      * x0 holds the possibly null object to unlock.
      */
 ENTRY art_quick_unlock_object
-    UNLOCK_OBJECT_FAST_PATH x0, art_quick_unlock_object_no_inline, /*can_be_null*/ 1
+    UNLOCK_OBJECT_FAST_PATH x0, art_quick_unlock_object_no_inline, /*can_be_null*/ 1, /*use_lse*/ 0
 END art_quick_unlock_object
+
+    /*
+     * Entry from managed code that tries to unlock the object in a fast path and calls
+     * `artUnlockObjectFromCode()` for the difficult cases and delivers exception on failure.
+     * x0 holds the possibly null object to unlock.
+     * Used only if runtime LSE support is detected.
+     */
+ENTRY art_quick_unlock_object_lse
+    UNLOCK_OBJECT_FAST_PATH x0, art_quick_unlock_object_no_inline, /*can_be_null*/ 1, /*use_lse*/ 1
+END art_quick_unlock_object_lse
 
     /*
      * Entry from managed code that calls `artUnlockObjectFromCode()`
@@ -1664,15 +1684,15 @@ END art_quick_proxy_invoke_handler
     /*
      * Called to resolve an imt conflict.
      * x0 is the conflict ArtMethod.
-     * xIP1 is a hidden argument that holds the target interface method.
+     * x15 is a hidden argument that holds the target interface method.
      *
-     * Note that this stub writes to xIP0, xIP1, and x0.
+     * Note that this stub writes to xIP0, and x0.
      */
 ENTRY art_quick_imt_conflict_trampoline
     ldr xIP0, [x0, #ART_METHOD_JNI_OFFSET_64]  // Load ImtConflictTable
     ldr x0, [xIP0]  // Load first entry in ImtConflictTable.
 .Limt_table_iterate:
-    cmp x0, xIP1
+    cmp x0, x15
     // Branch if found. Benchmarks have shown doing a branch here is better.
     beq .Limt_table_found
     // If the entry is null, the interface method is not in the ImtConflictTable.
@@ -1689,7 +1709,7 @@ ENTRY art_quick_imt_conflict_trampoline
 .Lconflict_trampoline:
     // Call the runtime stub to populate the ImtConflictTable and jump to the
     // resolved method.
-    mov x0, xIP1  // Load interface method
+    mov x0, x15  // Load interface method
     INVOKE_TRAMPOLINE_BODY artInvokeInterfaceTrampoline
 END art_quick_imt_conflict_trampoline
 
