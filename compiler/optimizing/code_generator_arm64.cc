@@ -1078,6 +1078,7 @@ CodeGeneratorARM64::CodeGeneratorARM64(HGraph* graph,
       public_type_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       package_type_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_string_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
+      app_image_string_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       string_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       method_type_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_jni_entrypoint_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
@@ -4886,9 +4887,10 @@ void LocationsBuilderARM64::HandleInvoke(HInvoke* invoke) {
 
 void LocationsBuilderARM64::VisitInvokeInterface(HInvokeInterface* invoke) {
   HandleInvoke(invoke);
+  // Add the hidden argument.
   if (invoke->GetHiddenArgumentLoadKind() == MethodLoadKind::kRecursive) {
-    // We cannot request ip1 as it's blocked by the register allocator.
-    invoke->GetLocations()->SetInAt(invoke->GetNumberOfArguments() - 1, Location::Any());
+    invoke->GetLocations()->SetInAt(invoke->GetNumberOfArguments() - 1,
+                                    Location::CoreRegister(x15.GetCode()));
   }
 }
 
@@ -4955,29 +4957,22 @@ void InstructionCodeGeneratorARM64::VisitInvokeInterface(HInvokeInterface* invok
   // If we're compiling baseline, update the inline cache.
   codegen_->MaybeGenerateInlineCacheCheck(invoke, temp);
 
-  // The register ip1 is required to be used for the hidden argument in
-  // art_quick_imt_conflict_trampoline, so prevent VIXL from using it.
-  MacroAssembler* masm = GetVIXLAssembler();
-  UseScratchRegisterScope scratch_scope(masm);
-  scratch_scope.Exclude(ip1);
+  // The register x15 is used as the hidden argument for `art_quick_imt_conflict_trampoline`,
+  // so make sure VIXL is not using it as a scratch register.
+  DCHECK(!UseScratchRegisterScope(GetVIXLAssembler()).IsAvailable(x15));
   if (invoke->GetHiddenArgumentLoadKind() == MethodLoadKind::kRecursive) {
-    Location interface_method = locations->InAt(invoke->GetNumberOfArguments() - 1);
-    if (interface_method.IsStackSlot()) {
-      __ Ldr(ip1, StackOperandFrom(interface_method));
-    } else {
-      __ Mov(ip1, XRegisterFrom(interface_method));
-    }
-  // If the load kind is through a runtime call, we will pass the method we
-  // fetch the IMT, which will either be a no-op if we don't hit the conflict
-  // stub, or will make us always go through the trampoline when there is a
-  // conflict.
-  } else if (invoke->GetHiddenArgumentLoadKind() != MethodLoadKind::kRuntimeCall) {
+    DCHECK(locations->InAt(invoke->GetNumberOfArguments() - 1).Equals(
+        Location::CoreRegister(x15.GetCode())));
+  } else if (invoke->GetHiddenArgumentLoadKind() == MethodLoadKind::kRuntimeCall) {
+    // If the load kind is through a runtime call, we will pass the method we fetch
+    // from the IMT, which will either be a no-op if we don't hit the conflict stub,
+    // or will make us always go through the trampoline when there is a conflict.
+  } else {
     codegen_->LoadMethod(
-        invoke->GetHiddenArgumentLoadKind(), Location::CoreRegister(ip1.GetCode()), invoke);
+        invoke->GetHiddenArgumentLoadKind(), Location::CoreRegister(x15.GetCode()), invoke);
   }
 
-  __ Ldr(temp,
-      MemOperand(temp, mirror::Class::ImtPtrOffset(kArm64PointerSize).Uint32Value()));
+  __ Ldr(temp, MemOperand(temp, mirror::Class::ImtPtrOffset(kArm64PointerSize).Uint32Value()));
   uint32_t method_offset = static_cast<uint32_t>(ImTable::OffsetOfElement(
       invoke->GetImtIndex(), kArm64PointerSize));
   // temp = temp->GetImtEntryAt(method_offset);
@@ -4985,7 +4980,7 @@ void InstructionCodeGeneratorARM64::VisitInvokeInterface(HInvokeInterface* invok
   if (invoke->GetHiddenArgumentLoadKind() == MethodLoadKind::kRuntimeCall) {
     // We pass the method from the IMT in case of a conflict. This will ensure
     // we go into the runtime to resolve the actual method.
-    __ Mov(ip1, temp);
+    __ Mov(x15, temp);
   }
   // lr = temp->GetEntryPoint();
   __ Ldr(lr, MemOperand(temp, entry_point.Int32Value()));
@@ -5403,6 +5398,14 @@ vixl::aarch64::Label* CodeGeneratorARM64::NewBootImageStringPatch(
       &dex_file, string_index.index_, adrp_label, &boot_image_string_patches_);
 }
 
+vixl::aarch64::Label* CodeGeneratorARM64::NewAppImageStringPatch(
+    const DexFile& dex_file,
+    dex::StringIndex string_index,
+    vixl::aarch64::Label* adrp_label) {
+  return NewPcRelativePatch(
+      &dex_file, string_index.index_, adrp_label, &app_image_string_patches_);
+}
+
 vixl::aarch64::Label* CodeGeneratorARM64::NewStringBssEntryPatch(
     const DexFile& dex_file,
     dex::StringIndex string_index,
@@ -5599,6 +5602,7 @@ void CodeGeneratorARM64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* lin
       public_type_bss_entry_patches_.size() +
       package_type_bss_entry_patches_.size() +
       boot_image_string_patches_.size() +
+      app_image_string_patches_.size() +
       string_bss_entry_patches_.size() +
       method_type_bss_entry_patches_.size() +
       boot_image_jni_entrypoint_patches_.size() +
@@ -5620,6 +5624,7 @@ void CodeGeneratorARM64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* lin
   }
   DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_method_patches_.empty());
   DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_type_patches_.empty());
+  DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_string_patches_.empty());
   if (GetCompilerOptions().IsBootImage()) {
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::IntrinsicReferencePatch>>(
         boot_image_other_patches_, linker_patches);
@@ -5630,6 +5635,8 @@ void CodeGeneratorARM64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* lin
         app_image_method_patches_, linker_patches);
     EmitPcRelativeLinkerPatches<linker::LinkerPatch::TypeAppImageRelRoPatch>(
         app_image_type_patches_, linker_patches);
+    EmitPcRelativeLinkerPatches<linker::LinkerPatch::StringAppImageRelRoPatch>(
+        app_image_string_patches_, linker_patches);
   }
   EmitPcRelativeLinkerPatches<linker::LinkerPatch::MethodBssEntryPatch>(
       method_bss_entry_patches_, linker_patches);
@@ -6033,6 +6040,7 @@ HLoadString::LoadKind CodeGeneratorARM64::GetSupportedLoadStringKind(
   switch (desired_string_load_kind) {
     case HLoadString::LoadKind::kBootImageLinkTimePcRelative:
     case HLoadString::LoadKind::kBootImageRelRo:
+    case HLoadString::LoadKind::kAppImageRelRo:
     case HLoadString::LoadKind::kBssEntry:
       DCHECK(!GetCompilerOptions().IsJitCompiler());
       break;
@@ -6090,6 +6098,19 @@ void InstructionCodeGeneratorARM64::VisitLoadString(HLoadString* load) NO_THREAD
       DCHECK(!codegen_->GetCompilerOptions().IsBootImage());
       uint32_t boot_image_offset = CodeGenerator::GetBootImageOffset(load);
       codegen_->LoadBootImageRelRoEntry(out.W(), boot_image_offset);
+      return;
+    }
+    case HLoadString::LoadKind::kAppImageRelRo: {
+      DCHECK(codegen_->GetCompilerOptions().IsAppImage());
+      // Add ADRP with its PC-relative String .data.img.rel.ro entry patch.
+      const DexFile& dex_file = load->GetDexFile();
+      const dex::StringIndex string_index = load->GetStringIndex();
+      vixl::aarch64::Label* adrp_label = codegen_->NewAppImageStringPatch(dex_file, string_index);
+      codegen_->EmitAdrpPlaceholder(adrp_label, out.X());
+      // Add LDR with its PC-relative String .data.img.rel.ro entry patch.
+      vixl::aarch64::Label* ldr_label =
+          codegen_->NewAppImageStringPatch(dex_file, string_index, adrp_label);
+      codegen_->EmitLdrOffsetPlaceholder(ldr_label, out.W(), out.X());
       return;
     }
     case HLoadString::LoadKind::kBssEntry: {
