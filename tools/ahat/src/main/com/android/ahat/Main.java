@@ -63,11 +63,15 @@ public class Main {
    * Prints an error message and exits the application on failure to load the
    * heap dump.
    */
-  private static AhatSnapshot loadHeapDump(File hprof,
-      ProguardMap map, Progress progress, Reachability retained) {
+  private static AhatSnapshot loadHeapDump(
+      File hprof, ProguardMap map, Progress progress, Reachability retained) {
     System.out.println("Processing '" + hprof + "' ...");
     try {
-      return new Parser(hprof).map(map).progress(progress).retained(retained).parse();
+      return new Parser(hprof)
+          .map(map)
+          .progress(progress)
+          .retained(retained)
+          .parse();
     } catch (IOException e) {
       System.err.println("Unable to load '" + hprof + "':");
       e.printStackTrace();
@@ -175,7 +179,8 @@ public class Main {
 
     AhatSnapshot ahat = loadHeapDump(hprof, map, new AsciiProgress(), retained);
     if (hprofbase != null) {
-      AhatSnapshot base = loadHeapDump(hprofbase, mapbase, new AsciiProgress(), retained);
+      AhatSnapshot base =
+          loadHeapDump(hprofbase, mapbase, new AsciiProgress(), retained);
 
       System.out.println("Diffing heap dumps ...");
       Diff.snapshots(ahat, base);
@@ -187,7 +192,9 @@ public class Main {
     server.createContext("/object", new AhatHttpHandler(new ObjectHandler(ahat)));
     server.createContext("/objects", new AhatHttpHandler(new ObjectsHandler(ahat)));
     server.createContext("/site", new AhatHttpHandler(new SiteHandler(ahat)));
+    server.createContext("/loopers", new AhatHttpHandler(new LoopersHandler(ahat)));
     server.createContext("/bitmap", new AhatHttpHandler(new BitmapHandler(ahat)));
+    server.createContext("/bitmaps", new AhatHttpHandler(new BitmapsHandler(ahat)));
     server.createContext("/array", new AhatHttpHandler(new ArrayHandler(ahat)));
     server.createContext(
         "/style.css", new AhatHttpHandler(new StaticHandler("etc/style.css", "text/css")));

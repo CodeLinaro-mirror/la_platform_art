@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-#if ASM_DEFINE_INCLUDE_DEPENDENCIES
-#include "jit/jit.h"
-#endif
+package android.os;
 
-ASM_DEFINE(FAST_COMPILER_FREQUENCY_CHECK, art::jit::kFastCompilerFrequencyCheck)
+public class Looper {
+    public MessageQueue mQueue;
+    public Thread mThread;
+}

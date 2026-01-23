@@ -26,7 +26,9 @@
 #include "dex/dex_file-inl.h"
 #include "driver/compiler_options.h"
 #include "intrinsics_enum.h"
+#include "obj_ptr.h"
 #include "optimizing/data_type.h"
+#include "handle_cache-inl.h"
 #include "optimizing/nodes.h"
 
 namespace art HIDDEN {
@@ -780,7 +782,7 @@ void HConstantFoldingVisitor::VisitStaticFieldGet(HStaticFieldGet* instruction) 
   }
 
   HConstant* constant = nullptr;
-  {
+  if (!GetGraph()->IsDebuggable()) {  // JNI can modify static final fields in debuggable runtime.
     ScopedObjectAccess soa(Thread::Current());
 
     if (!IsUnmodifiableAndInitialized(field, compiler_options_)) {
@@ -814,7 +816,10 @@ void HConstantFoldingVisitor::VisitStaticFieldGet(HStaticFieldGet* instruction) 
         break;
       }
       case DataType::Type::kFloat32: {
-        float value = field->GetFloat(field->GetDeclaringClass());
+        // On x86-32 ArtField::GetFloat might canonicalize NaNs when floats are put and read
+        // back from FP register stack.
+        uint32_t raw_bits = field->Get32(field->GetDeclaringClass());
+        float value = bit_cast<float, uint32_t>(raw_bits);
         constant = GetGraph()->GetFloatConstant(value);
         break;
       }
@@ -824,8 +829,26 @@ void HConstantFoldingVisitor::VisitStaticFieldGet(HStaticFieldGet* instruction) 
         break;
       }
       case DataType::Type::kFloat64: {
-        double value = field->GetDouble(field->GetDeclaringClass());
+        // On x86-32 ArtField::GetDouble might canonicalize NaNs when doubles are put and read
+        // back from FP register stack.
+        uint64_t raw_bits = field->Get64(field->GetDeclaringClass());
+        double value = bit_cast<double, uint64_t>(raw_bits);
         constant = GetGraph()->GetDoubleConstant(value);
+        break;
+      }
+      case DataType::Type::kReference: {
+        if (instruction->HasConstantValue()) {
+          DCHECK_EQ(field->GetObject(field->GetDeclaringClass().Ptr()),
+                    instruction->GetConstantValue().Get());
+        } else {
+          ObjPtr<mirror::Object> obj = field->GetObject(field->GetDeclaringClass());
+          if (obj.IsNull()) {
+            constant = GetGraph()->GetNullConstant();
+          } else {
+            instruction->SetConstantValue(
+                GetGraph()->GetHandleCache()->GetHandles()->NewHandle(obj));
+          }
+        }
         break;
       }
       default:

@@ -108,15 +108,14 @@ class CatchBlockStackVisitor final : public StackVisitor {
     // We stop the stack walk when we find the catch block. If we are ending the stack walk we don't
     // have to unwind this method so don't record it.
     if (continue_stack_walk && !skip_unwind_callback_) {
-      // Skip unwind callback is only used when method exit callback has thrown an exception. In
-      // that case, we should have runtime method (artMethodExitHook) on top of stack and the
-      // second should be the method for which method exit was called.
-      DCHECK_IMPLIES(skip_unwind_callback_, GetFrameDepth() == 2);
       if (Runtime::Current()->GetInstrumentation()->MethodSupportsExitEvents(
               GetMethod(), GetCurrentOatQuickMethodHeader())) {
         unwound_methods_for_callbacks_.push(method);
       }
     }
+    // Skip unwind callback is used when method exit callback has thrown an exception. Since we
+    // already invoked method exit callback for the top frame we shouldn't call the unwind
+    // callbacks. For others we should call the unwind callbacks.
     skip_unwind_callback_ = false;
     return continue_stack_walk;
   }
@@ -512,7 +511,12 @@ class DeoptimizeStackVisitor final : public StackVisitor {
       } else {
         HandleOptimizingDeoptimization(method, new_frame, updated_vregs);
       }
-      new_frame->SetSkipMethodExitEvents(!supports_exit_events);
+      if (!new_frame->GetSkipMethodExitEvents()) {
+        // Don't reset if we already set the skip method exit events. When
+        // popping a frame, jvmti sets this bit to avoid any exit events from
+        // being sent. We shouldn't overwrite that here.
+        new_frame->SetSkipMethodExitEvents(!supports_exit_events);
+      }
       // If we are deoptimizing after method exit callback we shouldn't call the method exit
       // callbacks again for the top frame. We may have to deopt after the callback if the callback
       // either throws or performs other actions that require a deopt.

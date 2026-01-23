@@ -14,34 +14,77 @@
  * limitations under the License.
  */
 
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.Objects;
 
 public final class Main {
-    private static final boolean BOOLEAN = $noinline$boolean();
-    private static final byte BYTE = $noinline$byte();
-    private static final char CHAR = $noinline$char();
-    private static final short SHORT = $noinline$short();
-    private static final int INT = $noinline$int();
-    private static final float FLOAT = $noinline$float();
-    private static final long LONG = $noinline$long();
-    private static final double DOUBLE = $noinline$double();
 
-    private static final class Values {
+    private static final boolean BOOLEAN = Values.BOOLEAN;
+    private static final byte BYTE = Values.BYTE;
+    private static final char CHAR = Values.CHAR;
+    private static final short SHORT = Values.SHORT;
+    private static final int INT = Values.INT;
+    private static final long LONG = Values.LONG;
+
+    private static final float FLOAT_PI = FloatValues.PI;
+    private static final float FLOAT_PLUS_INF = FloatValues.PLUS_INF;
+    private static final float FLOAT_NEG_INF = FloatValues.NEG_INF;
+    private static final float FLOAT_PLUS_ZERO = FloatValues.PLUS_ZERO;
+    private static final float FLOAT_NEG_ZERO = FloatValues.NEG_ZERO;
+    private static final float FLOAT_NAN = FloatValues.NAN;
+    private static final float FLOAT_NON_CANONICAL_NAN = FloatValues.NON_CANONICAL_NAN;
+
+    private static final double DOUBLE_PI = DoubleValues.PI;
+    private static final double DOUBLE_PLUS_INF = DoubleValues.PLUS_INF;
+    private static final double DOUBLE_NEG_INF = DoubleValues.NEG_INF;
+    private static final double DOUBLE_PLUS_ZERO = DoubleValues.PLUS_ZERO;
+    private static final double DOUBLE_NEG_ZERO = DoubleValues.NEG_ZERO;
+    private static final double DOUBLE_NAN = DoubleValues.NAN;
+    private static final double DOUBLE_NON_CANONICAL_NAN = DoubleValues.NON_CANONICAL_NAN;
+
+    private static final Integer BOXED_INT = Values.INT;
+    private static final Integer BOXED_INT_NULL = Values.NULL_INTEGER;
+
+    public static final class Values {
         static volatile boolean BOOLEAN;
         static volatile byte BYTE;
         static volatile char CHAR;
         static volatile short SHORT;
         static volatile int INT;
         static volatile long LONG;
+        static volatile Integer NULL_INTEGER = null;
 
         static {
-            BOOLEAN = ThreadLocalRandom.current().nextBoolean();
-            BYTE = (byte) ThreadLocalRandom.current().nextInt();
-            CHAR = (char) ThreadLocalRandom.current().nextInt();
-            SHORT = (short) ThreadLocalRandom.current().nextInt();
-            INT = ThreadLocalRandom.current().nextInt();
-            LONG = ThreadLocalRandom.current().nextLong();
+            BOOLEAN = true;
+            BYTE = Byte.MAX_VALUE;
+            CHAR = Character.MAX_VALUE;
+            SHORT = Short.MAX_VALUE;
+            INT = Integer.MAX_VALUE;
+            LONG = Long.MAX_VALUE;
         }
+    }
+
+    private static final class FloatValues {
+        static volatile float MAX = Float.MAX_VALUE;
+        static volatile float MIN = Float.MIN_VALUE;
+        static volatile float PI = (float) Math.PI;
+        static volatile float PLUS_INF = Float.POSITIVE_INFINITY;
+        static volatile float NEG_INF = Float.NEGATIVE_INFINITY;
+        static volatile float PLUS_ZERO = +0.0f;
+        static volatile float NEG_ZERO = -0.0f;
+        static volatile float NAN = Float.NaN;
+        static volatile float NON_CANONICAL_NAN = Float.intBitsToFloat(0xffaf9941);
+    }
+
+    private static final class DoubleValues {
+        static volatile double MAX = Double.MAX_VALUE;
+        static volatile double MIN = Double.MIN_VALUE;
+        static volatile double PI = Math.PI;
+        static volatile double PLUS_INF = Double.POSITIVE_INFINITY;
+        static volatile double NEG_INF = Double.NEGATIVE_INFINITY;
+        static volatile double PLUS_ZERO = +0.0d;
+        static volatile double NEG_ZERO = -0.0d;
+        static volatile double NAN = Double.NaN;
+        static volatile double NON_CANONICAL_NAN = Double.longBitsToDouble(0xfffeeeefffffffffL);
     }
 
     public static void main(String[] args) {
@@ -70,6 +113,9 @@ public final class Main {
 
         ensureJitCompiled(Main.class, "$noinline$testDouble");
         $noinline$testDouble();
+
+        ensureJitCompiled(Main.class, "$noinline$testInteger");
+        $noinline$testInteger();
     }
 
     private static void $noinline$testBoolean() {
@@ -79,19 +125,11 @@ public final class Main {
         }
     }
 
-    private static boolean $noinline$boolean() {
-        return Values.BOOLEAN;
-    }
-
     private static void $noinline$testByte() {
         byte actual = BYTE;
         if (actual != Values.BYTE) {
             throw new AssertionError("Expected: " + Values.BYTE + ", got: " + actual);
         }
-    }
-
-    private static byte $noinline$byte() {
-        return Values.BYTE;
     }
 
     private static void $noinline$testChar() {
@@ -101,10 +139,6 @@ public final class Main {
         }
     }
 
-    private static char $noinline$char() {
-        return Values.CHAR;
-    }
-
     private static void $noinline$testShort() {
         short actual = SHORT;
         if (actual != Values.SHORT) {
@@ -112,31 +146,39 @@ public final class Main {
         }
     }
 
-    private static short $noinline$short() {
-        return Values.SHORT;
-    }
-
     private static void $noinline$testInt() {
-        int actual = INT;
-        if (actual != Values.INT) {
-            throw new AssertionError("Expected: " + Values.INT + ", got: " + actual);
+        assertEquals(INT, Values.INT);
+    }
+
+    private static void $noinline$testInteger() {
+        assertEquals(BOXED_INT.intValue(), Values.INT);
+        assertThrowsNPE(() -> BOXED_INT_NULL.intValue());
+    }
+
+    private static void assertEquals(int actual, int expected) {
+        if (actual != expected) {
+            throw new AssertionError("Expected: " + expected + ", got: " + actual);
         }
     }
 
-    private static int $noinline$int() {
-        return Values.INT;
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 
-    private static void $noinline$testFloat() {
-        float actual = FLOAT;
-        int bits = Float.floatToRawIntBits(actual);
-        if (bits != Values.INT) {
-            throw new AssertionError("Expected bits: " + Values.INT + ", got: " + bits);
+    private static void assertThrowsNPE(ThrowingRunnable subject) {
+        Objects.requireNonNull(subject);
+        boolean observedNpe = false;
+        try {
+            subject.run();
+        } catch (NullPointerException expected) {
+            observedNpe = true;
+        } catch (Exception e) {
+            throw new AssertionError("Expected NPE, got: ", e);
         }
-    }
 
-    private static float $noinline$float() {
-        return Float.intBitsToFloat(Values.INT);
+        if (!observedNpe) {
+            throw new AssertionError("Expected NPE, but nothing was thrown");
+        }
     }
 
     private static void $noinline$testLong() {
@@ -146,20 +188,58 @@ public final class Main {
         }
     }
 
-    private static long $noinline$long() {
-        return Values.LONG;
+    private static void $noinline$testFloat() {
+        assertEquals(FLOAT_PI, FloatValues.PI);
+        assertEquals(FLOAT_PLUS_INF, FloatValues.PLUS_INF);
+        assertEquals(FLOAT_PLUS_ZERO, FloatValues.PLUS_ZERO);
+        assertEquals(FLOAT_NEG_ZERO, FloatValues.NEG_ZERO);
+        assertEquals(FLOAT_NAN, FloatValues.NAN);
+        assertNaN(FLOAT_NAN);
+        assertNaN(FLOAT_NON_CANONICAL_NAN);
     }
 
-    private static void $noinline$testDouble() {
-        double actual = DOUBLE;
-        long bits = Double.doubleToRawLongBits(actual);
-        if (bits != Values.LONG) {
-            throw new AssertionError("Expected bits: " + Values.LONG + ", got: " + bits);
+    private static void assertEquals(float actual, float expected) {
+        int actualBits = Float.floatToRawIntBits(actual);
+        int expectedBits = Float.floatToRawIntBits(expected);
+
+        if (actualBits != expectedBits) {
+            throw new AssertionError("Expected bits: " + expectedBits + ", got: " + actualBits);
         }
     }
 
-    private static double $noinline$double() {
-        return Double.longBitsToDouble(Values.LONG);
+    private static void assertNaN(float subject) {
+        if (!Float.isNaN(subject)) {
+            String msg = String.format(
+                "%f (bits: 0x%x) is not NaN", subject, Float.floatToRawIntBits(subject));
+            throw new AssertionError(msg);
+        }
+    }
+
+    private static void $noinline$testDouble() {
+        assertEquals(DOUBLE_PI, DoubleValues.PI);
+        assertEquals(DOUBLE_PLUS_INF, DoubleValues.PLUS_INF);
+        assertEquals(DOUBLE_PLUS_ZERO, DoubleValues.PLUS_ZERO);
+        assertEquals(DOUBLE_NEG_ZERO, DoubleValues.NEG_ZERO);
+        assertEquals(DOUBLE_NAN, DoubleValues.NAN);
+        assertNaN(DOUBLE_NAN);
+        assertNaN(DOUBLE_NON_CANONICAL_NAN);
+    }
+
+    private static void assertEquals(double actual, double expected) {
+        long actualBits = Double.doubleToRawLongBits(actual);
+        long expectedBits = Double.doubleToRawLongBits(expected);
+
+        if (actualBits != expectedBits) {
+            throw new AssertionError("Expected bits: " + expectedBits + ", got: " + actualBits);
+        }
+    }
+
+    private static void assertNaN(double subject) {
+        if (!Double.isNaN(subject)) {
+            String msg = String.format(
+                "%f (bits: 0x%x) is not NaN", subject, Double.doubleToRawLongBits(subject));
+            throw new AssertionError(msg);
+        }
     }
 
     private native static void ensureJitCompiled(Class<?> clazz, String method);

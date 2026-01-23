@@ -25,7 +25,11 @@ class Menu {
       .append(" - ")
       .appendLink(DocString.uri("rooted"), DocString.text("rooted"))
       .append(" - ")
-      .appendLink(DocString.uri("sites"), DocString.text("allocations"));
+      .appendLink(DocString.uri("sites"), DocString.text("allocations"))
+      .append(" - ")
+      .appendLink(DocString.uri("bitmaps"), DocString.text("bitmaps"))
+      .append(" - ")
+      .appendLink(DocString.uri("loopers"), DocString.text("loopers"));
 
   /**
    * Returns the menu as a DocString.

@@ -785,10 +785,24 @@ class CompilationFilterForRestrictedMode
   bool GraphRejected() const { return has_unsupported_instructions_; }
 
  private:
-  void VisitInstruction(HInstruction*) {
-    // Currently we don't support compiling methods unless they were annotated with $compile$.
-    RejectGraph();
+  // All the instructions will execute the following delegate visitor unless they are specifically
+  // supported by concrete visitors below.
+  void VisitInstruction(HInstruction* instruction) {
+    LocationSummary* locations = instruction->GetLocations();
+    if (locations != nullptr && locations->CanCall()) {
+      RejectGraph();
+    }
   }
+
+  //
+  // Concrete visitors; they do nothing inside hence allowing the instructions types.
+  //
+
+  void VisitSuspendCheck(HSuspendCheck*) {}
+  void VisitDeoptimize(HDeoptimize*) {}
+  void VisitInvokeVirtual(HInvokeVirtual*) {}
+  void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect*) {}
+
   void RejectGraph() {
     has_unsupported_instructions_ = true;
   }
@@ -839,12 +853,6 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   if (!IsInstructionSetSupported(instruction_set)) {
     MaybeRecordStat(compilation_stats_.get(),
                     MethodCompilationStat::kNotCompiledUnsupportedIsa);
-    return nullptr;
-  }
-
-  if (Compiler::IsPathologicalCase(*code_item, method_idx, dex_file)) {
-    SCOPED_TRACE << "Not compiling because of pathological case";
-    MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledPathological);
     return nullptr;
   }
 
@@ -1159,6 +1167,13 @@ CompiledMethod* OptimizingCompiler::Compile(const dex::CodeItem* code_item,
   ArenaStack arena_stack(runtime->GetArenaPool());
   std::unique_ptr<CodeGenerator> codegen;
   bool compiled_intrinsic = false;
+
+  if (Compiler::IsPathologicalCase(*code_item, method_idx, dex_file)) {
+    SCOPED_TRACE << "Not compiling because of pathological case";
+    MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledPathological);
+    return nullptr;
+  }
+
   {
     ScopedObjectAccess soa(Thread::Current());
     ArtMethod* method =
@@ -1470,6 +1485,12 @@ bool OptimizingCompiler::JitCompile(Thread* self,
       jit_logger->WriteLog(code, jni_compiled_method.GetCode().size(), method);
     }
     return true;
+  }
+
+  if (Compiler::IsPathologicalCase(*code_item, method_idx, *dex_file)) {
+    SCOPED_TRACE << "Not compiling because of pathological case";
+    MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledPathological);
+    return false;
   }
 
   ArenaStack arena_stack(runtime->GetJitArenaPool());

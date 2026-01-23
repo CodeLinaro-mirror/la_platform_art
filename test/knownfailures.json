@@ -700,9 +700,27 @@
         "description": [ "The test expects native-allocation GCs to finish within certain time-limit." ]
     },
     {
+        "tests": ["638-checker-inline-cache-intrinsic",
+                  "566-polymorphic-inlining"
+        ],
+        "variant": "continuous-gc",
+        "env_vars": {"ART_USE_READ_BARRIER": "true"},
+        "bug": "b/462460429",
+        "description": [ "We do not update inline caches while marking. Under continuous-gc, ",
+                         "we may never update inline caches as needed by this test to pass." ]
+    },
+    {
+        "tests": ["961-default-iface-resolution-gen"],
+        "variant": "continuous-gc",
+        "bug": "b/463783831",
+        "env_vars": {"ART_USE_READ_BARRIER": "true"},
+        "description": [ "Lock-order violation only in case of CC." ]
+    },
+    {
         "tests": ["099-vmdebug"],
         "variant": "continuous-gc",
-	"bug": "b/462513344",
+        "bug": "b/462513344",
+        "env_vars": {"ART_USE_READ_BARRIER": "false"},
         "description": [ "Objects-freed calculation for young CMC GCs needs to be fixed." ]
     },
     {
@@ -715,7 +733,8 @@
     {
         "tests": ["2031-zygote-compiled-frame-deopt"],
         "variant": "continuous-gc",
-	"bug": "b/463464286",
+        "bug": "b/463464286",
+        "env_vars": {"ART_USE_READ_BARRIER": "false"},
         "description": [ "Deadlock between marking-pause and reclaim-phase of CMC as we have a ",
 			 "window not holding the mutator-lock, wherein another thread can acquire ",
 			 "mutator-lock exclusively and then wait for weak-ref access." ]
@@ -1222,6 +1241,10 @@
                   "869-branches",
                   "870-constant-if",
                   "871-switch",
+                  "873-dead-handler",
+                  "874-filled-new-array",
+                  "875-shifts",
+                  "876-ifconst",
                   "999-redefine-hiddenapi",
                   "1000-non-moving-space-stress",
                   "1001-app-image-regions",
@@ -1285,7 +1308,8 @@
                   "2279-aconfig-flags",
                   "2286-method-tracing-aot-code",
                   "2396-unmodifiable-final-fields",
-                  "2398-method-trace-opt-code"],
+                  "2398-method-trace-opt-code",
+	          "2401-serialize-constructor"],
         "variant": "jvm",
         "description": ["Doesn't run on RI."]
     },
@@ -1727,5 +1751,56 @@
                   "2042-reference-processing"],
         "env_vars": {"ART_USE_RESTRICTED_MODE": "true"},
         "description": ["Test failures when using the restricted mode for simulator."]
+    },
+    {
+        "tests": ["044-proxy",
+                  "046-reflect",
+                  "064-field-access",
+                  "178-app-image-native-method",
+                  "693-vdex-inmem-loader-evict",
+                  "800-smali",
+                  "938-load-transform-bcp",
+                  "1914-get-local-instance",
+                  "1939-proxy-frames",
+                  "1945-proxy-method-arguments"],
+        "env_vars": {"ART_USE_SIMULATOR": "true"},
+        "description": ["TODO: Investigate reasons for these failures of the ART simulator."]
+    },
+    {
+        "tests": ["107-int-math2",
+                  "018-stack-overflow",
+                  "004-SignalTest"],
+        "env_vars": {"ART_USE_SIMULATOR": "true"},
+        "description": ["TODO: Implement implicit stack overflow checks for the ART simulator."]
+    },
+    {
+        "tests": ["2029-contended-monitors",
+                  "2042-reference-processing",
+                  "2043-reference-pauses"],
+        "env_vars": {"ART_USE_SIMULATOR": "true"},
+        "description": ["Intermittent timeout failures on the ART simulator due to the overheads",
+                        "in simulation."]
+    },
+    {
+        "tests": ["151-OpenFileLimit"],
+        "env_vars": {"ART_USE_SIMULATOR": "true"},
+        "description": ["The simulator requires a temporary file when creating a new",
+                        " simulator/thread. This file is used in Simulator::CanReadMemory to",
+                        " determine whether certain memory addresses are accessible without",
+                        " generating a fault."]
+    },
+    {
+        "tests": ["2237-checker-simulator"],
+        "variant": "jvm",
+        "description": ["Test for ART simulator, not very useful for jvm. The exepectations",
+                        "are slightly different so the test needs a special expectations",
+                        "file to work on jvm and not worth the additional bookkeeping."]
+    },
+    {
+        "tests": ["2401-pop-frame-on-throw"],
+        "variant": "jvm",
+        "description": ["jvm doesn't seem to pop the frame when requested from exception thrown",
+                        "listener when method exit callbacks are enabled. It works without method",
+                        "exit callbacks. It seems like a bug in jvm."]
     }
 ]

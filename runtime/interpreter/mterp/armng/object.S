@@ -1,16 +1,15 @@
 %def op_check_cast():
 %  slow_path = add_slow_path_for_last_prefix(op_check_cast_slow_path)
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r1", miss_label="3f")
+%  fetch_from_thread_cache("r0", miss_label="3f")
 1:
    lsr     r2, rINST, #8               // r2<- A
-   GET_VREG r0, r2                     // r0<- vA (object)
-   cmp     r0, #0
-   beq     2f
-   ldr     r2, [r0, #MIRROR_OBJECT_CLASS_OFFSET]
+   GET_VREG r3, r2                     // r3<- vA (object)
+   cbz     r3, 2f
+   ldr     r2, [r3, #MIRROR_OBJECT_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    // Fast path: do a comparison without read barrier.
-   cmp     r1, r2
+   cmp     r0, r2
    bne     ${slow_path}
 2:
    FETCH_ADVANCE_INST 2
@@ -22,21 +21,19 @@
    ldr     r1, [sp]
    mov     r2, rPC
    bl      nterp_get_class
-   mov     r1, r0
    b       1b
 
 %def op_check_cast_slow_path():
-   ldr     r3, [r1, #MIRROR_CLASS_ACCESS_FLAGS_OFFSET]
-   tst     r3, #MIRROR_CLASS_IS_INTERFACE_FLAG
+   ldr     r1, [r0, #MIRROR_CLASS_ACCESS_FLAGS_OFFSET]
+   tst     r1, #MIRROR_CLASS_IS_INTERFACE_FLAG
    bne     2f
-   ldr     r3, [r1, #MIRROR_CLASS_COMPONENT_TYPE_OFFSET]
-   UNPOISON_HEAP_REF r3
-   cmp     r3, #0
-   bne     5f
+   ldr     r1, [r0, #MIRROR_CLASS_COMPONENT_TYPE_OFFSET]
+   UNPOISON_HEAP_REF r1
+   cbnz    r1, 5f
 1:
    ldr     r2, [r2, #MIRROR_CLASS_SUPER_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
-   cmp     r1, r2
+   cmp     r0, r2
    beq     6f
    cmp     r2, #0
    bne     1b
@@ -44,27 +41,29 @@
    TEST_IF_MARKING 4f
 3:
    EXPORT_PC
+   mov     r1, r0
+   mov     r0, r3
    bl      art_quick_check_instance_of
    b       6f
 4:
-   bl      art_quick_read_barrier_mark_reg01
+   bl      art_quick_read_barrier_mark_reg00
    b       3b
 5:
-   // Class in r1 is an array, r3 is the component type.
+   // Class in r0 is an array, r1 is the component type.
    ldr     r2, [r2, #MIRROR_CLASS_COMPONENT_TYPE_OFFSET]
    UNPOISON_HEAP_REF r2
    // Check if object is an array.
    cmp     r2, #0
    beq     2b
-   ldr     r4, [r3, #MIRROR_CLASS_SUPER_CLASS_OFFSET]
+   ldr     r4, [r1, #MIRROR_CLASS_SUPER_CLASS_OFFSET]
    UNPOISON_HEAP_REF r4
    cmp     r4, #0
    // If the super class of the component type is not null, go slow path.
    bne     2b
-   ldrh    r3, [r3, #MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET]
+   ldrh    r1, [r1, #MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET]
    // Check if the object is a primitive array.
    ldrh    r2, [r2, #MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET]
-   orrs    r2, r3
+   orrs    r2, r1
    // Go slow path for throwing the exception.
    bne     2b
 6:
@@ -73,37 +72,39 @@
    GOTO_OPCODE
 
 %def op_instance_of():
-%  slow_path = add_slow_path_for_last_prefix(op_instance_of_slow_path)
+%  slow_path = add_slow_path(op_instance_of_slow_path)
+%  check_hierarchy = add_slow_path_for_last_prefix( \
+%      op_instance_check_hierarchy, suffix="_check_hierarchy")
    /* instance-of vA, vB, class@CCCC */
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r1", miss_label="3f")
-1:
+%  fetch_from_thread_cache("r1", miss_label=slow_path)
+.L${opcode}_resume:
    lsr     r2, rINST, #12              // r2<- B
    GET_VREG r0, r2                     // r0<- vB (object)
-   cmp     r0, #0
-   beq     2f
+   cbz     r0, 1f
    ldr     r2, [r0, #MIRROR_OBJECT_CLASS_OFFSET]
    UNPOISON_HEAP_REF r2
    // Fast path: do a comparison without read barrier.
    cmp     r1, r2
-   bne     ${slow_path}
+   bne     ${check_hierarchy}
    mov     r0, #1
-2:
-   ubfx    r1, rINST, #8, #4           // r1<- A
-   SET_VREG r0, r1
+1:
+   ubfx    r1, rINST, #(8-2), #(4+2)   // r1<- A << 2; opcode 20 has highest two bits clear
+   SET_VREG_PRESCALED r0, r1, s="s"    // set flags to use 16-bit encoding
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
-3:
+
+%def op_instance_of_slow_path():
    EXPORT_PC
    mov     r0, rSELF
    ldr     r1, [sp]
    mov     r2, rPC
    bl      nterp_get_class
    mov     r1, r0
-   b       1b
+   b       .L${opcode}_resume
 
-%def op_instance_of_slow_path():
+%def op_instance_check_hierarchy():
    // Go slow path if we are marking. Checking now allows
    // not going to slow path if the super class hierarchy check fails.
    TEST_IF_MARKING 4f
@@ -371,16 +372,22 @@
 %  fetch_from_thread_cache("r0", miss_label=slow_path)
 .L${opcode}_resume:
    ldr     r1, [r0, #ART_FIELD_OFFSET_OFFSET]
-   lsr     r2, rINST, #8               // r2 <- A
+   lsrs    r2, rINST, #8               // r2 <- A; set flags to use 16-bit encoding
    ldr     r0, [r0, #ART_FIELD_DECLARING_CLASS_OFFSET]
-   TEST_IF_MARKING .L${opcode}_read_barrier
+%  if wide:
+     movs    r3, #0                    // r3 <- 0; set flags to use 16-bit encoding
+     TEST_IF_MARKING_RZERO r3, .L${opcode}_read_barrier
+%  else:
+     TEST_IF_MARKING .L${opcode}_read_barrier
+%  pass
 .L${opcode}_resume_after_read_barrier:
 %  if wide:
      add     r0, r0, r1
+     PRESCALE_VREG r2, r2, s="s"       // r2 <- A << 2; set flags to use 16-bit encoding
      ldrd    r0, r1, [r0]
-     CLEAR_SHADOW_PAIR r2, ip, lr
-     VREG_INDEX_TO_ADDR r2, r2
-     SET_VREG_WIDE_BY_ADDR r0, r1, r2  // fp[A] <- value
+     CLEAR_SHADOW_PAIR_PRESCALED_RZERO r2, r3, r4, s="s"  // set flags to use 16-bit encoding
+     VREG_INDEX_TO_ADDR_PRESCALED r2, r2
+     SET_VREG_WIDE_BY_ADDR r0, r1, r2, wb="!"  // fp[A] <- value; write-back to use 16-bit encoding
 %  elif is_object:
      $load   r0, [r0, r1]
      UNPOISON_HEAP_REF r0
@@ -393,16 +400,9 @@
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
+%  if not (is_object or wide):
 .L${opcode}_read_barrier:
-   bl      art_quick_read_barrier_mark_reg00
-%  if is_object:
-     ldr     r0, [r0, r1]
-     UNPOISON_HEAP_REF r0
-.L${opcode}_mark_after_load:
-     // Here, we know the marking register is set.
      bl      art_quick_read_barrier_mark_reg00
-     b       .L${opcode}_after_reference_load
-%  else:
      b       .L${opcode}_resume_after_read_barrier
 
 %def op_sget_slow_path(load, wide, is_object):
@@ -454,6 +454,18 @@
 .L${opcode}_slow_path_read_barrier:
    bl      art_quick_read_barrier_mark_reg00
    b       .L${opcode}_slow_path_resume_after_read_barrier
+%  if is_object or wide:
+.L${opcode}_read_barrier:
+     bl      art_quick_read_barrier_mark_reg00
+%    if is_object:
+       ldr     r0, [r0, r1]
+       UNPOISON_HEAP_REF r0
+.L${opcode}_mark_after_load:
+       // Here, we know the marking register is set.
+       bl      art_quick_read_barrier_mark_reg00
+       b       .L${opcode}_after_reference_load
+%    else:
+       b       .L${opcode}_resume_after_read_barrier
 
 %def op_sget_wide():
 %  op_sget(load="ldr", wide=True)
@@ -566,27 +578,29 @@
 %  op_sput(store="str", is_object=True)
 
 %def op_new_instance():
-   // The routine is too big to fit in a handler, so jump to it.
+%  slow_path = add_slow_path(op_new_instance_slow_path)
    EXPORT_PC
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r0", miss_label="2f")
-   TEST_IF_MARKING 3f
-4:
+%  fetch_from_thread_cache("r0", miss_label=slow_path)
+   TEST_IF_MARKING 2f
+1:
    ldr     lr, [rSELF, #THREAD_ALLOC_OBJECT_ENTRYPOINT_OFFSET]
    blx     lr
    dmb     ishst                        // need fence for making object's class visible
-1:
-   lsr     r1, rINST, #8                // r1 <- A
-   SET_VREG_OBJECT r0, r1               // fp[A] <- value
+.L${opcode}_resume:
+   lsrs    r1, rINST, #(8-2)            // r1 <- A << 2; opcode 22 has highest two bits clear;
+                                        // set flags to use 16-bit encoding
+   SET_VREG_OBJECT_PRESCALED r0, r1     // fp[A] <- value
    FETCH_ADVANCE_INST 2
    PREPARE_OPCODE_DISPATCH
    GOTO_OPCODE
 2:
+   bl      art_quick_read_barrier_mark_reg00
+   b       1b
+
+%def op_new_instance_slow_path():
    mov     r0, rSELF
    ldr     r1, [sp]
    mov     r2, rPC
    bl      nterp_allocate_object
-   b       1b
-3:
-   bl      art_quick_read_barrier_mark_reg00
-   b       4b
+   b       .L${opcode}_resume

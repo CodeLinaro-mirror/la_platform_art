@@ -197,9 +197,21 @@
     mov     \reg, #0
     str     \reg, [rREFS, \vreg, lsl #2]
 .endm
+.macro PRESCALE_VREG scaled_vreg, vreg, s=""
+    lsl\s   \scaled_vreg, \vreg, #2
+.endm
+.macro SET_VREG_PRESCALED reg, scaled_vreg, s=""
+    str     \reg, [rFP, \scaled_vreg]
+    mov\s   \reg, #0
+    str     \reg, [rREFS, \scaled_vreg]
+.endm
 .macro SET_VREG_OBJECT reg, vreg
     str     \reg, [rFP, \vreg, lsl #2]
     str     \reg, [rREFS, \vreg, lsl #2]
+.endm
+.macro SET_VREG_OBJECT_PRESCALED reg, scaled_vreg
+    str     \reg, [rFP, \scaled_vreg]
+    str     \reg, [rREFS, \scaled_vreg]
 .endm
 .macro SET_VREG_FLOAT reg, vreg, tmpreg
     add     \tmpreg, rFP, \vreg, lsl #2
@@ -210,36 +222,37 @@
 .macro GET_VREG_WIDE_BY_ADDR reg0, reg1, addr
     ldmia \addr, {\reg0, \reg1}
 .endm
-.macro SET_VREG_WIDE_BY_ADDR reg0, reg1, addr
-    stmia \addr, {\reg0, \reg1}
+.macro SET_VREG_WIDE_BY_ADDR reg0, reg1, addr, wb=""
+    stmia \addr\wb, {\reg0, \reg1}
 .endm
-.macro GET_VREG_FLOAT sreg, vreg
-    ldr  \vreg, [rFP, \vreg, lsl #2]
-    vmov \sreg, \vreg
+.macro GET_VREG_FP_BY_ADDR fpreg, addr
+    vldr \fpreg, [\addr]
 .endm
-.macro GET_VREG_FLOAT_BY_ADDR reg, addr
-    vldr \reg, [\addr]
-.endm
-.macro SET_VREG_FLOAT_BY_ADDR reg, addr
-    vstr \reg, [\addr]
-.endm
-.macro GET_VREG_DOUBLE_BY_ADDR reg, addr
-    vldr \reg, [\addr]
-.endm
-.macro SET_VREG_DOUBLE_BY_ADDR reg, addr
-    vstr \reg, [\addr]
+.macro SET_VREG_FP_BY_ADDR fpreg, addr
+    vstr \fpreg, [\addr]
 .endm
 .macro SET_VREG_SHADOW reg, vreg
     str     \reg, [rREFS, \vreg, lsl #2]
 .endm
 .macro CLEAR_SHADOW_PAIR vreg, tmp1, tmp2
+    add     \tmp2, rREFS, \vreg, lsl #2
     mov     \tmp1, #0
-    add     \tmp2, \vreg, #1
-    SET_VREG_SHADOW \tmp1, \vreg
-    SET_VREG_SHADOW \tmp1, \tmp2
+    strd    \tmp1, \tmp1, [\tmp2]
+.endm
+.macro CLEAR_SHADOW_PAIR_PRESCALED scaled_vreg, tmp1, tmp2, s=""
+    add\s   \tmp2, rREFS, \scaled_vreg
+    mov\s   \tmp1, #0
+    strd    \tmp1, \tmp1, [\tmp2]
+.endm
+.macro CLEAR_SHADOW_PAIR_PRESCALED_RZERO scaled_vreg, rzero, tmp, s=""
+    add\s   \tmp, rREFS, \scaled_vreg
+    strd    \rzero, \rzero, [\tmp]
 .endm
 .macro VREG_INDEX_TO_ADDR reg, vreg
     add     \reg, rFP, \vreg, lsl #2
+.endm
+.macro VREG_INDEX_TO_ADDR_PRESCALED reg, scaled_vreg, s=""
+    add\s   \reg, rFP, \scaled_vreg
 .endm
 
 // An assembly entry for nterp.
@@ -312,6 +325,10 @@
 
 .macro TEST_IF_MARKING label
     cmp rMR, #0
+    bne \label
+.endm
+.macro TEST_IF_MARKING_RZERO rzero, label
+    cmp rMR, \rzero
     bne \label
 .endm
 
@@ -721,7 +738,8 @@
     FETCH_B ip, 0, 1
     and ip, ip, #0xf
 8:
-    GET_VREG_FLOAT \sreg, ip
+    GET_VREG ip, ip
+    vmov \sreg, ip
 .endm
 
 // Puts the next int/long/object argument in the expected register,

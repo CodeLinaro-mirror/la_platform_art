@@ -891,7 +891,12 @@ void ImageSpace::Relocator::RelocateImage(ArrayRef<const std::unique_ptr<ImageSp
               ObjPtr<mirror::Executable> as_executable =
                   ObjPtr<mirror::Executable>::DownCast(object);
               ArtMethod* unpatched_method = as_executable->GetArtMethod<kVerifyNone>();
-              ArtMethod* patched_method = forward_image(unpatched_method);
+              // Only constructors created using serializationCopy might have a null ArtMethod.
+              // Serialized constructors maintain the corresponding method differently and
+              // ArtMethod will be set to nullptr.
+              DCHECK_IMPLIES(klass == method_class, unpatched_method != nullptr);
+              ArtMethod* patched_method =
+                  (unpatched_method == nullptr) ? nullptr : forward_image(unpatched_method);
               as_executable->SetArtMethod</*kTransactionActive=*/ false,
                                           /*kCheckTransaction=*/ true,
                                           kVerifyNone>(patched_method);
@@ -997,7 +1002,10 @@ class ImageSpace::Loader {
         ArrayRef<ImageSpace* const> old_spaces =
             boot_image_spaces.SubArray(/*pos=*/ boot_image_space_dependencies);
         SafeMap<mirror::String*, mirror::String*> intern_remap;
-        ScopedObjectAccess soa(Thread::Current());
+        // Note: This `space` is not yet part of the heap and we're reading only
+        // constant data from the boot image, so we do not really need the mutator
+        // lock here. Pretend to acquire the reader access for static analysis.
+        FakeReaderMutexLock fake_lock(*Locks::mutator_lock_);
         RemoveInternTableDuplicates(old_spaces, space.get(), &intern_remap);
         if (!intern_remap.empty()) {
           RemapInternedStringDuplicates(intern_remap, space.get());
@@ -2434,8 +2442,8 @@ class ImageSpace::BootImageLoader {
 
   void DeduplicateInternedStrings(ArrayRef<const std::unique_ptr<ImageSpace>> spaces,
                                   TimingLogger* logger) {
-    // Note: The heap does not exist yet, so the mutator lock is irrelevant. Pretend that we
-    // acquire the reader access for static analysis of calls to helper functions we need.
+    // Note: These `spaces` are not yet part of the heap, so we do not need the mutator lock.
+    // Pretend to acquire the reader access for static analysis.
     FakeReaderMutexLock fake_lock(*Locks::mutator_lock_);
 
     TimingLogger::ScopedTiming timing("DeduplicateInternedStrings", logger);
@@ -3069,6 +3077,51 @@ std::unique_ptr<ImageSpace> ImageSpace::CreateFromAppImage(
                               oat_file,
                               boot_image_spaces,
                               error_msg);
+}
+
+bool ImageSpace::OpenAndSetDexFiles(std::vector<std::unique_ptr<const DexFile>>* out_dex_files,
+                                    std::string* error_msg) const {
+  // Note: This `ImageSpace` is not yet part of the heap, so we do not need the mutator lock.
+  // Pretend to acquire the reader access for static analysis of calls to helper functions we need.
+  FakeReaderMutexLock fake_lock(*Locks::mutator_lock_);
+  ScopedDebugDisallowReadBarriers sddrb(Thread::Current());
+  DCHECK(out_dex_files != nullptr);
+  const ImageHeader& header = GetImageHeader();
+  ObjPtr<mirror::Object> dex_caches_object =
+      header.GetImageRoot<kWithoutReadBarrier>(ImageHeader::kDexCaches);
+  DCHECK(dex_caches_object != nullptr);
+  ObjPtr<mirror::ObjectArray<mirror::DexCache>> dex_caches =
+      dex_caches_object->AsObjectArray<mirror::DexCache>();
+  const OatFile* oat_file = GetOatFile();
+  uint32_t num_dex_files = oat_file->GetOatHeader().GetDexFileCount();
+  if (num_dex_files != static_cast<uint32_t>(dex_caches->GetLength())) {
+    *error_msg =
+        "Dex cache count and dex file count mismatch while trying to initialize from image";
+    return false;
+  }
+
+  for (uint32_t i = 0; i != num_dex_files; ++i) {
+    ObjPtr<mirror::DexCache> dex_cache =
+        dex_caches->GetWithoutChecks<kVerifyNone, kWithoutReadBarrier>(i);
+    std::string dex_file_location =
+        dex_cache->GetLocation<kVerifyNone, kWithoutReadBarrier>()->ToModifiedUtf8();
+    // At this point, the location in the dex cache (from `--dex-location` passed to dex2oat) is
+    // not necessarily the actual dex location on device. `OpenOatDexFile` uses the table
+    // `OatFile::oat_dex_files_` to find the dex file. For each dex file, the table contains two
+    // keys corresponding to it, one from the oat header (from `--dex-location` passed to dex2oat)
+    // and the other being the actual dex location on device, unless they are the same. The lookup
+    // is based on the former key. When adding the image space, `ClassLinker` will replace the
+    // location in the dex cache with the actual dex location, which is the latter key in the table.
+    std::unique_ptr<const DexFile> dex_file =
+        oat_file->OpenOatDexFile(dex_file_location.c_str(), error_msg);
+    if (dex_file == nullptr) {
+      return false;
+    }
+    DCHECK(dex_cache->GetDexFile() == nullptr);
+    dex_cache->SetDexFile(dex_file.get());
+    out_dex_files->push_back(std::move(dex_file));
+  }
+  return true;
 }
 
 const OatFile* ImageSpace::GetOatFile() const {

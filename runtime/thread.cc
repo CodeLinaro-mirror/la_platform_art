@@ -130,6 +130,11 @@
 #include <sys/syscall.h>
 #endif  // ART_USE_FUTEXES
 
+#ifdef ART_USE_SIMULATOR
+#include "code_simulator.h"
+#include "code_simulator_container.h"
+#endif
+
 #pragma clang diagnostic push
 #pragma clang diagnostic error "-Wconversion"
 
@@ -185,6 +190,18 @@ void Thread::SetIsGcMarkingAndUpdateEntrypoints(bool is_marking) {
   tls32_.is_gc_marking = is_marking;
   UpdateReadBarrierEntrypoints(&tlsPtr_.quick_entrypoints, /* is_active= */ is_marking);
 }
+
+#ifdef ART_USE_SIMULATOR
+void Thread::CreateSimExecutor(size_t stack_size) {
+  tlsPtr_.sim_data.sim_executor =
+      Runtime::Current()->GetCodeSimulatorContainer()->CreateExecutor(stack_size);
+}
+
+CodeSimulator* Thread::GetSimExecutor() const {
+  DCHECK(tlsPtr_.sim_data.sim_executor != nullptr);
+  return tlsPtr_.sim_data.sim_executor;
+}
+#endif  // ART_USE_SIMULATOR
 
 void Thread::InitTlsEntryPoints() {
   ScopedTrace trace("InitTlsEntryPoints");
@@ -788,6 +805,13 @@ NO_INLINE uint8_t* Thread::FindStackTop<StackType::kHardware>() {
   return reinterpret_cast<uint8_t*>(
       AlignDown(__builtin_frame_address(0), gPageSize));
 }
+#ifdef ART_USE_SIMULATOR
+template <>
+NO_INLINE uint8_t* Thread::FindStackTop<StackType::kSimulated>() {
+  return reinterpret_cast<uint8_t*>(
+      AlignDown(reinterpret_cast<uint8_t*>(GetSimExecutor()->GetStackPointer()), gPageSize));
+}
+#endif
 
 // Install a protected region in the stack.  This is used to trigger a SIGSEGV if a stack
 // overflow is detected.  It is located right below the stack_begin_.
@@ -798,11 +822,20 @@ void Thread::InstallImplicitProtection() {
   // Page containing current top of stack.
   uint8_t* stack_top = FindStackTop<stack_type>();
 
+  // It is possible that the native stack is not mapped into memory when initially trying to
+  // protect it so don't treat the failure as fatal.
+  bool fatal_on_error = false;
+  if constexpr (stack_type == StackType::kSimulated) {
+    // The simulated stack is mapped into memory upon creation therefore it is an error if we fail
+    // to protect it.
+    fatal_on_error = true;
+  }
+
   // Try to directly protect the stack.
   VLOG(threads) << "installing stack protected region at " << std::hex <<
         static_cast<void*>(pregion) << " to " <<
         static_cast<void*>(pregion + GetStackOverflowProtectedSize() - 1);
-  if (ProtectStack<stack_type>(/* fatal_on_error= */ false)) {
+  if (ProtectStack<stack_type>(fatal_on_error)) {
     // Tell the kernel that we won't be needing these pages any more.
     // NB. madvise will probably write zeroes into the memory (on linux it does).
     size_t unwanted_size =
@@ -1084,6 +1117,20 @@ bool Thread::Init(ThreadList* thread_list, JavaVMExt* java_vm, JNIEnvExt* jni_en
     return false;
   }
   InitCpu();
+
+#ifdef ART_USE_SIMULATOR
+  if (Runtime::IsSimulatorMode()) {
+    // Use the same stack size for the simulator stack as the native stack.
+    CreateSimExecutor(read_stack_size);
+    uint8_t* stack_begin = GetSimExecutor()->GetStackBaseInternal() - read_stack_size;
+    if (!InitStack<StackType::kSimulated>(stack_begin,
+                                          read_stack_size,
+                                          read_guard_size)) {
+      return false;
+    }
+  }
+#endif
+
   InitTlsEntryPoints();
   RemoveSuspendTrigger();
   InitCardTable();
@@ -1842,11 +1889,11 @@ bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState wait_st
       // This waits while holding the mutator lock. Effectively `self` becomes
       // impossible to suspend until `this` responds to the suspend request.
       // Arguably that's not making anything qualitatively worse.
-      bool success = !Runtime::Current()
-                          ->GetThreadList()
-                          ->WaitForSuspendBarrier(self, &wrapped_barrier.barrier_)
-                          .has_value();
-      CHECK(success);
+      auto opt_fail_string = Runtime::Current()->GetThreadList()->WaitForSuspendBarrier(
+          self, &wrapped_barrier.barrier_);
+      if (opt_fail_string.has_value()) {
+        AbortInThis("Synchronous checkpoint failed to suspend: " + opt_fail_string.value());
+      }
     }
 
     // Ensure that the flip function for this thread, if pending, is finished *before*
@@ -2525,11 +2572,7 @@ Thread::DumpOrder Thread::DumpStack(std::ostream& os,
     uint64_t nanotime = NanoTime();
     // If we're currently in native code, dump that stack before dumping the managed stack.
     if (dump_native_stack && (dump_for_abort || force_dump_stack || ShouldShowNativeStack(this))) {
-      ArtMethod* method =
-          GetCurrentMethod(nullptr,
-                           /*check_suspended=*/ !force_dump_stack,
-                           /*abort_on_error=*/ !(dump_for_abort || force_dump_stack));
-      DumpNativeStack(os, unwinder, GetTid(), "  native: ", method);
+      DumpNativeStack(os, unwinder, GetTid(), "  native: ");
     }
     dump_order = DumpJavaStack(os,
                                /*check_suspended=*/ !force_dump_stack,
@@ -2846,6 +2889,16 @@ Thread::~Thread() {
   if (initialized) {
     CleanupCpu();
   }
+
+#ifdef ART_USE_SIMULATOR
+  if (Runtime::Current()->GetImplicitStackOverflowChecks()) {
+    UnprotectStack<StackType::kSimulated>();
+  }
+
+  if (tlsPtr_.sim_data.sim_executor != nullptr) {
+    delete tlsPtr_.sim_data.sim_executor;
+  }
+#endif
 
   SetCachedThreadName(nullptr);  // Deallocate name.
   delete tlsPtr_.deps_or_stack_trace_sample.stack_trace_sample;
@@ -4536,7 +4589,8 @@ class ReferenceMapVisitor : public StackVisitor {
             code_info(_code_info),
             dex_register_map(code_info.GetDexRegisterMapOf(map)),
             visitor(_visitor) {
-        DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
+        DCHECK_IMPLIES(code_info.IsDebuggable(), dex_register_map.size() == number_of_dex_registers)
+            << method->PrettyMethod();
       }
 
       // TODO: If necessary, we should consider caching a reverse map instead of the linear
@@ -4546,6 +4600,14 @@ class ReferenceMapVisitor : public StackVisitor {
                         mirror::Object** ref,
                         const StackVisitor* stack_visitor)
           REQUIRES_SHARED(Locks::mutator_lock_) {
+        if (dex_register_map.empty() && number_of_dex_registers != 0) {
+          // It is possible to see optimized code that isn't compiled with
+          // debuggable even in debuggable runtimes. For ex: zygote frames.
+          DCHECK(!code_info.IsDebuggable());
+          visitor(ref, JavaFrameRootInfo::kImpreciseVreg, stack_visitor);
+          return;
+        }
+
         bool found = false;
         for (size_t dex_reg = 0; dex_reg != number_of_dex_registers; ++dex_reg) {
           DexRegisterLocation location = dex_register_map[dex_reg];

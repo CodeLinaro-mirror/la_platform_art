@@ -758,6 +758,10 @@ void UnstartedRuntime::UnstartedJNIExecutableGetParameterTypesInternal(
   }
 
   ArtMethod* method = executable->GetArtMethod();
+  if (method == nullptr) {
+    result->SetL(nullptr);
+    return;
+  }
   const dex::TypeList* params = method->GetParameterTypeList();
   if (params == nullptr) {
     result->SetL(nullptr);
@@ -1614,12 +1618,12 @@ void UnstartedRuntime::UnstartedRuntimeAvailableProcessors(Thread* self,
 
 void UnstartedRuntime::UnstartedUnsafeCompareAndSwapLong(
     Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
-  UnstartedJdkUnsafeCompareAndSwapLong(self, shadow_frame, result, arg_offset);
+  UnstartedJdkUnsafeCompareAndSetLong(self, shadow_frame, result, arg_offset);
 }
 
 void UnstartedRuntime::UnstartedUnsafeCompareAndSwapObject(
     Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
-  UnstartedJdkUnsafeCompareAndSwapObject(self, shadow_frame, result, arg_offset);
+  UnstartedJdkUnsafeCompareAndSetReference(self, shadow_frame, result, arg_offset);
 }
 
 void UnstartedRuntime::UnstartedUnsafeGetObjectVolatile(
@@ -1661,16 +1665,6 @@ void UnstartedRuntime::UnstartedUnsafePutOrderedObject(
 
 void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSetLong(
     Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
-  UnstartedJdkUnsafeCompareAndSwapLong(self, shadow_frame, result, arg_offset);
-}
-
-void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSetReference(
-    Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
-  UnstartedJdkUnsafeCompareAndSwapObject(self, shadow_frame, result, arg_offset);
-}
-
-void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSwapLong(
-    Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
   // Argument 0 is the Unsafe instance, skip.
   mirror::Object* obj = shadow_frame->GetVRegReference(arg_offset + 1);
   if (obj == nullptr) {
@@ -1699,7 +1693,7 @@ void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSwapLong(
   result->SetZ(success ? 1 : 0);
 }
 
-void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSwapObject(
+void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSetReference(
     Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
   // Argument 0 is the Unsafe instance, skip.
   mirror::Object* obj = shadow_frame->GetVRegReference(arg_offset + 1);
@@ -2166,7 +2160,7 @@ void UnstartedRuntime::UnstartedJNIUnsafeCompareAndSwapInt(
     mirror::Object* receiver,
     uint32_t* args,
     JValue* result) {
-  UnstartedJNIJdkUnsafeCompareAndSwapInt(self, method, receiver, args, result);
+  UnstartedJNIJdkUnsafeCompareAndSetInt(self, method, receiver, args, result);
 }
 
 void UnstartedRuntime::UnstartedJNIUnsafeGetIntVolatile(Thread* self,
@@ -2211,7 +2205,7 @@ void UnstartedRuntime::UnstartedJNIJdkUnsafeAddressSize([[maybe_unused]] Thread*
   result->SetI(static_cast<jint>(Runtime::Current()->GetClassLinker()->GetImagePointerSize()));
 }
 
-void UnstartedRuntime::UnstartedJNIJdkUnsafeCompareAndSwapInt(
+void UnstartedRuntime::UnstartedJNIJdkUnsafeCompareAndSetInt(
     Thread* self,
     [[maybe_unused]] ArtMethod* method,
     [[maybe_unused]] mirror::Object* receiver,
@@ -2247,15 +2241,6 @@ void UnstartedRuntime::UnstartedJNIJdkUnsafeCompareAndSwapInt(
   result->SetZ(success ? JNI_TRUE : JNI_FALSE);
 }
 
-void UnstartedRuntime::UnstartedJNIJdkUnsafeCompareAndSetInt(
-    Thread* self,
-    ArtMethod* method,
-    mirror::Object* receiver,
-    uint32_t* args,
-    JValue* result) {
-  UnstartedJNIJdkUnsafeCompareAndSwapInt(self, method, receiver, args, result);
-}
-
 void UnstartedRuntime::UnstartedJNIJdkUnsafeGetIntVolatile(
     Thread* self,
     [[maybe_unused]] ArtMethod* method,
@@ -2264,7 +2249,7 @@ void UnstartedRuntime::UnstartedJNIJdkUnsafeGetIntVolatile(
     JValue* result) {
   ObjPtr<mirror::Object> obj = reinterpret_cast32<mirror::Object*>(args[0]);
   if (obj == nullptr) {
-    AbortTransactionOrFail(self, "Unsafe.compareAndSwapIntVolatile with null object.");
+    AbortTransactionOrFail(self, "Unsafe.getIntVolatile with null object.");
     return;
   }
 

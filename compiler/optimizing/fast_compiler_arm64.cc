@@ -563,6 +563,10 @@ class FastCompilerARM64 : public FastCompiler {
     return true;
   }
 
+  bool ThrowsIntoCatchHandler(const Instruction& instruction) {
+    return GetCodeItemAccessor().TriesSize() != 0 && IsThrowingDexInstruction(instruction);
+  }
+
   // Method being compiled.
   ArtMethod* method_;
 
@@ -881,8 +885,7 @@ bool FastCompilerARM64::ProcessBlock(uint32_t dex_pc) {
 
     // If the instruction can throw, emulate a branch to each catch handler by
     // updating dex register masks.
-    if (GetCodeItemAccessor().TriesSize() != 0 &&
-        (Instruction::FlagsOf(pair.Inst().Opcode()) & Instruction::kThrow) != 0) {
+    if (ThrowsIntoCatchHandler(pair.Inst())) {
       const dex::TryItem* try_item = GetCodeItemAccessor().FindTryItem(pair.DexPc());
       if (try_item != nullptr) {
         for (CatchHandlerIterator iterator(GetCodeItemAccessor(), *try_item);
@@ -1314,7 +1317,15 @@ bool FastCompilerARM64::GenerateFrame() {
   }
   core_spill_mask_ |= (1 << lr.GetCode());
 
-  code_generation_data_->GetStackMapStream()->BeginMethod(GetFrameSize(),
+  size_t frame_size = GetFrameSize();
+  if (frame_size > GetStackOverflowReservedBytes(InstructionSet::kArm64)) {
+    // This isn't an unimplemented reason, just a hard limit we have in the
+    // runtime about compile code frames.
+    unimplemented_reason_ = "FrameTooLarge";
+    return false;
+  }
+
+  code_generation_data_->GetStackMapStream()->BeginMethod(frame_size,
                                                           core_spill_mask_,
                                                           fpu_spill_mask_,
                                                           GetCodeItemAccessor().RegistersSize(),
@@ -1336,7 +1347,7 @@ bool FastCompilerARM64::GenerateFrame() {
   }
 
   CodeGeneratorARM64::GenerateFrame(GetAssembler(),
-                                    GetFrameSize(),
+                                    frame_size,
                                     GetFramePreservedCoreRegisters(),
                                     GetFramePreservedFPRegisters(),
                                     /* requires_current_method= */ true);
@@ -1590,6 +1601,7 @@ bool FastCompilerARM64::HandleInvoke(const Instruction& instruction,
       EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
       __ Ldr(kArtMethodRegister.W(), HeapOperand(receiver.W(), class_offset));
       if (can_be_null) {
+        UpdateNonNullMask(obj_reg, /* can_be_null= */ false);
         RecordPcInfo(dex_pc);
       }
     }
@@ -2041,6 +2053,7 @@ void FastCompilerARM64::DoWriteBarrierOn(Register holder,
 #define DO_CASE(arm_op, op, other) \
     case arm_op: { \
       if (constant op other) { \
+        PrepareToBranch(dex_pc + target_offset); \
         __ B(label); \
       } \
       break; \
@@ -2068,9 +2081,6 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
   Location location = vreg_locations_[register_index];
 
   if (kCompareWithZero) {
-    // We are going to branch, move all constants to registers to make the merge
-    // point use the same locations.
-    PrepareToBranch(dex_pc + target_offset);
     if (location.IsConstant()) {
       DCHECK(location.GetConstant()->IsIntConstant());
       int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
@@ -2083,6 +2093,9 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
         DO_CASE(vixl::aarch64::ge, >=, 0);
       }
     } else {
+      // We are going to branch, move all constants to registers to make the merge
+      // point use the same locations.
+      PrepareToBranch(dex_pc + target_offset);
       location = GetExistingRegisterLocation(register_index, DataType::Type::kInt32);
       if (HitUnimplemented()) {
         return false;
@@ -2107,9 +2120,6 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
   } else {
     // !kCompareWithZero
     Location other_location = vreg_locations_[instruction.VRegB_22t()];
-    // We are going to branch, move all constants to registers to make the merge
-    // point use the same locations.
-    PrepareToBranch(dex_pc + target_offset);
     if (location.IsConstant() && other_location.IsConstant()) {
       int32_t constant = location.GetConstant()->AsIntConstant()->GetValue();
       int32_t other_constant = other_location.GetConstant()->AsIntConstant()->GetValue();
@@ -2122,6 +2132,9 @@ bool FastCompilerARM64::If_21_22t(const Instruction& instruction, uint32_t dex_p
         DO_CASE(vixl::aarch64::ge, >=, other_constant);
       }
     } else {
+      // We are going to branch, move all constants to registers to make the merge
+      // point use the same locations.
+      PrepareToBranch(dex_pc + target_offset);
       // Reload the locations, which can now be registers.
       location = GetExistingRegisterLocation(register_index, DataType::Type::kInt32);
       other_location = GetExistingRegisterLocation(instruction.VRegB_22t(), DataType::Type::kInt32);
@@ -2409,6 +2422,7 @@ bool FastCompilerARM64::BuildArrayAccess(const Instruction& instruction,
     EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
     __ Ldr(temp, mem);
     if (CanBeNull(array_reg)) {
+      UpdateNonNullMask(array_reg, /* can_be_null= */ false);
       RecordPcInfo(dex_pc);
     }
   }
@@ -2486,6 +2500,7 @@ bool FastCompilerARM64::BuildArrayLength(
     EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
     __ Ldr(dest_reg, mem);
     if (CanBeNull(array)) {
+      UpdateNonNullMask(array, /* can_be_null= */ false);
       RecordPcInfo(dex_pc);
     }
   }
@@ -2544,6 +2559,7 @@ bool FastCompilerARM64::BuildInstanceFieldGet(const Instruction& instruction,
              next)) {
     return false;
   }
+  UpdateNonNullMask(obj_reg, /* can_be_null= */ false);
   return true;
 }
 
@@ -2587,15 +2603,17 @@ bool FastCompilerARM64::BuildInstanceFieldSet(const Instruction& instruction,
   }
   MemOperand mem = HeapOperand(holder, field->GetOffset());
 
-  return DoPut(mem,
-               holder,
-               field,
-               instruction.Opcode(),
-               source_reg,
-               can_receiver_be_null,
-               is_object,
-               field->IsVolatile(),
-               dex_pc);
+  bool result = DoPut(mem,
+                      holder,
+                      field,
+                      instruction.Opcode(),
+                      source_reg,
+                      can_receiver_be_null,
+                      is_object,
+                      field->IsVolatile(),
+                      dex_pc);
+  UpdateNonNullMask(obj_reg, /* can_be_null= */ false);
+  return result;
 }
 
 bool FastCompilerARM64::DoPut(const MemOperand& base,
@@ -2698,7 +2716,7 @@ bool FastCompilerARM64::DoPut(const MemOperand& base,
     case Instruction::SPUT: {
       if (is_volatile) {
         if (src.IsFpuRegister()) {
-          temp = overwrite_holder ? holder : temps.AcquireW();
+          temp = overwrite_holder ? holder.W() : temps.AcquireW();
           __ Fmov(temp, SRegisterFrom(src));
           __ stlr(temp, mem);
         } else {
@@ -3074,6 +3092,7 @@ bool FastCompilerARM64::BuildFillArrayData(const Instruction& instruction, uint3
     EmissionCheckScope guard(GetVIXLAssembler(), kMaxMacroInstructionSizeInBytes);
     __ Ldr(length, mem);
     if (CanBeNull(array_reg)) {
+      UpdateNonNullMask(array_reg, /* can_be_null= */ false);
       RecordPcInfo(dex_pc);
     }
   }
@@ -4008,8 +4027,7 @@ bool FastCompilerARM64::ProcessBlockForMasks(uint32_t dex_pc) {
     const Instruction& instruction = pair.Inst();
 
     // If the instruction can throw, emulate a branch to each catch handler.
-    if (GetCodeItemAccessor().TriesSize() != 0 &&
-        (Instruction::FlagsOf(instruction.Opcode()) & Instruction::kThrow) != 0) {
+    if (ThrowsIntoCatchHandler(instruction)) {
       const dex::TryItem* try_item = GetCodeItemAccessor().FindTryItem(pair.DexPc());
       if (try_item != nullptr) {
         for (CatchHandlerIterator iterator(GetCodeItemAccessor(), *try_item);
@@ -4126,6 +4144,8 @@ bool FastCompilerARM64::ProcessDexInstructionForMasks(const Instruction& instruc
     case Instruction::MONITOR_EXIT:
     case Instruction::SPARSE_SWITCH:
     case Instruction::PACKED_SWITCH:
+    case Instruction::FILLED_NEW_ARRAY:
+    case Instruction::FILLED_NEW_ARRAY_RANGE:
     case Instruction::FILL_ARRAY_DATA: {
       return true;
     }
@@ -4141,12 +4161,6 @@ bool FastCompilerARM64::ProcessDexInstructionForMasks(const Instruction& instruc
     OP_CASE(XOR)
     OP_CASE(DIV)
     OP_CASE(REM)
-#undef OP_CASE
-#define OP_CASE(opcode) \
-    case Instruction::opcode ##_INT_2ADDR: \
-    case Instruction::opcode ##_INT: \
-    case Instruction::opcode ##_LONG_2ADDR: \
-    case Instruction::opcode ##_LONG:
     OP_CASE(SHL)
     OP_CASE(SHR)
     OP_CASE(USHR)
@@ -4234,6 +4248,9 @@ bool FastCompilerARM64::ProcessDexInstructionForMasks(const Instruction& instruc
     OP_CASE(XOR)
     OP_CASE(DIV)
     OP_CASE(REM)
+    OP_CASE(SHL)
+    OP_CASE(SHR)
+    OP_CASE(USHR)
 #undef OP_CASE
     case Instruction::NEG_DOUBLE:
     case Instruction::NEG_LONG:
@@ -4272,8 +4289,6 @@ bool FastCompilerARM64::ProcessDexInstructionForMasks(const Instruction& instruc
 
     case Instruction::NEW_ARRAY:
     case Instruction::NEW_INSTANCE:
-    case Instruction::FILLED_NEW_ARRAY:
-    case Instruction::FILLED_NEW_ARRAY_RANGE:
     case Instruction::MOVE_RESULT_OBJECT:
     case Instruction::IGET_OBJECT:
     case Instruction::SGET_OBJECT:

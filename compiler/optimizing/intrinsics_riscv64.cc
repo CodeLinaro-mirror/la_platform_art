@@ -2339,7 +2339,7 @@ static void GenerateGetAndUpdate(CodeGeneratorRISCV64* codegen,
 
 static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
-                                     CodeGeneratorRISCV64* codegen) {
+                                     const CodeGeneratorRISCV64* codegen) {
   bool can_call = codegen->EmitReadBarrier() && IsUnsafeGetReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
       allocator,
@@ -2830,7 +2830,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafePutByte(HInvoke* invoke) {
 
 static void CreateUnsafeCASLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
-                                     CodeGeneratorRISCV64* codegen) {
+                                     const CodeGeneratorRISCV64* codegen) {
   const bool can_call = codegen->EmitReadBarrier() && IsUnsafeCASReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
       allocator,
@@ -2932,56 +2932,26 @@ static void GenUnsafeCas(HInvoke* invoke, CodeGeneratorRISCV64* codegen, DataTyp
 }
 
 void IntrinsicLocationsBuilderRISCV64::VisitUnsafeCASInt(HInvoke* invoke) {
-  VisitJdkUnsafeCASInt(invoke);
+  VisitJdkUnsafeCompareAndSetInt(invoke);
 }
 
 void IntrinsicCodeGeneratorRISCV64::VisitUnsafeCASInt(HInvoke* invoke) {
-  VisitJdkUnsafeCASInt(invoke);
+  VisitJdkUnsafeCompareAndSetInt(invoke);
 }
 
 void IntrinsicLocationsBuilderRISCV64::VisitUnsafeCASLong(HInvoke* invoke) {
-  VisitJdkUnsafeCASLong(invoke);
+  VisitJdkUnsafeCompareAndSetLong(invoke);
 }
 
 void IntrinsicCodeGeneratorRISCV64::VisitUnsafeCASLong(HInvoke* invoke) {
-  VisitJdkUnsafeCASLong(invoke);
+  VisitJdkUnsafeCompareAndSetLong(invoke);
 }
 
 void IntrinsicLocationsBuilderRISCV64::VisitUnsafeCASObject(HInvoke* invoke) {
-  VisitJdkUnsafeCASObject(invoke);
-}
-
-void IntrinsicCodeGeneratorRISCV64::VisitUnsafeCASObject(HInvoke* invoke) {
-  VisitJdkUnsafeCASObject(invoke);
-}
-
-void IntrinsicLocationsBuilderRISCV64::VisitJdkUnsafeCASInt(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapInt` has compare-and-set semantics (see javadoc).
-  VisitJdkUnsafeCompareAndSetInt(invoke);
-}
-
-void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeCASInt(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapInt` has compare-and-set semantics (see javadoc).
-  VisitJdkUnsafeCompareAndSetInt(invoke);
-}
-
-void IntrinsicLocationsBuilderRISCV64::VisitJdkUnsafeCASLong(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapLong` has compare-and-set semantics (see javadoc).
-  VisitJdkUnsafeCompareAndSetLong(invoke);
-}
-
-void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeCASLong(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapLong` has compare-and-set semantics (see javadoc).
-  VisitJdkUnsafeCompareAndSetLong(invoke);
-}
-
-void IntrinsicLocationsBuilderRISCV64::VisitJdkUnsafeCASObject(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapObject` has compare-and-set semantics (see javadoc).
   VisitJdkUnsafeCompareAndSetReference(invoke);
 }
 
-void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeCASObject(HInvoke* invoke) {
-  // `jdk.internal.misc.Unsafe.compareAndSwapObject` has compare-and-set semantics (see javadoc).
+void IntrinsicCodeGeneratorRISCV64::VisitUnsafeCASObject(HInvoke* invoke) {
   VisitJdkUnsafeCompareAndSetReference(invoke);
 }
 
@@ -3027,7 +2997,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeCompareAndSetReference(HInvoke
 
 static void CreateUnsafeGetAndUpdateLocations(ArenaAllocator* allocator,
                                               HInvoke* invoke,
-                                              CodeGeneratorRISCV64* codegen) {
+                                              const CodeGeneratorRISCV64* codegen) {
   const bool can_call = codegen->EmitReadBarrier() && IsUnsafeGetAndSetReference(invoke);
   LocationSummary* locations = LocationSummary::Create(
       allocator,
@@ -3820,7 +3790,7 @@ static void GenerateVarHandleTarget(HInvoke* invoke,
 }
 
 static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke,
-                                                       CodeGeneratorRISCV64* codegen) {
+                                                       const CodeGeneratorRISCV64* codegen) {
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
   DataType::Type return_type = invoke->GetType();
 
@@ -3871,7 +3841,7 @@ static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke,
   return locations;
 }
 
-static void CreateVarHandleGetLocations(HInvoke* invoke, CodeGeneratorRISCV64* codegen) {
+static void CreateVarHandleGetLocations(HInvoke* invoke, const CodeGeneratorRISCV64* codegen) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
     return;
@@ -4001,7 +3971,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitVarHandleGetVolatile(HInvoke* invoke) {
   GenerateVarHandleGet(invoke, codegen_, std::memory_order_seq_cst);
 }
 
-static void CreateVarHandleSetLocations(HInvoke* invoke, CodeGeneratorRISCV64* codegen) {
+static void CreateVarHandleSetLocations(HInvoke* invoke, const CodeGeneratorRISCV64* codegen) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
     return;
@@ -4115,7 +4085,7 @@ static bool ScratchXRegisterNeeded(Location loc, DataType::Type type, bool byte_
 }
 
 static void CreateVarHandleCompareAndSetOrExchangeLocations(HInvoke* invoke,
-                                                            CodeGeneratorRISCV64* codegen,
+                                                            const CodeGeneratorRISCV64* codegen,
                                                             bool return_success) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
@@ -4187,9 +4157,7 @@ static void CreateVarHandleCompareAndSetOrExchangeLocations(HInvoke* invoke,
       // We need a scratch register either for the old value or for the result of SC.
       // If we need to return a floating point old value, we need a temp for each.
       ((!return_success && is_fp) ? 2u : 1u);
-  size_t scratch_registers_available = 2u;
-  DCHECK_EQ(scratch_registers_available,
-            ScratchRegisterScope(codegen->GetAssembler()).AvailableXRegisters());
+  size_t scratch_registers_available = 2u;  // TMP(T6) and TMP2(T5).
   if (temps_needed > old_temp_count + scratch_registers_available) {
     locations->AddRegisterTemps(temps_needed - (old_temp_count + scratch_registers_available));
   }
@@ -4545,7 +4513,7 @@ void IntrinsicCodeGeneratorRISCV64::VisitVarHandleWeakCompareAndSetRelease(HInvo
 }
 
 static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
-                                                 CodeGeneratorRISCV64* codegen,
+                                                 const CodeGeneratorRISCV64* codegen,
                                                  GetAndUpdateOp get_and_update_op) {
   VarHandleOptimizations optimizations(invoke);
   if (optimizations.GetDoNotIntrinsify()) {
@@ -4611,9 +4579,7 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
     temps_needed = cas_temps_needed;
   }
 
-  size_t scratch_registers_available = 2u;
-  DCHECK_EQ(scratch_registers_available,
-            ScratchRegisterScope(codegen->GetAssembler()).AvailableXRegisters());
+  size_t scratch_registers_available = 2u;  // TMP(T6) and TMP2(T5).
   size_t old_temp_count = locations->GetTempCount();
   DCHECK_EQ(old_temp_count, (arg_index == 1u) ? 2u : 1u);
   if (temps_needed > old_temp_count + scratch_registers_available) {
