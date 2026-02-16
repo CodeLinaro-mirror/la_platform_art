@@ -3289,8 +3289,9 @@ bool InstructionSimplifierVisitor::CanUseKnownImageVarHandle(HInvoke* invoke) {
     if (Runtime::Current()->GetHeap()->ObjectIsInBootImageSpace(declaring_class)) {
       is_in_image = true;
     } else if (compiler_options.IsGeneratingImage()) {
-      TypeReference type_ref(&declaring_class->GetDexFile(), declaring_class->GetDexTypeIndex());
-      is_in_image = compiler_options.IsImageClass(type_ref, /*array_dim=*/ 0u);
+      std::string storage;
+      const char* descriptor = declaring_class->GetDescriptor(&storage);
+      is_in_image = compiler_options.IsImageClass(descriptor);
     }
     CHECK_EQ(is_in_image, load_class->IsLoadClass() && load_class->AsLoadClass()->IsInImage());
   }
