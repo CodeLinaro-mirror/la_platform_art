@@ -30,7 +30,6 @@
 #include "base/stl_util.h"
 #include "base/utils.h"
 #include "handle.h"
-#include "image_class_map.h"
 #include "optimizing/register_allocator.h"
 
 namespace art HIDDEN {
@@ -351,12 +350,11 @@ class CompilerOptions final {
     return dex_files_for_oat_file_;
   }
 
-  const ImageClassMap& GetImageClasses() const {
+  const HashSet<std::string>& GetImageClasses() const {
     return image_classes_;
   }
 
-  static constexpr size_t kInferArrayDim = static_cast<size_t>(-1);
-  EXPORT bool IsImageClass(TypeReference type_ref, size_t array_dim = kInferArrayDim) const;
+  EXPORT bool IsImageClass(const char* descriptor) const;
 
   // Returns whether the given `klass` is a no-preload class (one that is not allowed to be
   // initialized in zygote, either because it fails initialization, or because it is a logical
@@ -475,7 +473,7 @@ class CompilerOptions final {
 
   // Image classes, specifies the classes that will be included in the image if creating an image.
   // Must not be empty for real boot image, only for tests pretending to compile boot image.
-  ImageClassMap image_classes_;
+  HashSet<std::string> image_classes_;
 
   // Classes listed in the preloaded-classes file, used for boot image and
   // boot image extension compilation.
