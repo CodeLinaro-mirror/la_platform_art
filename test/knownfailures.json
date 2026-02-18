@@ -700,6 +700,11 @@
         "description": [ "The test expects native-allocation GCs to finish within certain time-limit." ]
     },
     {
+        "tests": ["2271-profile-inline-cache"],
+        "variant": "continuous-gc",
+        "description": [ "The test expects background GCs not to be repeatedly happening." ]
+    },
+    {
         "tests": ["638-checker-inline-cache-intrinsic",
                   "566-polymorphic-inlining"
         ],
@@ -726,9 +731,9 @@
     {
         "tests": ["203-multi-checkpoint"],
         "variant": "continuous-gc",
-	"bug": "b/463857863",
+        "bug": "b/463857863",
         "description": [ "the thread_list lock acquired in the test needs to be looked into as ",
-			 "it sometimes causes suspend-all on the gc-thread to deadlock" ]
+                         "it sometimes causes suspend-all on the gc-thread to deadlock" ]
     },
     {
         "tests": ["2031-zygote-compiled-frame-deopt"],
@@ -736,15 +741,15 @@
         "bug": "b/463464286",
         "env_vars": {"ART_USE_READ_BARRIER": "false"},
         "description": [ "Deadlock between marking-pause and reclaim-phase of CMC as we have a ",
-			 "window not holding the mutator-lock, wherein another thread can acquire ",
-			 "mutator-lock exclusively and then wait for weak-ref access." ]
+             "window not holding the mutator-lock, wherein another thread can acquire ",
+             "mutator-lock exclusively and then wait for weak-ref access." ]
     },
     {
         "tests": ["656-checker-simd-opt-no-interp-ac"],
         "variant": "continuous-gc & target",
-	"bug": "b/462496090",
+        "bug": "b/462496090",
         "description": [ "Timing out on target as test takes long time. Being a checker test, ",
-			 "it doesn't add much value to have it in this mode" ]
+                "it doesn't add much value to have it in this mode" ]
     },
     {
         "tests": ["2040-huge-native-alloc"],
@@ -1129,7 +1134,9 @@
           "2288-checker-smali-string-builder-wrong-init",
           "2289-smali-invalid-rti",
           "2292-checker-smali-peek-poke-truncation",
+          "2294-smali-select-do-not-simplify",
           "2295-smali-duplicate-phis",
+          "2299-checker-reducible-and-irreducible-loop-opt",
           "2397-array-verification-edge-cases",
           "2398-checkexacttype-methodhandles",
           "2400-setstaticfield-uninitialized"
@@ -1245,6 +1252,8 @@
                   "874-filled-new-array",
                   "875-shifts",
                   "876-ifconst",
+                  "877-long",
+                  "878-can-be-null",
                   "999-redefine-hiddenapi",
                   "1000-non-moving-space-stress",
                   "1001-app-image-regions",
@@ -1309,7 +1318,8 @@
                   "2286-method-tracing-aot-code",
                   "2396-unmodifiable-final-fields",
                   "2398-method-trace-opt-code",
-	          "2401-serialize-constructor"],
+                  "2401-serialize-constructor",
+                  "2403-class-isinstance-constant-folding"],
         "variant": "jvm",
         "description": ["Doesn't run on RI."]
     },
@@ -1739,13 +1749,8 @@
                         "when there are no live threads in the group and it is otherwise unreachable."]
     },
     {
-        "tests": ["004-StackWalk",
-                  "141-class-unload",
+        "tests": ["141-class-unload",
                   "178-app-image-native-method",
-                  "597-deopt-busy-loop",
-                  "629-vdex-speed",
-                  "638-checker-inline-cache-intrinsic",
-                  "661-oat-writer-layout",
                   "692-vdex-secondary-loader",
                   "850-checker-branches",
                   "2042-reference-processing"],
@@ -1753,18 +1758,11 @@
         "description": ["Test failures when using the restricted mode for simulator."]
     },
     {
-        "tests": ["044-proxy",
-                  "046-reflect",
-                  "064-field-access",
-                  "178-app-image-native-method",
-                  "693-vdex-inmem-loader-evict",
-                  "800-smali",
-                  "938-load-transform-bcp",
-                  "1914-get-local-instance",
-                  "1939-proxy-frames",
-                  "1945-proxy-method-arguments"],
-        "env_vars": {"ART_USE_SIMULATOR": "true"},
-        "description": ["TODO: Investigate reasons for these failures of the ART simulator."]
+        "tests": ["597-deopt-busy-loop",
+                  "638-checker-inline-cache-intrinsic"],
+        "env_vars": {"ART_USE_RESTRICTED_MODE": "true"},
+        "description": ["Simulator doesn't yet support JIT compilation and those test",
+                        "force JIT compilation even in --optimizing mode."]
     },
     {
         "tests": ["107-int-math2",
@@ -1772,14 +1770,6 @@
                   "004-SignalTest"],
         "env_vars": {"ART_USE_SIMULATOR": "true"},
         "description": ["TODO: Implement implicit stack overflow checks for the ART simulator."]
-    },
-    {
-        "tests": ["2029-contended-monitors",
-                  "2042-reference-processing",
-                  "2043-reference-pauses"],
-        "env_vars": {"ART_USE_SIMULATOR": "true"},
-        "description": ["Intermittent timeout failures on the ART simulator due to the overheads",
-                        "in simulation."]
     },
     {
         "tests": ["151-OpenFileLimit"],
@@ -1802,5 +1792,10 @@
         "description": ["jvm doesn't seem to pop the frame when requested from exception thrown",
                         "listener when method exit callbacks are enabled. It works without method",
                         "exit callbacks. It seems like a bug in jvm."]
+    },
+    {
+        "tests": ["137-cfi"],
+        "env_vars": {"ART_USE_SIMULATOR": "true"},
+        "description": ["Simulator does not currently support cfi relocations."]
     }
 ]

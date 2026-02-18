@@ -27,6 +27,7 @@
 #include "base/logging.h"
 #include "base/macros.h"
 #include "base/mutex.h"
+#include "base/offsets.h"
 #include "base/utils.h"
 #include "class_linker.h"
 #include "deopt_manager.h"
@@ -56,7 +57,6 @@
 #include "obj_ptr-inl.h"
 #include "object_callbacks.h"
 #include "object_tagging.h"
-#include "offsets.h"
 #include "read_barrier.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
@@ -1862,7 +1862,7 @@ static void ReplaceWeakRoots(art::Thread* self,
   ReplaceWeaksVisitor rwv(map);
   art::Runtime* runtime = art::Runtime::Current();
   runtime->SweepSystemWeaks(&rwv);
-  runtime->GetThreadList()->SweepInterpreterCaches(&rwv);
+  runtime->GetThreadList()->ClearInterpreterCaches();
   // Re-add the object tags. At this point all weak-references to the old_obj_ptr are gone.
   event_handler->ForEachEnv(self, [&](ArtJvmTiEnv* env) {
     // Cannot have REQUIRES(art::Locks::mutator_lock_) since ForEachEnv doesn't require it.

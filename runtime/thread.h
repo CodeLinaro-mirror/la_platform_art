@@ -33,6 +33,7 @@
 #include "base/bit_utils.h"
 #include "base/locks.h"
 #include "base/macros.h"
+#include "base/offsets.h"
 #include "base/pointer_size.h"
 #include "base/safe_map.h"
 #include "base/value_object.h"
@@ -46,7 +47,6 @@
 #include "javaheapprof/javaheapsampler.h"
 #include "jvalue.h"
 #include "managed_stack.h"
-#include "offsets.h"
 #include "read_barrier_config.h"
 #include "reflective_handle_scope.h"
 #include "runtime_globals.h"
@@ -1049,9 +1049,6 @@ class EXPORT Thread {
   bool HasDebuggerShadowFrames() const {
     return tlsPtr_.frame_id_to_shadow_frame != nullptr;
   }
-
-  // This is done by GC using a checkpoint (or in a stop-the-world pause).
-  void SweepInterpreterCache(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void VisitRoots(RootVisitor* visitor, VisitRootFlags flags)
       REQUIRES_SHARED(Locks::mutator_lock_);

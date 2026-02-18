@@ -35,6 +35,7 @@
 #include "base/macros.h"
 #include "base/mem_map.h"
 #include "base/metrics/metrics.h"
+#include "base/offsets.h"
 #include "base/os.h"
 #include "base/unix_file/fd_file.h"
 #include "compat_framework.h"
@@ -47,7 +48,6 @@
 #include "jni_id_type.h"
 #include "metrics/reporter.h"
 #include "obj_ptr.h"
-#include "offsets.h"
 #include "process_state.h"
 #include "quick/quick_method_frame_info.h"
 #include "reflective_value_visitor.h"
@@ -107,6 +107,7 @@ class CompilerCallbacks;
 class Dex2oatImageTest;
 class DexFile;
 enum class InstructionSet;
+class InstructionSetFeatures;
 class InternTable;
 class IsMarkedVisitor;
 class JavaVMExt;
@@ -319,7 +320,7 @@ class Runtime {
   EXPORT void CallExitHook(jint status);
 
   // Detaches the current native thread from the runtime.
-  void DetachCurrentThread(bool should_run_callbacks = true) REQUIRES(!Locks::mutator_lock_);
+  EXPORT void DetachCurrentThread(bool should_run_callbacks = true) REQUIRES(!Locks::mutator_lock_);
 
   // If we are handling SIQQUIT return the time when we received it.
   std::optional<uint64_t> SigQuitNanoTime() const;
@@ -1013,6 +1014,10 @@ class Runtime {
   // suspended to call this function.
   EXPORT void SetJniIdType(JniIdType t);
 
+  const InstructionSetFeatures* GetRuntimeInstructionSetFeatures() const {
+    return runtime_instruction_set_features_.get();
+  }
+
   uint32_t GetVerifierLoggingThresholdMs() const {
     return verifier_logging_threshold_ms_;
   }
@@ -1616,6 +1621,8 @@ class Runtime {
 #ifdef ART_USE_SIMULATOR
   std::unique_ptr<CodeSimulatorContainer> simulator_container_;
 #endif
+
+  std::unique_ptr<const InstructionSetFeatures> runtime_instruction_set_features_;
 
   // Note: See comments on GetFaultMessage.
   friend std::string GetFaultMessageForAbortLogging();

@@ -759,6 +759,11 @@ void FastCompilerARM64::MoveConstantsAndFpusToRegisters() {
     Location location  = vreg_locations_[i];
     if (location.IsConstant()) {
       DCHECK(location.GetConstant()->IsIntConstant() || location.GetConstant()->IsLongConstant());
+      // If the second register of the wide constant is used, we need to discard
+      // that constant.
+      if (location.GetConstant()->IsLongConstant() && !vreg_locations_[i + 1].IsInvalid()) {
+        continue;
+      }
       DataType::Type type = location.GetConstant()->IsIntConstant()
           ? DataType::Type::kInt32
           : DataType::Type::kInt64;
@@ -1618,7 +1623,7 @@ bool FastCompilerARM64::HandleInvoke(const Instruction& instruction,
     uint32_t method_offset =
         static_cast<uint32_t>(ImTable::OffsetOfElement(offset, kArm64PointerSize));
     __ Ldr(kArtMethodRegister, MemOperand(kArtMethodRegister, method_offset));
-    if (!LoadMethod(ip1, resolved_method)) {
+    if (!LoadMethod(x15, resolved_method)) {
       return false;
     }
   } else {
@@ -2559,7 +2564,11 @@ bool FastCompilerARM64::BuildInstanceFieldGet(const Instruction& instruction,
              next)) {
     return false;
   }
-  UpdateNonNullMask(obj_reg, /* can_be_null= */ false);
+  // Update the information that the object on which we do the field access is
+  // not null, unless its dex register aliases with the destination register.
+  if (obj_reg != source_or_dest_reg) {
+    UpdateNonNullMask(obj_reg, /* can_be_null= */ false);
+  }
   return true;
 }
 

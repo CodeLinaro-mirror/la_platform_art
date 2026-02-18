@@ -538,12 +538,30 @@ HLoopOptimization::HLoopOptimization(HGraph* graph,
       vector_header_(nullptr),
       vector_body_(nullptr),
       vector_index_(nullptr),
-      arch_loop_helper_(ArchNoOptsLoopHelper::Create(codegen, global_allocator_)) {}
+      arch_loop_helper_(ArchNoOptsLoopHelper::Create(codegen, global_allocator_)),
+      codegen_(codegen) {}
 
 bool HLoopOptimization::Run() {
-  // Skip if there is no loop or the graph has irreducible loops.
-  // TODO: make this less of a sledgehammer.
-  if (!graph_->HasLoops() || graph_->HasIrreducibleLoops()) {
+  // Skip if there is no loop or the graph only has irreducible loops.
+  if (!graph_->HasLoops()) {
+    return false;
+  }
+
+  // Check if all loop are irreducible first. This lets us avoid linearizing the graph when it is
+  // not needed.
+  bool all_irreducible_loops = true;
+  for (HBasicBlock* block : graph_->GetReversePostOrderSkipEntryBlock()) {
+    if (block->IsLoopHeader()) {
+      HLoopInformation* loop_info = block->GetLoopInformation();
+      if (!loop_info->ContainsIrreducibleLoop()) {
+        all_irreducible_loops = false;
+        break;
+      }
+    }
+  }
+
+  if (all_irreducible_loops) {
+    // All irreducible loops, nothing to do.
     return false;
   }
 
@@ -553,8 +571,10 @@ bool HLoopOptimization::Run() {
 
   // Perform loop optimizations.
   const bool did_loop_opt = LocalRun();
-  if (top_loop_ == nullptr) {
-    graph_->SetHasLoops(false);  // no more loops
+  // Check if we got rid of all the loops. Note that we skipped irreducible loops so those won't be
+  // eliminated by this pass.
+  if (top_loop_ == nullptr && !graph_->HasIrreducibleLoops()) {
+    graph_->SetHasLoops(false);
   }
 
   // Detach allocator.
@@ -576,6 +596,11 @@ bool HLoopOptimization::LocalRun() {
   // Build the loop hierarchy.
   for (HBasicBlock* block : linear_order) {
     if (block->IsLoopHeader()) {
+      HLoopInformation* loop_info = block->GetLoopInformation();
+      // Skip loops that contain irreducible loops
+      if (loop_info->ContainsIrreducibleLoop()) {
+        continue;
+      }
       AddLoop(block->GetLoopInformation());
     }
   }
@@ -1097,7 +1122,7 @@ bool HLoopOptimization::TryLoopScalarOpts(LoopNode* node) {
   }
 
   LoopAnalysisInfo analysis_info(loop_info);
-  LoopAnalysis::CalculateLoopBasicProperties(loop_info, &analysis_info, trip_count);
+  LoopAnalysis::CalculateLoopBasicProperties(loop_info, &analysis_info, trip_count, codegen_);
   if (analysis_info.HasInstructionsPreventingScalarOpts() ||
       arch_loop_helper_->IsLoopNonBeneficialForScalarOpts(&analysis_info)) {
     return false;

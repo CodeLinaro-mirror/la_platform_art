@@ -56,6 +56,7 @@ static constexpr size_t kRuntimeParameterFpuRegistersLength =
 static constexpr FloatRegister non_volatile_xmm_regs[] = { XMM12, XMM13, XMM14, XMM15 };
 
 #define UNIMPLEMENTED_INTRINSIC_LIST_X86_64(V) \
+  V(ClassIsAssignableFrom)                     \
   V(MathSignumFloat)                           \
   V(MathSignumDouble)                          \
   V(MathCopySignFloat)                         \
@@ -563,6 +564,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   void RecordAppImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
   Label* NewTypeBssEntryPatch(HLoadClass* load_class);
   void RecordBootImageStringPatch(HLoadString* load_string);
+  void RecordAppImageStringPatch(HLoadString* load_string);
   Label* NewStringBssEntryPatch(HLoadString* load_string);
   Label* NewMethodTypeBssEntryPatch(HLoadMethodType* load_method_type);
   void RecordBootImageJniEntrypointPatch(HInvokeStaticOrDirect* invoke);
@@ -749,6 +751,8 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   // We will fix this up in the linker later to have the right value.
   static constexpr int32_t kPlaceholder32BitOffset = 256;
 
+  bool IsIntrinsicCallFree(HInvoke* invoke) const override;
+
  private:
   static RegisterSet ComputeCalleeSaves();
   static RegisterSet ComputeBlockedRegisters();
@@ -787,6 +791,8 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   ArenaDeque<PatchInfo<Label>> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PatchInfo<Label>> boot_image_string_patches_;
+  // PC-relative String patch info for kAppImageRelRo.
+  ArenaDeque<PatchInfo<Label>> app_image_string_patches_;
   // PC-relative String patch info for kBssEntry.
   ArenaDeque<PatchInfo<Label>> string_bss_entry_patches_;
   // PC-relative MethodType patch info for kBssEntry.

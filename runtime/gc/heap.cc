@@ -447,7 +447,8 @@ Heap::Heap(size_t initial_size,
     LOG(INFO) << "Heap() entering";
   }
 
-  LOG(INFO) << "Using " << foreground_collector_type_ << " GC.";
+  std::string generational = use_generational_gc_ ? "generational " : "non-generational ";
+  LOG(INFO) << "Using " << generational << foreground_collector_type_ << " GC.";
   if (gUseUserfaultfd) {
     CHECK_EQ(foreground_collector_type_, kCollectorTypeCMC);
     CHECK_EQ(background_collector_type_, kCollectorTypeCMCBackground);
@@ -1912,13 +1913,26 @@ void Heap::RecordFree(uint64_t freed_objects, int64_t freed_bytes) {
   // free list backed space, which may increase memory footprint due to padding and binning.
   RACING_DCHECK_LE(freed_bytes,
                    static_cast<int64_t>(num_bytes_allocated_.load(std::memory_order_relaxed)));
-  // Note: This relies on 2s complement for handling negative freed_bytes.
-  num_bytes_allocated_.fetch_sub(static_cast<ssize_t>(freed_bytes), std::memory_order_relaxed);
-  if (freed_bytes > 0 && TraceEnabled()) {
-    // Use release memory-order to ensure that the updation of num_bytes_allocated_
-    // above doesn't get reordered with this store.
-    TraceHeapSize(last_reported_heap_size_.fetch_sub(freed_bytes, std::memory_order_release) -
-                  freed_bytes);
+  // Note: We rely on 2s complement for handling negative freed_bytes.
+  if (LIKELY(!TraceEnabled())) {
+    num_bytes_allocated_.fetch_sub(static_cast<ssize_t>(freed_bytes), std::memory_order_relaxed);
+  } else {
+    // Acquire load of last_reported_heap_size_ to ensure num_bytes_allocated_
+    // store is not re-ordered, potentially causing under-reporting.
+    size_t curr_reported_size = last_reported_heap_size_.load(std::memory_order_acquire);
+    size_t size_to_report = num_bytes_allocated_.fetch_sub(static_cast<ssize_t>(freed_bytes),
+                                                           std::memory_order_relaxed) -
+                            static_cast<ssize_t>(freed_bytes);
+    do {
+      // The first CAS is done unconditionally to address the possibility
+      // of being in this function with 0-initialized last_reported_heap_size_.
+      if (last_reported_heap_size_.compare_exchange_strong(
+              curr_reported_size, size_to_report, std::memory_order_release)) {
+        TraceHeapSize(size_to_report);
+        break;
+      }
+      size_to_report = GetBytesAllocated();
+    } while (UnsignedDifference(curr_reported_size, size_to_report) > 0);
   }
   if (Runtime::Current()->HasStatsEnabled()) {
     RuntimeStats* thread_stats = Thread::Current()->GetStats();
@@ -3919,7 +3933,10 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
         uint64_t expected_gc_cost_ms = NsToMs(current_gc_iteration_.GetThreadCpuTimeNs());
         time_based_gc_threshold_ = time_based_gc_threshold_factor_ * expected_gc_cost_ms;
         last_gc_start_time_ = current_gc_iteration_.GetStartTime();
-
+        if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+          time_based_gc_threshold_progress_.Reset();
+          time_based_gc_threshold_native_progress_.Reset();
+        }
         RequestTimeBasedGcThresholdCheck(self);
       }
 
@@ -4323,7 +4340,20 @@ size_t Heap::ComputeTimeBasedGcThresholdFactor(double memory_gc_cost_factor) {
   double num_pages = static_cast<double>(sysconf(_SC_PHYS_PAGES));
   double page_size = static_cast<double>(sysconf(_SC_PAGESIZE));
   double total_memory_kb = num_pages * page_size / KB;
+
+  if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+    // The time weighted average of Java heap is half the max value for apps
+    // that allocate at a constant rate. Adjust the memory_gc_cost_factor
+    // accordingly to allow for fair comparison between the two approaches.
+    memory_gc_cost_factor *= 2.0;
+  }
+
   return static_cast<size_t>(total_memory_kb / memory_gc_cost_factor);
+}
+
+void Heap::TimeIntegral::Reset() {
+  integral_.store(0);
+  time_.store(NanoTime());
 }
 
 class Heap::TimeBasedGcThresholdCheckTask : public HeapTask {
@@ -4373,7 +4403,16 @@ void Heap::TimeBasedGcThresholdCheck(Thread* self) {
   size_t bytes_allocated_since_last_gc_kb = (bytes_allocated - num_bytes_alive_after_gc_) / KB;
   uint64_t now = NanoTime();
   uint64_t time_since_last_gc_ms = NsToMs(now - last_gc_start_time_);
-  if (bytes_allocated_since_last_gc_kb * time_since_last_gc_ms >= time_based_gc_threshold_) {
+
+  uint64_t threshold_progress;
+  if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+    threshold_progress =
+        time_based_gc_threshold_progress_.AddSample(bytes_allocated_since_last_gc_kb);
+  } else {
+    threshold_progress = bytes_allocated_since_last_gc_kb * time_since_last_gc_ms;
+  }
+
+  if (threshold_progress >= time_based_gc_threshold_) {
     ScopedTrace t2("PureTimeGcTrigger");
     RequestConcurrentGC(self, kGcCauseBackground, false, GetCurrentGcNum());
 
@@ -4392,7 +4431,14 @@ void Heap::TimeBasedGcThresholdCheck(Thread* self) {
     return;
   }
 
-  uint64_t time_delta_ms = time_based_gc_threshold_ / bytes_allocated_since_last_gc_kb;
+  uint64_t time_delta_ms;
+  if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+    time_delta_ms = time_since_last_gc_ms + (time_based_gc_threshold_ - threshold_progress) /
+                                                bytes_allocated_since_last_gc_kb;
+  } else {
+    time_delta_ms = time_based_gc_threshold_ / bytes_allocated_since_last_gc_kb;
+  }
+
   if (bytes_allocated > bytes_allocated_at_last_gc_threshold_check_) {
     // There have been allocations since the last check, which suggests the
     // application is actively allocating objects. Schedule the next check
@@ -4459,20 +4505,49 @@ inline float Heap::NativeMemoryOverTarget(size_t current_native_bytes, bool is_g
     // It's OK to lose an update if two stores race.
     old_native_bytes_allocated_.store(current_native_bytes, std::memory_order_relaxed);
     return 0.0;
-  } else {
-    size_t new_native_bytes = UnsignedDifference(current_native_bytes, old_native_bytes);
-    size_t weighted_native_bytes = new_native_bytes / kNewNativeDiscountFactor
-        + old_native_bytes / kOldNativeDiscountFactor;
-    size_t add_bytes_allowed = static_cast<size_t>(
-        NativeAllocationGcWatermark() * HeapGrowthMultiplier());
-    size_t java_gc_start_bytes = is_gc_concurrent
-        ? concurrent_start_bytes_
-        : target_footprint_.load(std::memory_order_relaxed);
-    size_t adj_start_bytes = UnsignedSum(java_gc_start_bytes,
-                                         add_bytes_allowed / kNewNativeDiscountFactor);
-    return static_cast<float>(GetBytesAllocated() + weighted_native_bytes)
-         / static_cast<float>(adj_start_bytes);
   }
+
+  size_t new_native_bytes = UnsignedDifference(current_native_bytes, old_native_bytes);
+  size_t weighted_native_bytes =
+      new_native_bytes / kNewNativeDiscountFactor + old_native_bytes / kOldNativeDiscountFactor;
+  size_t java_gc_start_bytes = is_gc_concurrent ? concurrent_start_bytes_
+                                                : target_footprint_.load(std::memory_order_relaxed);
+  size_t weighted_num_bytes_allocated = GetBytesAllocated() + weighted_native_bytes;
+
+  if (com::android::art::rw::flags::enable_time_based_gc_triggering() &&
+      com::android::art::rw::flags::native_alloc_time_based_gc_triggering_bugfix() &&
+      time_based_gc_threshold_ != 0) {
+    if (weighted_num_bytes_allocated >= java_gc_start_bytes) {
+      // Time based gc triggering sets java_gc_start_bytes for use as a
+      // last resort to ensure we start GC before running out of heap
+      // entirely.
+      return static_cast<float>(weighted_num_bytes_allocated) /
+             static_cast<float>(java_gc_start_bytes);
+    }
+
+    uint64_t threshold_progress;
+    if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+      size_t bytes_allocated_since_last_gc_kb =
+          (GetBytesAllocated() - num_bytes_alive_after_gc_) / KB;
+      threshold_progress =
+          time_based_gc_threshold_progress_.AddSample(bytes_allocated_since_last_gc_kb);
+      threshold_progress +=
+          time_based_gc_threshold_native_progress_.AddSample(new_native_bytes / KB);
+    } else {
+      size_t new_num_bytes_allocated = GetBytesAllocated() + new_native_bytes;
+      size_t bytes_allocated_since_last_gc_kb =
+          (new_num_bytes_allocated - num_bytes_alive_after_gc_) / KB;
+      uint64_t time_since_last_gc_ms = NsToMs(NanoTime() - last_gc_start_time_);
+      threshold_progress = bytes_allocated_since_last_gc_kb * time_since_last_gc_ms;
+    }
+    return static_cast<float>(threshold_progress) / static_cast<float>(time_based_gc_threshold_);
+  }
+
+  size_t add_bytes_allowed =
+      static_cast<size_t>(NativeAllocationGcWatermark() * HeapGrowthMultiplier());
+  size_t adj_start_bytes =
+      UnsignedSum(java_gc_start_bytes, add_bytes_allowed / kNewNativeDiscountFactor);
+  return static_cast<float>(weighted_num_bytes_allocated) / static_cast<float>(adj_start_bytes);
 }
 
 inline void Heap::CheckGCForNative(Thread* self) {
@@ -4913,7 +4988,7 @@ size_t Heap::UpdateAndReportBytesAllocated(size_t tl_bytes_allocated) {
   while (UnsignedDifference(size_to_report, curr_reported_size) >= kMinHeapSizeToReport) {
     // compare_exchange_strong() will update 'curr_reported_size' on failure.
     if (last_reported_heap_size_.compare_exchange_strong(
-            curr_reported_size, size_to_report, std::memory_order_relaxed)) {
+            curr_reported_size, size_to_report, std::memory_order_release)) {
       // Trace entries may still be written out of order. In very rare cases, this can
       // effectively cause reports of large allocations to be delayed until a subsequent
       // allocation is reported. But alternatives increase locking overhead. So, we
@@ -4922,9 +4997,10 @@ size_t Heap::UpdateAndReportBytesAllocated(size_t tl_bytes_allocated) {
       break;
     } else if (curr_reported_size < last_reported_size) {
       // The GC thread has pushed a notification of heap size lower
-      // than what we thought was the last reported size. Furthermore,
-      // that notification already took into consideration this
-      // allocation. So skip the notification.
+      // than what we thought was the last reported size. If it missed this
+      // thread's update of num_bytes_allocated then next TLAB allocation will
+      // catch it. But it's not a good idea to retry CAS as that is more likely
+      // to result in temporarily wrong reporting.
       break;
     }
     last_reported_size = curr_reported_size;
@@ -5007,7 +5083,8 @@ void Heap::PostForkChildAction(Thread* self) {
   uint64_t last_adj_time = NanoTime();
   next_gc_type_ = NonStickyGcType();  // Always start with a full gc.
 
-  LOG(INFO) << "Using " << foreground_collector_type_ << " GC.";
+  std::string generational = use_generational_gc_ ? "generational " : "non-generational ";
+  LOG(INFO) << "Using " << generational << foreground_collector_type_ << " GC.";
   if (gUseUserfaultfd) {
     DCHECK_NE(mark_compact_, nullptr);
     mark_compact_->CreateUserfaultfd(/*post_fork*/true);
@@ -5024,6 +5101,10 @@ void Heap::PostForkChildAction(Thread* self) {
     // based on historical concurrent_start_bytes_ rather than time based
     // thresholding.
     time_based_gc_threshold_ = 0;
+    if (com::android::art::rw::flags::time_based_gc_triggering_via_integral()) {
+      time_based_gc_threshold_progress_.Reset();
+      time_based_gc_threshold_native_progress_.Reset();
+    }
   }
 
   // Shrink heap after kPostForkMaxHeapDurationMS, to force a memory hog process to GC.

@@ -482,7 +482,17 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
     // If the target class is in the boot or app image, it's non-moveable and it doesn't matter
     // if we compare it with a from-space or to-space reference, the result is the same.
     // It's OK to traverse a class hierarchy jumping between from-space and to-space.
-    return EmitReadBarrier() && !instance_of->GetTargetClass()->IsInImage();
+    if (EmitBakerReadBarrier()) {
+      HInstruction* target_class = instance_of->GetTargetClass();
+      if (target_class->IsLoadClass()) {
+        return !target_class->AsLoadClass()->IsInImage();
+      } else {
+        DCHECK(target_class->IsFieldAccess());
+        // This could be more precise. Assuming the worst.
+        return true;
+      }
+    }
+    return false;
   }
 
   ReadBarrierOption ReadBarrierOptionForInstanceOf(HInstanceOf* instance_of) {
@@ -496,8 +506,9 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
       case TypeCheckKind::kClassHierarchyCheck:
       case TypeCheckKind::kArrayObjectCheck:
       case TypeCheckKind::kInterfaceCheck: {
+        DCHECK(check_cast->GetTargetClass()->IsLoadClass());
         bool needs_read_barrier =
-            EmitReadBarrier() && !check_cast->GetTargetClass()->IsInImage();
+            EmitReadBarrier() && !check_cast->GetTargetClass()->AsLoadClass()->IsInImage();
         // We do not emit read barriers for HCheckCast, so we can get false negatives
         // and the slow path shall re-check and simply return if the cast is actually OK.
         return !needs_read_barrier;
@@ -771,6 +782,14 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
 
   virtual HGraphVisitor* GetLocationBuilder() = 0;
   virtual HGraphVisitor* GetInstructionVisitor() = 0;
+
+  // Returns true if `invoke` is an intrinsic with code generation that it is truly there and
+  // call-free (not unimplemented, no bail on instruction features, or call on slow path).
+  //
+  // TODO: Avoid wasting Arena memory. This is done by calling the locations builder on the
+  // instruction and clearing out the locations once result is known. We assume this call only has
+  // creating locations as side effects!
+  virtual bool IsIntrinsicCallFree(HInvoke* invoke) const = 0;
 
  protected:
   // Patch info used for recording locations of required linker patches and their targets,

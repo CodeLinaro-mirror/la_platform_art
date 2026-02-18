@@ -21,6 +21,9 @@
 #include "base/memory_region.h"
 #include "base/utils.h"
 #include "entrypoints/quick/runtime_entrypoints_list.h"
+#include "fault_handler.h"
+
+#include <sys/ucontext.h>
 
 #include "code_simulator_container.h"
 
@@ -33,6 +36,7 @@ static constexpr bool kSimDebuggerEnabled = false;
 
 extern "C" const void* GetQuickInvokeStub();
 extern "C" const void* GetQuickInvokeStaticStub();
+extern "C" const void* GetQuickThrowNullPointerExceptionFromSignal();
 
 namespace arm64 {
 
@@ -136,8 +140,84 @@ class ARTSimulator final : public Simulator {
     RegisterBranchInterception(artThrowNullPointerExceptionFromCode);
     RegisterBranchInterception(artThrowStringBoundsFromCode);
     RegisterBranchInterception(artDeoptimizeFromCompiledCode);
+    RegisterBranchInterception(artResolveTypeAndVerifyAccessFromCode);
+    RegisterBranchInterception(artIsAssignableFromCode);
+    RegisterBranchInterception(artThrowArrayStoreException);
+    RegisterBranchInterception(artInitializeStaticStorageFromCode);
+    RegisterBranchInterception(artResolveStringFromCode);
+    RegisterBranchInterception(artResolveMethodTypeFromCode);
+    RegisterBranchInterception(artAllocObjectFromCodeWithChecksRosAlloc);
+    RegisterBranchInterception(artInvokePolymorphic);
+    RegisterBranchInterception(artLockObjectFromCode);
+    RegisterBranchInterception(artUnlockObjectFromCode);
+    RegisterBranchInterception(artDeliverExceptionFromCode);
+    RegisterBranchInterception(artStringBuilderAppend);
+    RegisterBranchInterception(fmodf);
+    RegisterBranchInterception(fmod);
+    RegisterBranchInterception(artAllocArrayFromCodeResolvedRosAllocInstrumented);
+    RegisterBranchInterception(artAllocObjectFromCodeInitializedRosAllocInstrumented);
+    RegisterBranchInterception(artAllocObjectFromCodeWithChecksRosAllocInstrumented);
+    RegisterBranchInterception(artAllocObjectFromCodeResolvedRosAllocInstrumented);
+    RegisterBranchInterception(artAllocStringFromBytesFromCodeRosAlloc);
+    RegisterBranchInterception(artAllocStringFromCharsFromCodeRosAlloc);
+    RegisterBranchInterception(artAllocStringFromStringFromCodeRosAlloc);
+    RegisterBranchInterception(artGetByteStaticFromCompiledCode);
+    RegisterBranchInterception(artGetCharStaticFromCompiledCode);
+    RegisterBranchInterception(artGet32StaticFromCompiledCode);
+    RegisterBranchInterception(artGet64StaticFromCompiledCode);
+    RegisterBranchInterception(artGetObjStaticFromCompiledCode);
+    RegisterBranchInterception(artGetByteInstanceFromCompiledCode);
+    RegisterBranchInterception(artGetCharInstanceFromCompiledCode);
+    RegisterBranchInterception(artGet32InstanceFromCompiledCode);
+    RegisterBranchInterception(artGet64InstanceFromCompiledCode);
+    RegisterBranchInterception(artGetObjInstanceFromCompiledCode);
+    RegisterBranchInterception(artSet8StaticFromCompiledCode);
+    RegisterBranchInterception(artSet16StaticFromCompiledCode);
+    RegisterBranchInterception(artSet32StaticFromCompiledCode);
+    RegisterBranchInterception(artSet64StaticFromCompiledCode);
+    RegisterBranchInterception(artSetObjStaticFromCompiledCode);
+    RegisterBranchInterception(artSet8InstanceFromCompiledCode);
+    RegisterBranchInterception(artSet16InstanceFromCompiledCode);
+    RegisterBranchInterception(artSet32InstanceFromCompiledCode);
+    RegisterBranchInterception(artSet64InstanceFromCompiledCode);
+    RegisterBranchInterception(artSetObjInstanceFromCompiledCode);
+    RegisterBranchInterception(artResolveMethodHandleFromCode);
+    RegisterBranchInterception(artAllocStringObjectRosAlloc);
+    RegisterBranchInterception(artDeoptimizeIfNeeded);
+    RegisterBranchInterception(artInvokeCustom);
+    RegisterBranchInterception(artThrowNullPointerExceptionFromSignal);
+
+    // ART has a number of math entrypoints which operate on double type (see
+    // quick_entrypoints_list.h, entrypoints_init_arm64.cc); we need to intercept C functions
+    // called from those EPs.
+    //
+    // The C library provides function implementations for both double and float, so we have
+    // to explicitly choose the type for the interception templates - double.
+    RegisterBranchInterception<double, double>(cos);
+    RegisterBranchInterception<double, double>(sin);
+    RegisterBranchInterception<double, double>(acos);
+    RegisterBranchInterception<double, double>(asin);
+    RegisterBranchInterception<double, double>(atan);
+    RegisterBranchInterception<double, double, double>(atan2);
+    RegisterBranchInterception<double, double, double>(pow);
+    RegisterBranchInterception<double, double>(cbrt);
+    RegisterBranchInterception<double, double>(cosh);
+    RegisterBranchInterception<double, double>(exp);
+    RegisterBranchInterception<double, double>(expm1);
+    RegisterBranchInterception<double, double, double>(hypot);
+    RegisterBranchInterception<double, double>(log);
+    RegisterBranchInterception<double, double>(log10);
+    RegisterBranchInterception<double, double, double>(nextafter);
+    RegisterBranchInterception<double, double>(sinh);
+    RegisterBranchInterception<double, double>(tan);
+    RegisterBranchInterception<double, double>(tanh);
 
     RegisterTwoWordReturnInterception(artInvokeSuperTrampolineWithAccessCheck);
+    RegisterTwoWordReturnInterception(artInvokeStaticTrampolineWithAccessCheck);
+    RegisterTwoWordReturnInterception(artInvokeInterfaceTrampoline);
+    RegisterTwoWordReturnInterception(artInvokeVirtualTrampolineWithAccessCheck);
+    RegisterTwoWordReturnInterception(artInvokeDirectTrampolineWithAccessCheck);
+    RegisterTwoWordReturnInterception(artInvokeInterfaceTrampolineWithAccessCheck);
 
     RegisterBranchInterception(
         artArm64SimulatorGenericJNIPlaceholder,
@@ -196,6 +276,55 @@ class ARTSimulator final : public Simulator {
       WriteXRegister(0, res.lo);
       WriteXRegister(1, res.hi);
     });
+  }
+
+  void VisitLoadStoreExclusive(const vixl::aarch64::Instruction* instr) override {
+    // Exclusive accesses are not simulated accurately enough for multi-threaded code, see
+    // external/vixl/README.md for more details. The restricted mode ensures that we shouldn't
+    // encounter any.
+    // TODO(Simulator): Separate out the exclusive accesses in VIXL that are accurately simulated
+    // and those that are not.
+    LoadStoreExclusive op = static_cast<LoadStoreExclusive>(instr->Mask(LoadStoreExclusiveMask));
+    switch (op) {
+      // Exclusive stores.
+      case STXRB_w:
+      case STXRH_w:
+      case STXR_w:
+      case STXR_x:
+      // Exclusive loads.
+      case LDXRB_w:
+      case LDXRH_w:
+      case LDXR_w:
+      case LDXR_x:
+      // Exclusive store pair.
+      case STXP_w:
+      case STXP_x:
+      // Exclusive load pair.
+      case LDXP_w:
+      case LDXP_x:
+      // Exclusive store-release variants.
+      case STLXRB_w:
+      case STLXRH_w:
+      case STLXR_w:
+      case STLXR_x:
+      // Exclusive load-acquire variants
+      case LDAXRB_w:
+      case LDAXRH_w:
+      case LDAXR_w:
+      case LDAXR_x:
+      // Exclusive store-release pair variants.
+      case STLXP_w:
+      case STLXP_x:
+      // Exclusive load-acquire pair variants.
+      case LDAXP_w:
+      case LDAXP_x:
+        LOG(FATAL) << "Unexpected exclusive operation: " << op;
+        UNREACHABLE();
+      default:
+        // Some instructions counted as exclusive such as LDAR/STLR and CAS* are simulated
+        // accurately enough to be used.
+        Simulator::VisitLoadStoreExclusive(instr);
+    }
   }
 };
 
@@ -265,6 +394,89 @@ int64_t CodeSimulatorArm64::GetStackPointer() {
 uint8_t* CodeSimulatorArm64::GetStackBaseInternal() {
   return GetSimulator()->GetStackBase();
 }
+
+uintptr_t CodeSimulatorArm64::GetPc() {
+  return reinterpret_cast<uintptr_t>(GetSimulator()->ReadPc());
+}
+
+#ifdef __x86_64__
+//
+// Simulator Fault Handlers.
+//
+// These fault handlers are based on their respective Arm64 fault handlers and should remain
+// aligned with those functions. This alignment is because all implicit check fault handlers are
+// called from and return to quick code and so should be aligned with the kRuntimeQuickCodeISA
+// fault handler, which in the case of the simulator is Arm64.
+//
+// In general these fault handlers should mirror their respective Arm64 fault handlers except in
+// the following ways:
+//   - There is an additional check that the fault came from the simulator.
+//   - If the faulting address is needed, it is first replaced by the actual address by the
+//     simulator. For more details see vixl::aarch64::Simulator::ReplaceFaultAddress.
+//   - Native registers in the context are replaced with their equivalent simulated registers.
+//   - The native context is set up to return to the simulator.
+//
+
+// This handler is based on the Arm64 NullPointerHandler::Action and should remain aligned with
+// that function.
+bool CodeSimulatorArm64::HandleNullPointer([[maybe_unused]] int sig,
+                                           siginfo_t* siginfo,
+                                           void* context) {
+  ARTSimulator* sim = GetSimulator();
+
+  // Did the signal come from the simulator?
+  ucontext_t* uc = reinterpret_cast<ucontext_t*>(context);
+  uintptr_t fault_pc = uc->uc_mcontext.gregs[REG_RIP];
+  if (!sim->IsSimulatedMemoryAccess(fault_pc)) {
+    return false;
+  }
+
+  // If we use siginfo->si_addr we need to ensure it is at the correct address as the address
+  // reported by the kernel could be wrong due to how VIXL probes memory for implicit checks.
+  sim->ReplaceFaultAddress(siginfo, context);
+  uintptr_t fault_address = reinterpret_cast<uintptr_t>(siginfo->si_addr);
+  if (!NullPointerHandler::IsValidFaultAddress(fault_address)) {
+    return false;
+  }
+
+  // For null checks in compiled code we insert a stack map that is immediately
+  // after the load/store instruction that might cause the fault and we need to
+  // pass the return PC to the handler. For null checks in Nterp, we similarly
+  // need the return PC to recognize that this was a null check in Nterp, so
+  // that the handler can get the needed data from the Nterp frame.
+
+  ArtMethod** sp = reinterpret_cast<ArtMethod**>(sim->get_sp());
+  uintptr_t return_pc = reinterpret_cast<uintptr_t>(sim->ReadPc()->GetNextInstruction());
+  if (!NullPointerHandler::IsValidMethod(*sp) ||
+      !NullPointerHandler::IsValidReturnPc(sp, return_pc)) {
+    return false;
+  }
+
+  // Push the return PC to the stack and pass the fault address in LR.
+  sim->WriteSp(sim->get_sp() - sizeof(uintptr_t));
+  *reinterpret_cast<uintptr_t*>(sim->get_sp()) = return_pc;
+  sim->WriteLr(fault_address);
+
+  // Return to the VIXL memory access continuation point, which is also the next instruction, after
+  // this handler.
+  uc->uc_mcontext.gregs[REG_RIP] = sim->GetSignalReturnAddress();
+  // Return that the memory access failed.
+  uc->uc_mcontext.gregs[REG_RAX] = static_cast<greg_t>(MemoryAccessResult::Failure);
+  // Set the address where we want to continue simulating.
+  sim->WritePc(reinterpret_cast<const vixl::aarch64::Instruction*>(
+      GetQuickThrowNullPointerExceptionFromSignal()));
+
+  VLOG(signals) << "Generating null pointer exception";
+  return true;
+}
+#else
+bool CodeSimulatorArm64::HandleNullPointer([[maybe_unused]] int sig,
+                                           [[maybe_unused]] siginfo_t* siginfo,
+                                           [[maybe_unused]] void* context) {
+  LOG(FATAL) << "Unreachable";
+  UNREACHABLE();
+}
+#endif
 
 #endif
 

@@ -71,7 +71,7 @@ void HLoopInformation::PopulateRecursive(
     // We're visiting loops in post-order, so inner loops must have been
     // populated already.
     DCHECK(block->GetLoopInformation()->IsPopulated());
-    if (block->GetLoopInformation()->IsIrreducible()) {
+    if (block->GetLoopInformation()->ContainsIrreducibleLoop()) {
       contains_irreducible_loop_ = true;
     }
   }
@@ -256,6 +256,9 @@ void HLoopInformation::Populate() {
 void HLoopInformation::PopulateInnerLoopUpwards(HLoopInformation* inner_loop) {
   DCHECK(inner_loop->GetPreHeader()->GetLoopInformation() == this);
   block_mask_.Union(&inner_loop->block_mask_);
+  if (inner_loop->ContainsIrreducibleLoop()) {
+    contains_irreducible_loop_ = true;
+  }
   HLoopInformation* outer_loop = GetPreHeader()->GetLoopInformation();
   if (outer_loop != nullptr) {
     outer_loop->PopulateInnerLoopUpwards(this);
@@ -320,6 +323,9 @@ inline void HLoopInformation::MarkInLoop(HBasicBlock* block) {
     // The `block` is currently part of an outer loop. Make it part of this inner loop.
     // Note that a non loop header having a loop information means this loop information
     // has already been populated
+    block->SetLoopInformation(this);
+  } else if (IsBackEdge(*block)) {
+    // If the `block` is a back edge of the current loop, it must point to this loop.
     block->SetLoopInformation(this);
   } else {
     // The `block` is part of an inner loop. Do not update the loop information.

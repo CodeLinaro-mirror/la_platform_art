@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2026 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef ART_RUNTIME_NATIVE_JAVA_UTIL_CONCURRENT_ATOMIC_ATOMICLONG_H_
-#define ART_RUNTIME_NATIVE_JAVA_UTIL_CONCURRENT_ATOMIC_ATOMICLONG_H_
+#if ASM_DEFINE_INCLUDE_DEPENDENCIES
+#include "mirror/dex_cache.h"
+#endif
 
-#include <jni.h>
-
-#include "base/macros.h"
-
-namespace art HIDDEN {
-
-void register_java_util_concurrent_atomic_AtomicLong(JNIEnv* env);
-
-}  // namespace art
-
-#endif  // ART_RUNTIME_NATIVE_JAVA_UTIL_CONCURRENT_ATOMIC_ATOMICLONG_H_
+ASM_DEFINE(MIRROR_DEX_CACHE_DEX_FILE_OFFSET, art::mirror::DexCache::DexFileOffset().Int32Value())

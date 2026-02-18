@@ -56,6 +56,7 @@ static_assert(kQuietNaN == 0x200);
 static constexpr int32_t kFClassNaNMinValue = 0x100;
 
 #define UNIMPLEMENTED_INTRINSIC_LIST_RISCV64(V) \
+  V(ClassIsAssignableFrom)                      \
   V(FP16Ceil)                                   \
   V(FP16Compare)                                \
   V(FP16Floor)                                  \
@@ -595,6 +596,9 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
   PcRelativePatchInfo* NewBootImageStringPatch(const DexFile& dex_file,
                                                dex::StringIndex string_index,
                                                const PcRelativePatchInfo* info_high = nullptr);
+  PcRelativePatchInfo* NewAppImageStringPatch(const DexFile& dex_file,
+                                              dex::StringIndex string_index,
+                                              const PcRelativePatchInfo* info_high = nullptr);
   PcRelativePatchInfo* NewStringBssEntryPatch(const DexFile& dex_file,
                                               dex::StringIndex string_index,
                                               const PcRelativePatchInfo* info_high = nullptr);
@@ -641,6 +645,7 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
 
   bool CanUseImplicitSuspendCheck() const;
 
+  bool IsIntrinsicCallFree(HInvoke* invoke) const override;
 
   // Create slow path for a Baker read barrier for a GC root load within `instruction`.
   SlowPathCodeRISCV64* AddGcRootBakerBarrierBarrierSlowPath(
@@ -836,6 +841,8 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
   ArenaDeque<PcRelativePatchInfo> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_string_patches_;
+  // PC-relative String patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_string_patches_;
   // PC-relative String patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> string_bss_entry_patches_;
   // PC-relative method patch info for kBootImageLinkTimePcRelative+kCallCriticalNative.

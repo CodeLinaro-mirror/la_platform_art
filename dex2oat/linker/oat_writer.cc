@@ -466,6 +466,8 @@ OatWriter::OatWriter(const CompilerOptions& compiler_options,
       app_image_rel_ro_method_entries_sorted_(),
       app_image_rel_ro_type_entries_(),
       app_image_rel_ro_type_entries_sorted_(),
+      app_image_rel_ro_string_entries_(),
+      app_image_rel_ro_string_entries_sorted_(),
       bss_method_entries_(),
       bss_type_entries_(),
       bss_public_type_entries_(),
@@ -876,6 +878,9 @@ void OatWriter::InitBssAndRelRoData() {
           bss_type_entries = &bss_package_type_entries_;
           bss_references = &bss_package_type_entry_references_;
           add_type_entry = true;
+        } else if (patch.GetType() == LinkerPatch::Type::kStringAppImageRelRo) {
+          app_image_rel_ro_string_entries_.insert(
+              std::make_pair(patch.TargetString(), /* placeholder */ 0u));
         } else if (patch.GetType() == LinkerPatch::Type::kStringBssEntry) {
           StringReference target_string = patch.TargetString();
           bss_string_entries_.insert(std::make_pair(target_string, /* placeholder */ 0u));
@@ -1741,6 +1746,16 @@ class OatWriter::WriteCodeMethodVisitor : public OrderedMethodVisitor {
                                                                    target_offset);
               break;
             }
+            case LinkerPatch::Type::kStringAppImageRelRo: {
+              uint32_t target_offset =
+                  writer_->data_img_rel_ro_start_ +
+                  writer_->app_image_rel_ro_string_entries_.find(patch.TargetString())->second;
+              writer_->relative_patcher_->PatchPcRelativeReference(&patched_code_,
+                                                                   patch,
+                                                                   offset_ + literal_offset,
+                                                                   target_offset);
+              break;
+            }
             case LinkerPatch::Type::kStringBssEntry: {
               uint32_t target_offset =
                   writer_->bss_start_ +
@@ -2508,7 +2523,8 @@ size_t OatWriter::InitDataImgRelRoLayout(size_t offset) {
   DCHECK_EQ(data_img_rel_ro_size_, 0u);
   if (boot_image_rel_ro_entries_.empty() &&
       app_image_rel_ro_method_entries_.empty() &&
-      app_image_rel_ro_type_entries_.empty()) {
+      app_image_rel_ro_type_entries_.empty() &&
+      app_image_rel_ro_string_entries_.empty()) {
     // Nothing to put to the .data.img.rel.ro section.
     return offset;
   }
@@ -2530,6 +2546,10 @@ size_t OatWriter::InitDataImgRelRoLayout(size_t offset) {
   DCHECK(app_image_rel_ro_type_entries_sorted_.empty());
   app_image_rel_ro_type_entries_sorted_ = InitDataImgRelRoLayoutOffset(
       app_image_rel_ro_type_entries_, sizeof(uint32_t), TypeReferenceValueComparator());
+
+  DCHECK(app_image_rel_ro_string_entries_sorted_.empty());
+  app_image_rel_ro_string_entries_sorted_ = InitDataImgRelRoLayoutOffset(
+      app_image_rel_ro_string_entries_, sizeof(uint32_t), StringReferenceValueComparator());
 
   offset = data_img_rel_ro_start_ + data_img_rel_ro_size_;
   return offset;
@@ -3305,7 +3325,8 @@ size_t OatWriter::WriteDataImgRelRo(OutputStream* out,
                                     size_t relative_offset) {
   size_t size = boot_image_rel_ro_entries_.size() +
                 app_image_rel_ro_method_entries_.size() +
-                app_image_rel_ro_type_entries_.size();
+                app_image_rel_ro_type_entries_.size() +
+                app_image_rel_ro_string_entries_.size();
   if (size == 0u) {
     return relative_offset;
   }
@@ -3323,7 +3344,11 @@ size_t OatWriter::WriteDataImgRelRo(OutputStream* out,
   DCHECK_EQ(app_image_rel_ro_method_entries_.size(),
             app_image_rel_ro_method_entries_sorted_.size());
   DCHECK_EQ(app_image_rel_ro_type_entries_.size(), app_image_rel_ro_type_entries_sorted_.size());
-  if (!app_image_rel_ro_method_entries_.empty() || !app_image_rel_ro_type_entries_.empty()) {
+  DCHECK_EQ(app_image_rel_ro_string_entries_.size(),
+            app_image_rel_ro_string_entries_sorted_.size());
+  if (!app_image_rel_ro_method_entries_.empty() ||
+      !app_image_rel_ro_type_entries_.empty() ||
+      !app_image_rel_ro_string_entries_.empty()) {
     DCHECK(GetCompilerOptions().IsAppImage());
     ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     ScopedObjectAccess soa(Thread::Current());
@@ -3368,6 +3393,22 @@ size_t OatWriter::WriteDataImgRelRo(OutputStream* out,
           class_linker->LookupResolvedType(target_type.TypeIndex(), dex_cache, class_loader);
       CHECK(type != nullptr);
       uint32_t app_image_offset = image_writer_->GetGlobalImageOffset(type.Ptr());
+      data.push_back(app_image_offset);
+    }
+    for (size_t i : Range(app_image_rel_ro_string_entries_sorted_.size())) {
+      if (i != 0 && app_image_rel_ro_string_entries_sorted_[i]->second ==
+                        app_image_rel_ro_string_entries_sorted_[i - 1]->second) {
+        // Skip duplicates. We can do it cheaply by comparing the offsets, without the need to
+        // compare the StringReferences themselves.
+        --size;
+        continue;
+      }
+      StringReference target_string = app_image_rel_ro_string_entries_sorted_[i]->first;
+      update_for_dex_file(target_string.dex_file);
+      ObjPtr<mirror::String> string =
+          class_linker->LookupString(target_string.StringIndex(), dex_cache);
+      CHECK(string != nullptr);
+      uint32_t app_image_offset = image_writer_->GetGlobalImageOffset(string.Ptr());
       data.push_back(app_image_offset);
     }
   }
@@ -4212,17 +4253,6 @@ bool OatWriter::OatClass::Write(OatWriter* oat_writer, OutputStream* out) const 
 debug::DebugInfo OatWriter::GetDebugInfo() const {
   debug::DebugInfo debug_info{};
   debug_info.compiled_methods = ArrayRef<const debug::MethodDebugInfo>(method_info_);
-  if (VdexWillContainDexFiles()) {
-    DCHECK_EQ(dex_files_->size(), oat_dex_files_.size());
-    for (size_t i = 0, size = dex_files_->size(); i != size; ++i) {
-      const DexFile* dex_file = (*dex_files_)[i];
-      const OatDexFile& oat_dex_file = oat_dex_files_[i];
-      uint32_t dex_file_offset = oat_dex_file.dex_file_offset_;
-      if (dex_file_offset != 0) {
-        debug_info.dex_files.emplace(dex_file_offset, dex_file);
-      }
-    }
-  }
   return debug_info;
 }
 

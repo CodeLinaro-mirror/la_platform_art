@@ -61,21 +61,12 @@ void HiddenApiFinder::CollectAccesses(VeridexResolver* resolver,
   for (ClassAccessor accessor : dex_file.GetClasses()) {
     if (class_filter.Matches(accessor.GetDescriptorView())) {
       for (const ClassAccessor::Method& method : accessor.GetMethods()) {
-        std::unique_ptr<AconfigGuardFinder> aconfig_guard_finder;
-        if (ignore_aconfig_guards_ && method.GetCodeItem() != nullptr) {
-          aconfig_guard_finder =
-              std::make_unique<AconfigGuardFinder>(resolver, method, dependency_graph_);
-          aconfig_guard_finder->Run();
-        }
         CodeItemInstructionAccessor codes = method.GetInstructions();
         const uint32_t max_pc = codes.InsnsSizeInCodeUnits();
         for (const DexInstructionPcPair& inst : codes) {
           if (inst.DexPc() >= max_pc) {
             // We need to prevent abnormal access for outside of code
             break;
-          }
-          if (aconfig_guard_finder && aconfig_guard_finder->IsPcGuarded(inst.DexPc())) {
-            continue;
           }
 
           switch (inst->Opcode()) {
@@ -185,41 +176,42 @@ void HiddenApiFinder::Run(const std::vector<std::unique_ptr<VeridexResolver>>& r
   }
 }
 
+void HiddenApiFinder::DumpInternal(std::ostream& os,
+                                   HiddenApiStats* stats,
+                                   const std::string& name,
+                                   const std::vector<MethodReference>& references,
+                                   const std::string& type) {
+  if (hidden_api_.GetSignatureSource(name) != SignatureSource::APP &&
+      hidden_api_.ShouldReport(name)) {
+    stats->linking_count++;
+    hiddenapi::ApiList api_list = hidden_api_.GetApiList(name);
+    stats->api_counts[api_list.GetIntValue()]++;
+    std::string flag_info = "";
+    std::optional<std::string> flag = hidden_api_.GetFlag(name);
+    if (flag.has_value()) {
+      flag_info = ",flagged=" + flag.value();
+    }
+    os << "#" << ++stats->count << ": " << type << " " << api_list << flag_info << " " << name
+       << " use(s):";
+    os << std::endl;
+    HiddenApiFinder::DumpReferences(os, references);
+    os << std::endl;
+  }
+}
+
 void HiddenApiFinder::Dump(std::ostream& os,
                            HiddenApiStats* stats,
                            bool dump_reflection) {
   // Dump methods from hidden APIs linked against.
   for (const std::pair<const std::string,
                        std::vector<MethodReference>>& pair : method_locations_) {
-    const auto& name = pair.first;
-    if (hidden_api_.GetSignatureSource(name) != SignatureSource::APP &&
-        hidden_api_.ShouldReport(name)) {
-      stats->linking_count++;
-      hiddenapi::ApiList api_list = hidden_api_.GetApiList(pair.first);
-      stats->api_counts[api_list.GetIntValue()]++;
-      os << "#" << ++stats->count << ": Linking " << api_list << " " << pair.first << " use(s):";
-      os << std::endl;
-      HiddenApiFinder::DumpReferences(os, pair.second);
-      os << std::endl;
-    }
+    DumpInternal(os, stats, pair.first, pair.second, "Linking");
   }
 
   // Dump fields from hidden APIs linked against.
   for (const std::pair<const std::string,
                        std::vector<MethodReference>>& pair : field_locations_) {
-    const auto& name = pair.first;
-    if (hidden_api_.GetSignatureSource(name) != SignatureSource::APP &&
-        hidden_api_.ShouldReport(name)) {
-      stats->linking_count++;
-      hiddenapi::ApiList api_list = hidden_api_.GetApiList(pair.first);
-      stats->api_counts[api_list.GetIntValue()]++;
-      // Note: There is a test depending on this output format,
-      // so please be careful when you modify the format. b/123662832
-      os << "#" << ++stats->count << ": Linking " << api_list << " " << pair.first << " use(s):";
-      os << std::endl;
-      HiddenApiFinder::DumpReferences(os, pair.second);
-      os << std::endl;
-    }
+    DumpInternal(os, stats, pair.first, pair.second, "Linking");
   }
 
   if (dump_reflection) {
@@ -234,8 +226,13 @@ void HiddenApiFinder::Dump(std::ostream& os,
           stats->reflection_count++;
           // Note: There is a test depending on this output format,
           // so please be careful when you modify the format. b/123662832
-          os << "#" << ++stats->count << ": Reflection " << api_list << " " << full_name
-             << " potential use(s):";
+          std::string flag_info = "";
+          std::optional<std::string> flag = hidden_api_.GetFlag(full_name);
+          if (flag.has_value()) {
+            flag_info = ",flagged=" + flag.value();
+          }
+          os << "#" << ++stats->count << ": Reflection " << api_list << flag_info << " "
+             << full_name << " potential use(s):";
           os << std::endl;
           HiddenApiFinder::DumpReferences(os, reflection_locations_[name]);
           os << std::endl;

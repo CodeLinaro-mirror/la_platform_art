@@ -49,6 +49,7 @@ static constexpr size_t kRuntimeParameterFpuRegistersLength =
     arraysize(kRuntimeParameterFpuRegisters);
 
 #define UNIMPLEMENTED_INTRINSIC_LIST_X86(V) \
+  V(ClassIsAssignableFrom)                  \
   V(MathSignumFloat)                        \
   V(MathSignumDouble)                       \
   V(MathCopySignFloat)                      \
@@ -552,6 +553,7 @@ class CodeGeneratorX86 : public CodeGenerator {
   void RecordAppImageTypePatch(HLoadClass* load_class);
   Label* NewTypeBssEntryPatch(HLoadClass* load_class);
   void RecordBootImageStringPatch(HLoadString* load_string);
+  void RecordAppImageStringPatch(HLoadString* load_string);
   Label* NewStringBssEntryPatch(HLoadString* load_string);
   void RecordBootImageJniEntrypointPatch(HInvokeStaticOrDirect* invoke);
 
@@ -752,6 +754,8 @@ class CodeGeneratorX86 : public CodeGenerator {
   // The correct value will be inserted when processing Assembler fixups.
   static constexpr int32_t kPlaceholder32BitOffset = 256;
 
+  bool IsIntrinsicCallFree(HInvoke* invoke) const override;
+
  private:
   static RegisterSet ComputeCalleeSaves();
   static RegisterSet ComputeBlockedRegisters();
@@ -798,6 +802,8 @@ class CodeGeneratorX86 : public CodeGenerator {
   ArenaDeque<X86PcRelativePatchInfo> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<X86PcRelativePatchInfo> boot_image_string_patches_;
+  // PC-relative String patch info for kAppImageRelRo.
+  ArenaDeque<X86PcRelativePatchInfo> app_image_string_patches_;
   // PC-relative String patch info for kBssEntry.
   ArenaDeque<X86PcRelativePatchInfo> string_bss_entry_patches_;
   // PC-relative method patch info for kBootImageLinkTimePcRelative+kCallCriticalNative.

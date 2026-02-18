@@ -143,7 +143,6 @@
 #include "native/java_lang_reflect_Method.h"
 #include "native/java_lang_reflect_Parameter.h"
 #include "native/java_lang_reflect_Proxy.h"
-#include "native/java_util_concurrent_atomic_AtomicLong.h"
 #include "native/jdk_internal_misc_Unsafe.h"
 #include "native/jdk_internal_vm_Continuation.h"
 #include "native/libcore_io_Memory.h"
@@ -542,7 +541,6 @@ Runtime::~Runtime() {
   delete oat_file_manager_;
   oat_file_manager_ = nullptr;
   Thread::Shutdown();
-  QuasiAtomic::Shutdown();
 
   // Destroy allocators before shutting down the MemMap because they may use it.
   java_vm_.reset();
@@ -1640,8 +1638,6 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
 
   VLOG(startup) << "Runtime::Init -verbose:startup enabled";
 
-  QuasiAtomic::Startup();
-
   oat_file_manager_ = new OatFileManager();
 
   jni_id_manager_.reset(new jni::JniIdManager());
@@ -1753,18 +1749,17 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // hiddenapi_platform_enforcement flag is set, otherwise the checks are
   // disabled by default and can be enabled with a command line flag.
   // AndroidRuntime will pass the flag if a system property is set.
-  // TODO(b/377676642): Replace flag with SDK level check when ramped.
   {
     bool always_enable = false;
 #ifdef ART_TARGET_ANDROID
-    if (com::android::art::flags::hiddenapi_platform_enforcement()) {
+    if (hiddenapi::EnableHiddenapiPlatformEnforcement()) {
       always_enable = true;
     }
 #endif
     const char* reason;
     if (always_enable) {
       core_platform_api_policy_ = hiddenapi::EnforcementPolicy::kEnabled;
-      reason = "from the hiddenapi_platform_enforcement flag";
+      reason = "from the hiddenapi_platform_enforcement flag and the device API level";
     } else {
       core_platform_api_policy_ = runtime_options.GetOrDefault(Opt::CorePlatformApiPolicy);
       reason = "by runtime option";
@@ -1808,6 +1803,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // for (auto lib : runtime_options.ReleaseOrDefault(Opt::AgentLib)) {
   //   agents_.push_back(lib);
   // }
+
+  if (InstructionSetFeatures::IsRuntimeDetectionSupported()) {
+    runtime_instruction_set_features_ = InstructionSetFeatures::FromRuntimeDetection();
+  }
 
   float foreground_heap_growth_multiplier;
   if (is_low_memory_mode_ && !runtime_options.Exists(Opt::ForegroundHeapGrowthMultiplier)) {
@@ -1986,9 +1985,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   }
 
 #ifdef ART_USE_RESTRICTED_MODE
-  // TODO(Simulator): support signal handling and implicit checks.
+  // TODO(Simulator): support implicit suspend checks.
   implicit_suspend_checks_ = false;
-  implicit_null_checks_ = false;
 #endif  // ART_USE_RESTRICTED_MODE
 
   fault_manager.Init(!no_sig_chain_);
@@ -2009,8 +2007,13 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
       }
 
       if (implicit_null_checks_) {
+#ifdef ART_USE_SIMULATOR
+        fault_manager.AddHandler(new NullPointerHandlerSimulator(),
+                                 NullPointerHandlerSimulator::IsGeneratedCodeHandler());
+#else
         fault_manager.AddHandler(new NullPointerHandler(),
                                  NullPointerHandler::IsGeneratedCodeHandler());
+#endif
       }
 
       if (kEnableJavaStackTraceHandler) {
@@ -2505,7 +2508,6 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   register_java_lang_Thread(env);
   register_java_lang_Throwable(env);
   register_java_lang_VMClassLoader(env);
-  register_java_util_concurrent_atomic_AtomicLong(env);
   register_jdk_internal_misc_Unsafe(env);
   register_jdk_internal_vm_Continuation(env);
   register_libcore_io_Memory(env);

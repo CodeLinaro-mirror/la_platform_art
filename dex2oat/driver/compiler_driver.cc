@@ -279,30 +279,35 @@ CompilerDriver::~CompilerDriver() {
       });
 }
 
+#define CREATE_TRAMPOLINE_IMPL(isa, isa_features, type, abi, offset)                     \
+  if (Is64BitInstructionSet((isa))) {                                                    \
+    return CreateTrampoline64(                                                           \
+        (isa), (isa_features), abi, type##_ENTRYPOINT_OFFSET(PointerSize::k64, offset)); \
+  } else {                                                                               \
+    return CreateTrampoline32(                                                           \
+        (isa), (isa_features), abi, type##_ENTRYPOINT_OFFSET(PointerSize::k32, offset)); \
+  }
 
-#define CREATE_TRAMPOLINE_IMPL(isa, type, abi, offset)                                  \
-    if (Is64BitInstructionSet((isa))) {                                                 \
-      return CreateTrampoline64((isa),                                                  \
-                                abi,                                                    \
-                                type ## _ENTRYPOINT_OFFSET(PointerSize::k64, offset));  \
-    } else {                                                                            \
-      return CreateTrampoline32((isa),                                                  \
-                                abi,                                                    \
-                                type ## _ENTRYPOINT_OFFSET(PointerSize::k32, offset));  \
-    }
-
-#define CREATE_TRAMPOLINE(type, abi, offset)                                            \
-    CREATE_TRAMPOLINE_IMPL(GetCompilerOptions().GetInstructionSet(), type, abi, offset)
+#define CREATE_TRAMPOLINE(type, abi, offset)                               \
+  CREATE_TRAMPOLINE_IMPL(GetCompilerOptions().GetInstructionSet(),         \
+                         GetCompilerOptions().GetInstructionSetFeatures(), \
+                         type,                                             \
+                         abi,                                              \
+                         offset)
 
 std::unique_ptr<const std::vector<uint8_t>>
     CompilerDriver::CreateJniDlsymLookupTrampoline() const {
 #ifdef ART_USE_SIMULATOR
   // In simulator mode the dlsymLookup trampoline is executed in native ISA, not quick code isa.
   InstructionSet trampoline_isa = kRuntimeISA;
+  // Don't assume any specialized ISA features.
+  const InstructionSetFeatures* trampoline_isa_features = nullptr;
 #else
   InstructionSet trampoline_isa = GetCompilerOptions().GetInstructionSet();
+  const InstructionSetFeatures* trampoline_isa_features =
+      GetCompilerOptions().GetInstructionSetFeatures();
 #endif
-  CREATE_TRAMPOLINE_IMPL(trampoline_isa, JNI, kJniAbi, pDlsymLookup)
+  CREATE_TRAMPOLINE_IMPL(trampoline_isa, trampoline_isa_features, JNI, kJniAbi, pDlsymLookup)
 }
 
 std::unique_ptr<const std::vector<uint8_t>>
@@ -614,7 +619,8 @@ void CompilerDriver::CollectStringsForLinkerPatches(
       [&]([[maybe_unused]] const DexFileReference& ref, CompiledMethod* method) {
         if (method != nullptr) {
           for (const linker::LinkerPatch& patch : method->GetPatches()) {
-            if (patch.GetType() == linker::LinkerPatch::Type::kStringRelative) {
+            if (patch.GetType() == linker::LinkerPatch::Type::kStringRelative ||
+                patch.GetType() == linker::LinkerPatch::Type::kStringAppImageRelRo) {
               StringReference target_string = patch.TargetString();
               if (last_dex_file != target_string.dex_file) {
                 last_dex_file = target_string.dex_file;

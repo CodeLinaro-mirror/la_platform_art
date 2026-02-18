@@ -29,13 +29,13 @@
 #include "base/gc_visited_arena_pool.h"
 #include "base/macros.h"
 #include "base/mutex.h"
+#include "base/offsets.h"
 #include "garbage_collector.h"
 #include "gc/accounting/atomic_stack.h"
 #include "gc/accounting/bitmap-inl.h"
 #include "gc/accounting/heap_bitmap.h"
 #include "gc_root.h"
 #include "immune_spaces.h"
-#include "offsets.h"
 #include "scoped_thread_priority_change.h"
 
 namespace art HIDDEN {
@@ -538,7 +538,7 @@ class MarkCompact final : public GarbageCollector {
       REQUIRES(Locks::heap_bitmap_lock_);
   // Scan (only) immune spaces looking for references into the garbage collected
   // spaces.
-  void UpdateAndMarkModUnion() REQUIRES_SHARED(Locks::mutator_lock_)
+  NO_INLINE void UpdateAndMarkModUnion() REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(Locks::heap_bitmap_lock_);
   // Scan mod-union and card tables, covering all the spaces, to identify dirty objects.
   // These are in 'minimum age' cards, which is 'kCardAged' in case of concurrent (second round)
@@ -723,7 +723,8 @@ class MarkCompact final : public GarbageCollector {
   void SetBitForMidToOldPromotion(uint8_t* obj);
   // Scan old-gen for young GCs by looking for cards that are at least 'aged' in
   // the card-table corresponding to moving and non-moving spaces.
-  void ScanOldGenObjects() REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_);
+  NO_INLINE void ScanOldGenObjects() REQUIRES(Locks::heap_bitmap_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
   // Return free pages from 'from-space' to be reused. Returns nullptr if 'size'
   // worth of contiguous pages are not available. 'size' must be a multiple of
   // page-size.

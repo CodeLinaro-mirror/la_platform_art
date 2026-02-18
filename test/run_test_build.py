@@ -68,13 +68,13 @@ TRADEFED_DISABLED = {
 }
 
 TRADEFED_VARIANTS = [
-    # ["--debug", "--baseline"],
-    # ["--debug", "--interpreter"],
-    # ["--debug", "--jit", "--debuggable"],
-    # ["--debug", "--jit"],
-    # ["--debug", "--optimizing", "--debuggable"],
+    ["--debug", "--baseline"],
+    ["--debug", "--interpreter"],
+    ["--debug", "--jit", "--debuggable"],
+    ["--debug", "--jit"],
+    ["--debug", "--optimizing", "--debuggable"],
     ["--debug", "--optimizing"],
-    # ["--debug", "--speed-profile"],
+    ["--debug", "--speed-profile"],
 ]
 
 # Debug option. Report commands that are taking a lot of user CPU time.
@@ -84,6 +84,7 @@ class BuildTestContext:
   def __init__(self, args, android_build_top, test_dir):
     self.android_build_top = android_build_top.absolute()
     self.bootclasspath = args.bootclasspath.absolute()
+    self.systemmodule = args.systemmodule.absolute()
     self.test_name = test_dir.name
     self.test_dir = test_dir.absolute()
     self.mode = args.mode
@@ -345,12 +346,20 @@ class BuildTestContext:
       args = self.javac_args.split(" ") + javac_args
       args += ["-implicit:none", "-encoding", "utf8", "-d", dst_dir]
       args += ["-source", javac_source_arg, "-target", javac_target_arg]
-      if not self.jvm and float(javac_target_arg) < 17.0:
-        args += ["-bootclasspath", self.bootclasspath]
+      if not self.jvm:
+        # Use the bootclasspath/system module that contains libcore classes
+        if float(javac_target_arg) < 17.0:
+          args += ["-bootclasspath", self.bootclasspath]
+        else:
+          module_zip = Path(self.systemmodule)
+          module_dir = module_zip.parent / module_zip.stem
+          zipfile.ZipFile(module_zip, "r").extractall(module_dir)
+          args += ["--system", module_dir]
       if javac_classpath:
         args += ["-classpath", javac_classpath]
       for src_dir in src_dirs:
         args += sorted(src_dir.glob("**/*.java"))
+
       self.javac(args)
       javac_post = Path("javac_post.sh")
       if javac_post.exists():
@@ -584,34 +593,35 @@ def create_setup_script(bitness, isa):
 # We generate distinct scripts for all of the pre-defined variants.
 def create_ci_runner_scripts(out, mode, test_names, bitness, isa, tags) -> List[Dict[str, Any]]:
   assert bitness in {32, 64}
-  DEVICE_DIR = "/data/local/tmp/art"
+  DEVICE_DIR = Path("/data/local/tmp/art")
   out.mkdir(parents=True, exist_ok=True)
   old_files = set(Path(out).glob("*/*.sh"))
 
   # Very simple wrapper to isolate the test execution.
   # It is not full/proper chroot, and uses simpler solution for now.
-  # It runs in 'unshare' and makes the mount points independent for this process.
-  # This means we keep most of the file system as-is, but re-mount only ART apex.
-  # (which is visible only to this process, so there is no unmount needed later)
-  chroot = out / f"chroot.{isa}.sh"
-  chroot.write_text("\n".join([
+  # It runs in 'unshare' to make the mount points independent for this process
+  # (which applies only to this process, so there is no unmount needed later).
+  wrapper1 = out / f"wrapper1.{isa}.sh"
+  wrapper1.write_text("\n".join([
     "#!/bin/sh",
     "set -e",
-    f"su root unshare --mount sh {DEVICE_DIR}/chroot2.{isa}.sh $@",
+    f"su root unshare --mount sh {DEVICE_DIR}/wrapper2.{isa}.sh $@",
   ]))
-  chroot2 = out / f"chroot2.{isa}.sh"
-  chroot2.write_text("\n".join([
+
+  # Inner wrapper - keep most of the file system as-is and bind-mount only the ART apex.
+  wrapper2 = out / f"wrapper2.{isa}.sh"
+  wrapper2.write_text("\n".join([
     "#!/bin/sh",
     "set -e",
     f"mount --bind {DEVICE_DIR}/apex/com.android.art /apex/com.android.art",
     "sh $@",
   ]))
+  wrap = ["sh", f"{DEVICE_DIR}/{wrapper1.name}"]
 
   setup = out / f"setup.{isa}.sh"
   setup_script = [
     "#!/bin/sh",
     "set -e",
-    f"chmod +x {DEVICE_DIR}/apex/com.android.art/bin/*",
   ] + create_setup_script(bitness, isa)
   setup.write_text("\n".join(setup_script))
   test_names = list(set(test_names) - TRADEFED_DISABLED)
@@ -626,7 +636,7 @@ def create_ci_runner_scripts(out, mode, test_names, bitness, isa, tags) -> List[
     "TARGET_ARCH": isa,
     "TMPDIR": Path(getcwd()) / "tmp",
   }
-  for variant in TRADEFED_VARIANTS :
+  for variant in TRADEFED_VARIANTS:
     args = [
       f"--run-test-option=--create-runner={out}",
       f"-j={cpu_count()}",
@@ -634,21 +644,22 @@ def create_ci_runner_scripts(out, mode, test_names, bitness, isa, tags) -> List[
       f"--{bitness}",
     ] + variant
     run([python, script] + args + test_names, env=envs, check=True)
-  tests: List[Dict[str, Any]] = [
-    {
-      "name": f"run-test-{isa}.setup#compile-boot-image",
-      "tags": tags,
-      "cmds": [
-        {"kind": "push", "args": ["../apex/com.android.art", f"{DEVICE_DIR}/apex/com.android.art"]},
-        {"kind": "push", "args": [f"{chroot.name}", f"{DEVICE_DIR}/{chroot.name}"]},
-        {"kind": "push", "args": [f"{chroot2.name}", f"{DEVICE_DIR}/{chroot2.name}"]},
-        {"kind": "push", "args": [f"{setup.name}", f"{DEVICE_DIR}/{setup.name}"]},
-        {"kind": "shell", "args": ["rm", "-rf", f"{DEVICE_DIR}/test"]},
-        {"kind": "shell", "args": ["sh", f"{DEVICE_DIR}/{chroot.name}",
-                                   f"{DEVICE_DIR}/{setup.name}"]},
-      ],
-    },
-  ]
+
+  def make_setup() -> Dict[str, Any]:
+    name = f"run-test-{isa}.setup#compile-boot-image"
+    cmds: List[Dict[str, Any]] = [
+      {"kind": "push", "args": ["../apex/com.android.art", f"{DEVICE_DIR}/apex/com.android.art"]},
+      {"kind": "push", "args": [f"{wrapper1.name}", f"{DEVICE_DIR}/{wrapper1.name}"]},
+      {"kind": "push", "args": [f"{wrapper2.name}", f"{DEVICE_DIR}/{wrapper2.name}"]},
+      {"kind": "shell", "args": [f"chmod +x {DEVICE_DIR}/apex/com.android.art/bin/*"]},
+      {"kind": "push", "args": [f"{setup.name}", f"{DEVICE_DIR}/{setup.name}"]},
+      {"kind": "shell", "args": ["rm", "-rf", f"{DEVICE_DIR}/test"]},
+      {"kind": "shell", "args": wrap + [f"{DEVICE_DIR}/{setup.name}"]},
+    ]
+    return {"name": name, "tags": tags, "cmds": cmds}
+
+  setup = make_setup()
+  tests: List[Dict[str, Any]] = [setup]
   for runner in sorted(set(Path(out).glob("*/*.sh")) - old_files):
     test_name = runner.parent.name
     m = re.search("FULL_TEST_NAME=(.*)", runner.read_text())
@@ -660,11 +671,11 @@ def create_ci_runner_scripts(out, mode, test_names, bitness, isa, tags) -> List[
     tests.append({
       "name": full_name,
       "tags": tags,
-      "deps": [f"run-test-{isa}.setup#compile-boot-image"],
+      "deps": [setup["name"]],
       "cmds": [
         {"kind": "push", "args": [f"../{mode}/{test_name}", f"{target_dir}"]},
         {"kind": "push", "args": [str(runner.relative_to(out)), f"{target_dir}/run.sh"]},
-        {"kind": "shell", "args": ["sh", f"{DEVICE_DIR}/{chroot.name}", f"{target_dir}/run.sh"]},
+        {"kind": "shell", "args": wrap + [f"{target_dir}/run.sh"]},
       ],
     })
   return tests
@@ -691,6 +702,7 @@ def main() -> None:
   parser.add_argument("--out", type=Path, help="Final zip file")
   parser.add_argument("--mode", choices=["host", "jvm", "target"])
   parser.add_argument("--bootclasspath", type=Path)
+  parser.add_argument("--systemmodule", type=Path)
   parser.add_argument("--d8", type=Path)
   parser.add_argument("--hiddenapi", type=Path)
   parser.add_argument("--jasmin", type=Path)
@@ -745,6 +757,7 @@ def main() -> None:
         (32, "x86", ["x86"]),
         (64, "x86_64", ["x86_64"]),
       ]:
+      tags += ["root"]
       tests += create_ci_runner_scripts(out, args.mode, test_names, bitness, isa, tags)
     dst.write_text(json.dumps(tests, indent=2))
 

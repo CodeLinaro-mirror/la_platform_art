@@ -31,6 +31,7 @@
 #include "base/iteration_range.h"
 #include "base/macros.h"
 #include "base/mutex.h"
+#include "base/offsets.h"
 #include "base/quasi_atomic.h"
 #include "base/stl_util.h"
 #include "base/transform_array_ref.h"
@@ -53,7 +54,6 @@
 #include "loop_information.h"
 #include "mirror/class.h"
 #include "mirror/method_type.h"
-#include "offsets.h"
 #include "reference_type_info.h"
 
 namespace art HIDDEN {
@@ -6187,6 +6187,10 @@ class HLoadString final : public HInstruction {
     // Used for boot image strings referenced by apps in AOT-compiled code.
     kBootImageRelRo,
 
+    // Load from an app image entry in the .data.img.rel.ro using a PC-relative load.
+    // Used for app image strings referenced by apps in AOT-compiled code.
+    kAppImageRelRo,
+
     // Load from an entry in the .bss section using a PC-relative load.
     // Used for strings outside boot image referenced by AOT-compiled app and boot image code.
     kBssEntry,
@@ -6233,6 +6237,7 @@ class HLoadString final : public HInstruction {
   bool HasPcRelativeLoadKind() const {
     return GetLoadKind() == LoadKind::kBootImageLinkTimePcRelative ||
            GetLoadKind() == LoadKind::kBootImageRelRo ||
+           GetLoadKind() == LoadKind::kAppImageRelRo ||
            GetLoadKind() == LoadKind::kBssEntry;
   }
 
@@ -6264,6 +6269,7 @@ class HLoadString final : public HInstruction {
     LoadKind load_kind = GetLoadKind();
     if (load_kind == LoadKind::kBootImageLinkTimePcRelative ||
         load_kind == LoadKind::kBootImageRelRo ||
+        load_kind == LoadKind::kAppImageRelRo ||
         load_kind == LoadKind::kJitBootImageAddress ||
         load_kind == LoadKind::kJitTableAddress) {
       return false;
@@ -6334,6 +6340,7 @@ inline void HLoadString::AddSpecialInput(HInstruction* special_input) {
   // including literal pool loads, which are PC-relative too.
   DCHECK(GetLoadKind() == LoadKind::kBootImageLinkTimePcRelative ||
          GetLoadKind() == LoadKind::kBootImageRelRo ||
+         GetLoadKind() == LoadKind::kAppImageRelRo ||
          GetLoadKind() == LoadKind::kBssEntry ||
          GetLoadKind() == LoadKind::kJitBootImageAddress) << GetLoadKind();
   // HLoadString::GetInputRecords() returns an empty array at this point,
@@ -6375,7 +6382,7 @@ class HLoadMethodHandle final : public HInstruction {
   }
 
   bool CanThrow() const override { return true; }
-
+  bool CanBeNull() const override { return false; }
   bool NeedsEnvironment() const override { return true; }
 
   DECLARE_INSTRUCTION(LoadMethodHandle);
@@ -6447,7 +6454,7 @@ class HLoadMethodType final : public HInstruction {
   }
 
   bool CanThrow() const override { return true; }
-
+  bool CanBeNull() const override { return false; }
   bool NeedsEnvironment() const override { return true; }
 
   DECLARE_INSTRUCTION(LoadMethodType);
@@ -6945,15 +6952,22 @@ class HTypeCheckInstruction : public HVariableInputSizeInstruction {
       SetRawInputAt(2, bitstring_path_to_root);
       SetRawInputAt(3, bitstring_mask);
     } else {
-      DCHECK(target_class_or_null->IsLoadClass());
+      if (kind == kCheckCast) {
+        DCHECK(target_class_or_null->IsLoadClass());
+      } else {
+        DCHECK_EQ(kind, kInstanceOf);
+        DCHECK(target_class_or_null->IsLoadClass() || target_class_or_null->IsFieldAccess());
+        DCHECK_IMPLIES(target_class_or_null->IsFieldAccess(),
+                       target_class_or_null->AsFieldAccess()->HasConstantValue());
+      }
     }
   }
 
-  HLoadClass* GetTargetClass() const {
+  HInstruction* GetTargetClass() const {
     DCHECK_NE(GetTypeCheckKind(), TypeCheckKind::kBitstringCheck);
-    HInstruction* load_class = InputAt(1);
-    DCHECK(load_class->IsLoadClass());
-    return load_class->AsLoadClass();
+    HInstruction* target_class = InputAt(1);
+    DCHECK(target_class->IsLoadClass() || target_class->IsFieldAccess());
+    return target_class;
   }
 
   uint32_t GetBitstringPathToRoot() const {

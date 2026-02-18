@@ -121,6 +121,7 @@ using VIXLInt32Literal = vixl::aarch32::Literal<int32_t>;
 using VIXLUInt32Literal = vixl::aarch32::Literal<uint32_t>;
 
 #define UNIMPLEMENTED_INTRINSIC_LIST_ARM(V)                                \
+  V(ClassIsAssignableFrom)                                                 \
   V(MathSignumFloat)                                                       \
   V(MathSignumDouble)                                                      \
   V(MathCopySignFloat)                                                     \
@@ -724,6 +725,8 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   PcRelativePatchInfo* NewTypeBssEntryPatch(HLoadClass* load_class);
   PcRelativePatchInfo* NewBootImageStringPatch(const DexFile& dex_file,
                                                dex::StringIndex string_index);
+  PcRelativePatchInfo* NewAppImageStringPatch(const DexFile& dex_file,
+                                              dex::StringIndex string_index);
   PcRelativePatchInfo* NewStringBssEntryPatch(const DexFile& dex_file,
                                               dex::StringIndex string_index);
 
@@ -915,6 +918,8 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, vixl32::Register klass);
   void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
+  bool IsIntrinsicCallFree(HInvoke* invoke) const override;
+
  private:
   static RegisterSet ComputeCalleeSaves();
   static RegisterSet ComputeBlockedRegisters(HGraph* graph);
@@ -1058,6 +1063,8 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   ArenaDeque<PcRelativePatchInfo> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_string_patches_;
+  // PC-relative String patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_string_patches_;
   // PC-relative String patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> string_bss_entry_patches_;
   // PC-relative patch info for IntrinsicObjects for the boot image,

@@ -56,7 +56,7 @@ luci.project(
                 acl.PROJECT_CONFIGS_READER,
                 acl.SCHEDULER_READER,
             ],
-            groups = "googlers",
+            groups = "mdb/android-team",
         ),
         acl.entry(
             roles = [
@@ -77,7 +77,7 @@ luci.project(
         ),
         luci.binding(
             roles = "role/swarming.poolViewer",
-            groups = "googlers",
+            groups = "mdb/android-team",
         ),
     ],
 )
@@ -191,7 +191,7 @@ luci.cq_group(
             roles = [
                 acl.CQ_COMMITTER,
             ],
-            groups = "googlers",
+            groups = "mdb/android-team",
         ),
     ],
 )
@@ -360,8 +360,8 @@ def add_builders():
       add_builder(mode, arch, bitness, poison=True)
       add_builder(mode, arch, bitness, gcstress=True)
       add_builder(mode, arch, bitness, cmc=True, gcstress=True)
-      add_builder(mode, arch, bitness, continuousgc=True, hidden=True)
-      add_builder(mode, arch, bitness, cmc=True, continuousgc=True, hidden=True)
+      add_builder(mode, arch, bitness, continuousgc=True)
+      add_builder(mode, arch, bitness, cmc=True, continuousgc=True)
       add_builder(mode, arch, bitness, build_only=True, hidden=True, presubmit=True)
   add_builder('qemu', 'arm', bitness=64)
   add_builder('qemu', 'riscv', bitness=64)
