@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2026 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,20 +14,8 @@
  * limitations under the License.
  */
 
-package com.android.ahat.progress;
-
-/**
- * Null progress tracker that ignores all updates.
- */
-public class NullProgress implements Progress {
-  /**
-   * Constructs a new NullProgress.
-   */
-  public NullProgress() {}
-
-  @Override public void start(String description, long duration) { }
-  @Override public void advance() { }
-  @Override public void advance(long n) { }
-  @Override public void update(long current) { }
-  @Override public void done() { }
+public class Main {
+    public static void main(String args[]) {
+        PackedSwitch.main();
+    }
 }

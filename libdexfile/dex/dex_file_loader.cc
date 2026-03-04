@@ -142,11 +142,11 @@ bool DexFileLoader::IsMultiDexLocation(std::string_view location) {
   return location.find(kMultiDexSeparator) != std::string_view::npos;
 }
 
-std::string DexFileLoader::GetMultiDexClassesDexName(size_t index) {
+std::string DexFileLoader::GetMultiDexZipEntryName(size_t index) {
   return (index == 0) ? "classes.dex" : StringPrintf("classes%zu.dex", index + 1);
 }
 
-std::string DexFileLoader::GetMultiDexLocation(size_t index, const char* dex_location) {
+std::string DexFileLoader::GetMultiDexLocation(const char* dex_location, size_t index) {
   DCHECK(!IsMultiDexLocation(dex_location));
   if (index == 0) {
     return dex_location;
@@ -177,7 +177,7 @@ bool DexFileLoader::GetMultiDexChecksums(
       *only_contains_uncompressed_dex = true;
     }
     for (size_t i = 0;; ++i) {
-      std::string name = GetMultiDexClassesDexName(i);
+      std::string name = GetMultiDexZipEntryName(i);
       std::unique_ptr<ZipEntry> zip_entry(zip_archive->Find(name.c_str(), error_msg));
       if (zip_entry == nullptr) {
         break;
@@ -187,7 +187,7 @@ bool DexFileLoader::GetMultiDexChecksums(
           *only_contains_uncompressed_dex = false;
         }
       }
-      checksums->emplace_back(GetMultiDexLocation(i, location_.c_str()), zip_entry->GetCrc32());
+      checksums->emplace_back(GetMultiDexLocation(location_.c_str(), i), zip_entry->GetCrc32());
     }
     return true;
   }
@@ -208,7 +208,7 @@ bool DexFileLoader::GetMultiDexChecksums(
       *error_msg = StringPrintf("Truncated dex file: '%s'", filename_.c_str());
       return false;
     }
-    checksums->emplace_back(GetMultiDexLocation(i++, location_.c_str()), header->checksum_);
+    checksums->emplace_back(GetMultiDexLocation(location_.c_str(), i++), header->checksum_);
     ptr += header->file_size_;
   }
   return true;
@@ -381,7 +381,7 @@ bool DexFileLoader::Open(bool verify,
     }
     size_t multidex_count = 0;
     for (size_t i = 0;; ++i) {
-      std::string name = GetMultiDexClassesDexName(i);
+      std::string name = GetMultiDexZipEntryName(i);
       bool ok = OpenFromZipEntry(*zip_archive,
                                  name.c_str(),
                                  location_,
@@ -413,7 +413,7 @@ bool DexFileLoader::Open(bool verify,
     DCHECK(root_container_ != nullptr);
     size_t header_offset = 0;
     for (size_t i = 0;; i++) {
-      std::string multidex_location = GetMultiDexLocation(i, location_.c_str());
+      std::string multidex_location = GetMultiDexLocation(location_.c_str(), i);
       std::unique_ptr<const DexFile> dex_file =
           OpenCommon(root_container_,
                      root_container_->Begin() + header_offset,
@@ -559,7 +559,7 @@ bool DexFileLoader::OpenFromZipEntry(const ZipArchive& zip_archive,
 
   size_t header_offset = 0;
   for (size_t i = 0;; i++) {
-    std::string multidex_location = GetMultiDexLocation(*multidex_count, location.c_str());
+    std::string multidex_location = GetMultiDexLocation(location.c_str(), *multidex_count);
     ++(*multidex_count);
     uint32_t multidex_checksum = zip_entry->GetCrc32() + i;
     std::unique_ptr<const DexFile> dex_file = OpenCommon(container,

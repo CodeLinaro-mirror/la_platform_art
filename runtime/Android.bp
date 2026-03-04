@@ -987,8 +987,11 @@ art_cc_library_static {
 // Release version of the ART runtime library, bundled with `libart-compiler` for JIT support.
 art_cc_library {
     name: "libart",
-    defaults: ["libart_defaults"],
+    defaults: [
+        "libart_defaults",
+    ],
     sdclang: false,
+
     whole_static_libs: [
         "libart-compiler",
         "libart-runtime",
