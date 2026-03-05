@@ -621,7 +621,7 @@
    call nterp_get_static_field  // result a0 := resolved_field
 
    // Test for volatile bit
-   slli t0, a0, 31
+   slli t0, a0, 32
    bgez t0, .L${opcode}_slow_resume
 %  volatile_path = add_slow_path(op_sget_volatile, width, zext, "s7", "t0", "t1")
    tail $volatile_path
@@ -707,7 +707,7 @@
    call nterp_get_static_field  // result a0 := resolved_field
 
    // Test for volatile bit
-   slli $z0, a0, 31
+   slli $z0, a0, 32
    bltz $z0, .L${opcode}_volatile
    tail .L${opcode}_slow_resume  // resume offset exceeds branch imm
 
@@ -802,7 +802,7 @@
    call nterp_get_static_field  // result a0 := resolved_field
 
    // Test for volatile bit
-   slli t0, a0, 31
+   slli t0, a0, 32
    bgez t0, .L${opcode}_slow_resume
 %  volatile_path = add_slow_path(op_sput_volatile, width, "s7", "t0", "t1")
    tail $volatile_path
@@ -898,7 +898,7 @@
 %  get_vreg(value, src_vreg, is_unsigned=True)  # value := fp[AA], zext
 
    // Test for volatile bit
-   slli $z0, a0, 31
+   slli $z0, a0, 32
    bltz $z0, .L${opcode}_volatile
    tail .L${opcode}_slow_resume  // resume offset exceeds branch imm
 
