@@ -22,6 +22,7 @@
 #include "data_type-inl.h"
 #include "driver/compiler_options.h"
 #include "escape.h"
+#include "handle_cache-inl.h"
 #include "intrinsic_objects.h"
 #include "intrinsics.h"
 #include "intrinsics_utils.h"
@@ -51,6 +52,9 @@ class InstructionSimplifierVisitor final : public CRTPGraphVisitor<InstructionSi
         be_loop_friendly_(be_loop_friendly) {}
 
   bool Run();
+
+  bool CanUseKnownImageVarHandle(HInvoke* invoke);
+  static bool CanEnsureNotNullAt(HInstruction* input, HInstruction* at);
 
  private:
   void RecordSimplification() {
@@ -169,9 +173,7 @@ class InstructionSimplifierVisitor final : public CRTPGraphVisitor<InstructionSi
   void SimplifyAllocationIntrinsic(HInvoke* invoke);
   void SimplifyVarHandleIntrinsic(HInvoke* invoke);
   void SimplifyArrayBaseOffset(HInvoke* invoke);
-
-  bool CanUseKnownImageVarHandle(HInvoke* invoke);
-  static bool CanEnsureNotNullAt(HInstruction* input, HInstruction* at);
+  void SimplifyClassIsAssignableFrom(HInvoke* invoke);
 
   // Returns an instruction with the opposite Boolean value from 'cond'.
   // The instruction is inserted into the graph, either in the entry block
@@ -763,7 +765,8 @@ void InstructionSimplifierVisitor::VisitCheckCast(HCheckCast* check_cast) {
       check_cast->GetBlock()->RemoveInstruction(check_cast);
       MaybeRecordStat(stats_, MethodCompilationStat::kRemovedCheckedCast);
       if (check_cast->GetTypeCheckKind() != TypeCheckKind::kBitstringCheck) {
-        HLoadClass* load_class = check_cast->GetTargetClass();
+        DCHECK(check_cast->GetTargetClass()->IsLoadClass());
+        HLoadClass* load_class = check_cast->GetTargetClass()->AsLoadClass();
         if (!load_class->HasUses() && !load_class->NeedsAccessCheck()) {
           // We cannot rely on DCE to remove the class because the `HLoadClass` thinks it can throw.
           // However, here we know that it cannot because the checkcast was successful, hence
@@ -819,13 +822,19 @@ void InstructionSimplifierVisitor::VisitInstanceOf(HInstanceOf* instruction) {
     RecordSimplification();
     instruction->GetBlock()->RemoveInstruction(instruction);
     if (outcome && instruction->GetTypeCheckKind() != TypeCheckKind::kBitstringCheck) {
-      HLoadClass* load_class = instruction->GetTargetClass();
-      if (!load_class->HasUses() && !load_class->NeedsAccessCheck()) {
+      HInstruction* target_class = instruction->GetTargetClass();
+      DCHECK_IMPLIES(!target_class->IsLoadClass(), target_class->IsFieldAccess());
+      bool needs_access_check = target_class->IsLoadClass()
+          ? target_class->AsLoadClass()->NeedsAccessCheck()
+          // If target_class is FieldAccess then `java.lang.Class` instance was already obtained
+          // and access checks are not needed.
+          : false;
+      if (!target_class->HasUses() && !needs_access_check) {
         // We cannot rely on DCE to remove the class because the `HLoadClass`
         // thinks it can throw. However, here we know that it cannot because the
         // instanceof check was successful and we don't need to check the
         // access, hence the class was already loaded.
-        load_class->GetBlock()->RemoveInstruction(load_class);
+        target_class->GetBlock()->RemoveInstruction(target_class);
       }
     }
   }
@@ -2924,6 +2933,54 @@ static bool NoEscapeForStringBufferReference(HInstruction* reference, HInstructi
   return false;
 }
 
+static bool MatchStringBuilderConstructor(HInvokeStaticOrDirect* invoke,
+                                          HInstruction* sb,
+                                          uint32_t* format,
+                                          uint32_t* num_args,
+                                          HInstruction** args) {
+  ScopedObjectAccess soa(Thread::Current());
+  if (invoke->GetResolvedMethod()->GetDeclaringClass() !=
+      sb->GetReferenceTypeInfo().GetTypeHandle().Get()) {
+    return false;
+  }
+
+  if (invoke->GetNumberOfArguments() == 1u) {
+    return true;
+  } else if (invoke->GetNumberOfArguments() == 2u) {
+    HInstruction* arg = invoke->InputAt(1);
+    if (arg->GetType() == DataType::Type::kInt32) {
+      return true;
+    }
+    if (arg->GetType() != DataType::Type::kReference ||
+        !InstructionSimplifierVisitor::CanEnsureNotNullAt(arg, invoke)) {
+      return false;
+    }
+
+    // Check if the argument is a string.
+    bool is_string = arg->IsLoadString();
+    if (!is_string) {
+      ReferenceTypeInfo rti = arg->GetReferenceTypeInfo();
+      // Ensure NullChecks are accepted if they return a String type
+      is_string = rti.IsValid() && rti.IsStringClass();
+    }
+
+    if (is_string) {
+      // If we are already at the maximum number of arguments, adding the
+      // constructor argument would overflow.
+      if (*num_args == StringBuilderAppend::kMaxArgs) {
+        return false;
+      }
+
+      *format = (*format << StringBuilderAppend::kBitsPerArg) |
+               static_cast<uint32_t>(StringBuilderAppend::Argument::kString);
+      args[*num_args] = arg;
+      ++(*num_args);
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool TryReplaceStringBuilderAppend(CodeGenerator* codegen, HInvoke* invoke) {
   DCHECK_EQ(invoke->GetIntrinsic(), Intrinsics::kStringBuilderToString);
   if (invoke->CanThrowIntoCatchBlock()) {
@@ -2981,13 +3038,17 @@ static bool TryReplaceStringBuilderAppend(CodeGenerator* codegen, HInvoke* invok
     // Pattern match seeing arguments, then constructor, then constructor fence.
     if (user->IsInvokeStaticOrDirect() &&
         user->AsInvokeStaticOrDirect()->GetResolvedMethod() != nullptr &&
-        user->AsInvokeStaticOrDirect()->GetResolvedMethod()->IsConstructor() &&
-        user->AsInvokeStaticOrDirect()->GetNumberOfArguments() == 1u) {
+        user->AsInvokeStaticOrDirect()->GetResolvedMethod()->IsConstructor()) {
       // After arguments, we should see the constructor.
-      // We accept only the constructor with no extra arguments.
+      // We accept the constructor with no extra arguments or with a single String argument.
       DCHECK(!seen_constructor);
       DCHECK(!seen_constructor_fence);
-      seen_constructor = true;
+      if (MatchStringBuilderConstructor(
+              user->AsInvokeStaticOrDirect(), sb, &format, &num_args, args)) {
+        seen_constructor = true;
+      } else {
+        return false;
+      }
     } else if (user->IsInvoke()) {
       // The arguments.
       HInvoke* as_invoke = user->AsInvoke();
@@ -3115,6 +3176,7 @@ static bool TryReplaceStringBuilderAppend(CodeGenerator* codegen, HInvoke* invok
   DCHECK(!invoke->CanBeNull());
   DCHECK(!append->CanBeNull());
   invoke->ReplaceWith(append);
+
   // Copy environment, except for the StringBuilder uses.
   for (HEnvironment* env = invoke->GetEnvironment(); env != nullptr; env = env->GetParent()) {
     for (size_t i = 0, size = env->Size(); i != size; ++i) {
@@ -3124,6 +3186,7 @@ static bool TryReplaceStringBuilderAppend(CodeGenerator* codegen, HInvoke* invok
       }
     }
   }
+
   append->CopyEnvironmentFrom(invoke->GetEnvironment());
   // Remove the old instruction.
   block->RemoveInstruction(invoke);
@@ -3395,6 +3458,9 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
     case Intrinsics::kJdkUnsafeArrayBaseOffset:
       SimplifyArrayBaseOffset(instruction);
       break;
+    case Intrinsics::kClassIsAssignableFrom:
+      SimplifyClassIsAssignableFrom(instruction);
+      break;
     default:
       break;
   }
@@ -3419,6 +3485,90 @@ void InstructionSimplifierVisitor::SimplifyArrayBaseOffset(HInvoke* invoke) {
   invoke->ReplaceWith(GetGraph()->GetIntConstant(base_offset));
   RecordSimplification();
   return;
+}
+
+// Returns true if klass is admissible to the propagation: non-null and resolved.
+// For an array type, we also check if the component type is admissible.
+static bool IsAdmissible(ObjPtr<mirror::Class> klass) REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (klass == nullptr) {
+    return false;
+  }
+  while (klass->IsArrayClass()) {
+    DCHECK(klass->IsResolved());
+    klass = klass->GetComponentType();
+  }
+  return klass->IsResolved();
+}
+
+// If `clazz.isAssignableFrom(j.l.Class)` was called as `clazz.isAssignableFrom(obj.getClass())`
+// then it can be replaced with `obj instanceof clazz`.
+void InstructionSimplifierVisitor::SimplifyClassIsAssignableFrom(HInvoke* invoke) {
+  DCHECK(codegen_ != nullptr);
+
+  HInstruction* receiver = invoke->InputAt(0u);
+  HInstruction* field_get = invoke->InputAt(1u);
+
+  if (!field_get->IsInstanceFieldGet()) {
+    return;
+  }
+
+  if (field_get->AsInstanceFieldGet()->GetFieldInfo().GetField() !=
+          WellKnownClasses::java_lang_Object_shadowKlass) {
+    return;
+  }
+
+  HInstruction* object = field_get->InputAt(0u);
+
+  ArenaAllocator* allocator = GetGraph()->GetAllocator();
+  HInstruction* target_class = nullptr;
+  Handle<mirror::Class> klass;
+
+  ScopedObjectAccess soa(Thread::Current());
+
+  // At this point an instance of j.l.Class was already obtained.
+  constexpr bool needs_access_check = false;
+
+  if (receiver->IsFieldAccess() && receiver->AsFieldAccess()->HasConstantValue()) {
+    DCHECK(receiver->AsFieldAccess()->GetConstantValue()->IsClass());
+
+    target_class = receiver;
+    ObjPtr<mirror::Class> field_value = ObjPtr<mirror::Class>::DownCast(
+        receiver->AsFieldAccess()->GetConstantValue().Get());
+    klass = GetGraph()->GetHandleCache()->NewHandle(field_value);
+  } else if (receiver->IsLoadClass()) {
+    target_class = receiver;
+    klass = receiver->AsLoadClass()->GetClass();
+  }
+
+  if (target_class != nullptr) {
+    TypeCheckKind check_kind = HSharpening::ComputeTypeCheckKind(klass.Get(),
+                                                                 codegen_,
+                                                                 needs_access_check);
+    DCHECK_NE(check_kind, TypeCheckKind::kBitstringCheck);
+
+    HInstanceOf* instance_of = new (allocator) HInstanceOf(object,
+                                                           target_class,
+                                                           check_kind,
+                                                           klass,
+                                                           invoke->GetDexPc(),
+                                                           allocator,
+                                                           /*bitstring_path_to_root=*/ nullptr,
+                                                           /*bitstring_mask)=*/ nullptr);
+    // For regular `instanceof` this is done in RTP run.
+    // However InstructionSimplifierVisitor::VisitInstanceOf relies on class RTI and because that's
+    // done as part of instruction_simplifier pass too setting it here explicitly.
+    if (IsAdmissible(klass.Get())) {
+      instance_of->SetValidTargetClassRTI();
+    }
+
+    invoke->GetBlock()->InsertInstructionBefore(instance_of, invoke);
+    if (instance_of->NeedsEnvironment()) {
+      instance_of->CopyEnvironmentFrom(invoke->GetEnvironment());
+    }
+    invoke->ReplaceWith(instance_of);
+    invoke->GetBlock()->RemoveInstruction(invoke);
+    RecordSimplification();
+  }
 }
 
 void InstructionSimplifierVisitor::VisitDeoptimize(HDeoptimize* deoptimize) {

@@ -104,6 +104,10 @@ func globalFlags(ctx android.LoadHookContext) ([]string, []string) {
 		}
 	}
 
+	if ctx.Config().IsEnvTrue("ART_FORCE_CMC_STW_COMPACTION") {
+		cflags = append(cflags, "-DART_FORCE_CMC_STW_COMPACTION=1")
+	}
+
 	if tlab {
 		cflags = append(cflags, "-DART_USE_TLAB=1")
 	}

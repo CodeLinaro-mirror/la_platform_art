@@ -20,7 +20,6 @@
 #include <string_view>
 
 #include "android-base/stringprintf.h"
-
 #include "arch/instruction_set.h"
 #include "arch/instruction_set_features.h"
 #include "art_method-inl.h"
@@ -31,6 +30,7 @@
 #include "compiler_options_map-inl.h"
 #include "dex/dex_file-inl.h"
 #include "image_class_map-inl.h"
+#include "profile/profile_compilation_info.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "simple_compiler_options_map.h"
@@ -41,6 +41,10 @@ CompilerOptions::CompilerOptions()
     : compiler_filter_(CompilerFilter::kDefaultCompilerFilter),
       huge_method_threshold_(kDefaultHugeMethodThreshold),
       inline_max_code_units_(kUnsetInlineMaxCodeUnits),
+      inline_max_total_instructions_(kInlineMaximumNumberOfTotalInstructions),
+      inline_max_instructions_for_small_method_(kInlineMaximumNumberOfInstructionsForSmallMethod),
+      inline_max_cumulated_dex_registers_(kInlineMaximumNumberOfCumulatedDexRegisters),
+      inline_max_recursive_calls_(kInlineMaximumNumberOfRecursiveCalls),
       instruction_set_(kRuntimeISA == InstructionSet::kArm ? InstructionSet::kThumb2 : kRuntimeISA),
       instruction_set_features_(nullptr),
       no_inline_from_(),
@@ -145,6 +149,18 @@ bool CompilerOptions::IsImageClass(TypeReference type_ref, size_t array_dim) con
     DCHECK(!type_ref.dex_file->GetTypeDescriptorView(type_ref.TypeIndex()).starts_with('['));
   }
   return image_classes_.Contains(type_ref, array_dim);
+}
+
+bool CompilerOptions::IsNoPreloadClass(Handle<mirror::Class> klass) const {
+  if (profile_compilation_info_ != nullptr) {
+    ScopedObjectAccess soa(Thread::Current());
+    const ArenaSet<dex::TypeIndex>* classes_no_preload =
+        profile_compilation_info_->GetClassesNoPreload(klass->GetDexFile());
+    if (classes_no_preload != nullptr) {
+      return classes_no_preload->find(klass->GetDexTypeIndex()) != classes_no_preload->end();
+    }
+  }
+  return false;
 }
 
 bool CompilerOptions::IsPreloadedClass(std::string_view pretty_descriptor) const {

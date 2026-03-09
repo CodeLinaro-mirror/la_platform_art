@@ -104,18 +104,16 @@
 #define wMR w20
 #endif
 
-// Temporary registers while setting up a frame for nterp-to-nterp calls.
+// Temporary registers while setting up a frame for calls.
 #define wARGS        w8  // args C-F for non-range calls, first arg for range calls.
 #define xARGS        x8  // 64-bit register version of the wARGS register.
-#define wSHORTY_LEN  w9  // Shorty length during nterp-to-non-nterp calls.
-#define xLOADW      x10  // Pointer to W register loading code during nterp-to-non-nterp calls.
-#define xLOADX      x11  // Pointer to X register loading code during nterp-to-non-nterp calls.
-#define xLOADS      x12  // Pointer to S register loading code during nterp-to-non-nterp calls.
-#define xLOADD      x13  // Pointer to D register loading code during nterp-to-non-nterp calls.
+#define xSHORTY     x10  // Shorty pointer during nterp-to-non-nterp calls.
+#define wSHORTY_LEN w11  // Shorty length during nterp-to-non-nterp calls.
+#define xLOADW      x12  // Pointer to W register loading code during nterp-to-non-nterp calls.
+#define xLOADS      x13  // Pointer to S register loading code during nterp-to-non-nterp calls.
 #define xNEW_FP     x12  // New FP during nterp-to-nterp calls.
 #define xNEW_REFS   x13  // New REFS during nterp-to-nterp calls.
 #define CFI_NEW_REFS 13
-#define xSHORTY     x14  // Shorty length during nterp-to-non-nterp calls.
 #define xHIDDEN_ARG x15  // The hidden argument register for invoke-interface/-range.
 
 // +8 for the ArtMethod of the caller.
@@ -310,11 +308,7 @@
   END \name
 .endm
 
-.macro CLEAR_STATIC_VOLATILE_MARKER reg
-  and \reg, \reg, #-2
-.endm
-
-.macro CLEAR_INSTANCE_VOLATILE_MARKER reg
+.macro CLEAR_VOLATILE_MARKER reg
   neg \reg, \reg
 .endm
 
@@ -736,16 +730,15 @@
 
 // Check if method entrypoint is the nterp entrypoint for quick nterp-to-nterp transition.
 // Loads the code item and entrypoint to specified registers for potential reuse.
-.macro N2N_ENTRY_POINT_CHECK code_item, entrypoint, call_compiled_code
+%def n2n_entry_point_check(code_item, entrypoint, call_compiled_code):
    // On entry, the method is x0, the instance is x1
 #if ART_METHOD_QUICK_CODE_OFFSET_64 != ART_METHOD_DATA_OFFSET_64 + 8
 #error Unexpected offsets, cannot use LDP.
 #endif
-   ldp \code_item, \entrypoint, [x0, #ART_METHOD_DATA_OFFSET_64]
+   ldp ${code_item}, ${entrypoint}, [x0, #ART_METHOD_DATA_OFFSET_64]
    adr ip, ExecuteNterpImpl
-   cmp \entrypoint, ip
-   b.ne  \call_compiled_code
-.endm
+   cmp ${entrypoint}, ip
+   b.ne ${call_compiled_code}
 
 .macro UPDATE_REGISTERS_FOR_STRING_INIT old_value, new_value
    mov wip, wzr
@@ -761,86 +754,61 @@
    b.ne 1b
 .endm
 
-.macro SETUP_RETURN_VALUE shorty
-   cmp \shorty, #68  // Test if result type char == 'D'.
-   b.eq 1f
-   cmp \shorty, #70  // Test if result type char == 'F'.
-   b.ne 2f
-   fmov w0, s0
-   b 2f
-1:
-   fmov x0, d0
-2:
-%  pass
-.endm
+%def setup_return_value(shorty):
+   // Note: We shall move d0 to x0 for both 'D' and 'F'. For 'F', this means moving garbage
+   // into the higher 32 bits of x0 but the only way that x0 can be used for return shorty 'F'
+   // is by `move-result` which shall ignore the high 32 bits anyway.
+   sub wip, ${shorty}, #'D'
+   fmov ip2, d0
+   tst wip, #~2      // Test if result type char == 'D' or 'F'.
+   csel x0, x0, ip2, ne
 
-%def common_invoke_non_range(is_static=False, suffix="", is_string_init=False, is_polymorphic=False, is_custom=False):
-%  if is_polymorphic:
-     // We always go to compiled code for polymorphic calls.
-%    pass
-%  elif is_custom:
-     // We always go to compiled code for custom calls.
-%    pass
+%def common_invoke_non_range_fast_path_setup(is_static, suffix):
+   ubfx wip, wINST, #12, #4
+%  if is_static:
+     cbz wip, .Linvoke_fast_path_${suffix}
+   cmp wip, #2
+   b.lt .Lone_arg_fast_path_${suffix}
+   b.eq .Ltwo_args_fast_path_${suffix}
+   cmp wip, #4
+   b.lt .Lthree_args_fast_path_${suffix}
+   b.eq .Lfour_args_fast_path_${suffix}
+
+   ubfx        wip, wINST, #8, #4
+   GET_VREG    w5, wip
+.Lfour_args_fast_path_${suffix}:
+   ubfx        wip, wARGS, #12, #4
+   GET_VREG    w4, wip
+.Lthree_args_fast_path_${suffix}:
+   ubfx        wip, wARGS, #8, #4
+   GET_VREG    w3, wip
+.Ltwo_args_fast_path_${suffix}:
+   ubfx        wip, wARGS, #4, #4
+   GET_VREG    w2, wip
+.Lone_arg_fast_path_${suffix}:
+%  if is_static:
+     ubfx        wip, wARGS, #0, #4
+     GET_VREG    w1, wip
 %  else:
-     N2N_ENTRY_POINT_CHECK x2, entrypoint=lr, call_compiled_code=.Lcall_compiled_code_${suffix}
-%    if is_string_init:
-       bl nterp_to_nterp_static_non_range
-%    elif is_static:
-       bl nterp_to_nterp_static_non_range
-%    else:
-       bl nterp_to_nterp_instance_non_range
-     b .Ldone_return_${suffix}
+     // First argument already in w1.
+%    pass
+%  pass
+.Linvoke_fast_path_${suffix}:
 %  pass
 
-.Lcall_compiled_code_${suffix}:
+%def common_invoke_non_range(is_static=False, suffix="", is_polymorphic=False, is_custom=False):
 %  if is_polymorphic:
      // No fast path for polymorphic calls.
 %    pass
 %  elif is_custom:
      // No fast path for custom calls.
 %    pass
-%  elif is_string_init:
-     // No fast path for string.init.
-%    pass
 %  else:
      ldr wip, [x0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
      tbz wip, #ART_METHOD_NTERP_INVOKE_FAST_PATH_FLAG_BIT, .Lfast_path_with_few_args_${suffix}
-     ubfx wip, wINST, #12, #4
-%    if is_static:
-       cbz wip, .Linvoke_fast_path_${suffix}
-%    else:
-       cmp wip, #1
-       b.eq .Linvoke_fast_path_${suffix}
-     cmp wip, #2
-%    if is_static:
-       b.lt .Lone_arg_fast_path_${suffix}
-     b.eq .Ltwo_args_fast_path_${suffix}
-     cmp wip, #4
-     b.lt .Lthree_args_fast_path_${suffix}
-     b.eq .Lfour_args_fast_path_${suffix}
-
-     ubfx        wip, wINST, #8, #4
-     GET_VREG    w5, wip
-.Lfour_args_fast_path_${suffix}:
-     ubfx        wip, wARGS, #12, #4
-     GET_VREG    w4, wip
-.Lthree_args_fast_path_${suffix}:
-     ubfx        wip, wARGS, #8, #4
-     GET_VREG    w3, wip
-.Ltwo_args_fast_path_${suffix}:
-     ubfx        wip, wARGS, #4, #4
-     GET_VREG    w2, wip
-.Lone_arg_fast_path_${suffix}:
-%    if is_static:
-       ubfx        wip, wARGS, #0, #4
-       GET_VREG    w1, wip
-%    else:
-       // First argument already in w1.
-%      pass
-%    pass
-.Linvoke_fast_path_${suffix}:
-     blr lr
+%    common_invoke_non_range_fast_path_setup(is_static, suffix)
      FETCH_ADVANCE_INST 3
+     blr lr
      PREPARE_OPCODE_DISPATCH
      GOTO_OPCODE
 
@@ -899,82 +867,90 @@
      ldp x0, x1, [sp], #16
      FETCH wARGS, 2
 %  else:
-%    if is_polymorphic:
-       FETCH w7, 3
-       GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, \
-           slow_path=.Lget_shorty_slow_path_${suffix}, is_proto_index=1
-%    else:
-       FETCH w7, 1
-       GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, slow_path=.Lget_shorty_slow_path_${suffix}
+%    index_code_unit = 3 if is_polymorphic else 1
+     FETCH w7, ${index_code_unit}
+     GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, \
+         slow_path=.Lget_shorty_slow_path_${suffix}, is_proto_index=${is_polymorphic}
 %  pass
 .Lget_shorty_resume_${suffix}:
    // At this point:
    // - x0 contains method
    // - x1 contains 'this' pointer for instance method.
    // - wARGS (x8) contains arguments C-F.
-   // - xSHORTY_LEN (x9) contains the shorty length.
-   // - xSHORTY (x14) contains shorty (in callee-save to switch over return value after call).
+   // - xSHORTY (x10) contains the shorty pointer.
+   // - xSHORTY_LEN (x11) contains the shorty length.
    // - xHIDDEN_ARG (x15) contains the interface method for interface calls.
    // - wINST (w23) contains the number of arguments in bits 15:12 and the argument G in bits 11:8.
-   // - except for polymorphic and custom invokes, lr contains the entrypoint.
+   // - lr contains the entrypoint, except for polymorphic and custom invokes.
    ldrb wCSTMP, [xSHORTY], #1  // load return arg character, advance to args at shorty + 1
    sub wSHORTY_LEN, wSHORTY_LEN, 1  // reduce the remaining shorty length.
    // Check for zero args for invoke-custom or string-init.
    // Zero args for invoke-static are handled above.
-%  if is_custom or is_string_init:
+%  if is_custom:
      cbz wSHORTY_LEN, .Lsetup_finished_${suffix}
-%  if is_static or is_string_init:
+%  if is_static:
      adr xLOADW, .Lnon_range_load_w1_${suffix}
-     adr xLOADX, .Lnon_range_load_x1_${suffix}
 %  else:
      adr xLOADW, .Lnon_range_load_w2_${suffix}
-     adr xLOADX, .Lnon_range_load_x2_${suffix}
 %  if is_static:
      ubfiz wINST, wINST, #8, #12  // Move G to bits 19:16. Opcode bits shall be replaced below.
-%  elif not is_string_init:
+%  else:
      ubfiz wINST, wINST, #4, #12  // Move G to bits 15:12. Opcode bits shall be replaced below.
    adr xLOADS, .Lnon_range_load_s0_${suffix}
 %  if is_static:
      bfxil wINST, wARGS, #0, #16  // Insert args C-F to bits 15:0.
-%  elif is_string_init:
-     mov wINST, wARGS
 %  else:
      bfxil wINST, wARGS, #4, #12  // Insert args D-F to bits 11:0.
-   adr xLOADD, .Lnon_range_load_d0_${suffix}
 
+   // Each load handler has 16 bytes, except for the "LOAD_LAST_VREG" handler which has 32 bytes.
+%  load_w_to_x_offset = 16 * (4 if is_static else 3) + 32
+%  load_s_to_d_offset = 16 * (4 if is_static else 3) + 32
 .Lnon_range_load_regs_${suffix}:
    ldrb wip2, [xSHORTY], #1       // Load next character in signature, and increment.
    ubfiz wip, wINST, #2, #4       // Extract and prescale current argument vreg.
    sub wSHORTY_LEN, wSHORTY_LEN, #1
    cmp wip2, #'J'                 // Is this a long?
    beq .Lnon_range_load_long_${suffix}
-   cmp w17, #'D'                  // Is this a double?
+   cmp wip2, #'D'                 // Is this a double?
    beq .Lnon_range_load_double_${suffix}
    lsr wINST, wINST, #4
-   cmp  w17, #'F'                 // Is this a float?
+   cmp wip2, #'F'                 // Is this a float?
    beq .Lnon_range_load_float_${suffix}
    // Everything else uses a 4-byte GPR.
    br xLOADW
 .Lnon_range_load_long_${suffix}:
+   add ip2, xLOADW, ${load_w_to_x_offset}
    lsr wINST, wINST, #8
-   br xLOADX
+   br ip2
 .Lnon_range_load_float_${suffix}:
    br xLOADS
 .Lnon_range_load_double_${suffix}:
+   add ip2, xLOADS, ${load_s_to_d_offset}
    lsr wINST, wINST, #8
-   br xLOADD
+   br ip2
 
    // The `cont` can have a special value "LOAD_LAST_VREG" to specify that the last vreg
    // should be loaded to both W register and S register without looking at the shorty.
    // This is an optimization for invokes with 5 vregs with non-wide last argument.
+   // Without "LOAD_LAST_VREG", the handler has 16 bytes (or less if `cont == done`),
+   // with "LOAD_LAST_VREG" it has over 16 bytes but no more than 32 bytes, so
+   // `.balign 16` shall round it up to 32 bytes for the following handler.
 %  def non_range_load_vreg(reg, done, cont):
+%    narrow = 'w' if reg[0] == 'w' or reg[0] == 'x' else 's'
+%    reg_number = int(reg[1:])
+%    if reg[0] == 'x' or reg[0] == 'd':
+%      load_narrow_to_wide_offset = load_w_to_x_offset if reg[0] == 'x' else load_s_to_d_offset
+       .org .Lnon_range_load_${narrow}${reg_number}_${suffix} + ${load_narrow_to_wide_offset}
+%    else:
+       .balign 16
+%    pass
 .Lnon_range_load_${reg}_${suffix}:
      // Note: `GET_VREG_DOUBLE_PRESCALED` just forwards args to `GET_WREG_WIDE_PRESCALED`.
 %    get_vreg_suffix = "_WIDE" if reg[0] == 'x' or reg[0] == 'd' else ""
      GET_VREG${get_vreg_suffix}_PRESCALED ${reg}, wip
 %    if done != cont:
        cbz wSHORTY_LEN, ${done}_${suffix}
-%    next_reg_number = int(re.sub(r"[wxsd]", r"", reg)) + 1
+%    next_reg_number = reg_number + 1
 %    if cont == "LOAD_LAST_VREG":
        // Load the last vreg to both W register and S register.
        // We take this path only if all previous arguments have the same type (all FP
@@ -984,7 +960,7 @@
          GET_VREG w${next_reg_number}, wip
          fmov s0, w${next_reg_number}
 %      else:
-%        if is_static or is_string_init:
+%        if is_static:
            GET_VREG w1, wip
            fmov s${next_reg_number}, w1
 %        else:
@@ -993,23 +969,25 @@
        b ${done}_${suffix}
 %    else:
 %      if done != cont:
-%        if reg[0] == 'w' or reg[0] == 'x':
-           adr xLOADW, .Lnon_range_load_w${next_reg_number}_${suffix}
-           adr xLOADX, .Lnon_range_load_x${next_reg_number}_${suffix}
-%        else:
-           adr xLOADS, .Lnon_range_load_s${next_reg_number}_${suffix}
-           adr xLOADD, .Lnon_range_load_d${next_reg_number}_${suffix}
+%        narrow_upper = narrow.upper()
+         adr xLOAD${narrow_upper}, .Lnon_range_load_${narrow}${next_reg_number}_${suffix}
        b ${cont}_${suffix}
 %  pass
 
-%  if is_static or is_string_init:
+   // Note: To keep the distances from wN to xN (and from sN to dN) handlers identical in the
+   // presence of 32-byte handlers with "LOAD_LAST_VREG", we reorder the last narrow handler
+   // (which does not have a corresponding wide handler) after the narrow handler corresponding
+   // to the wide "LOAD_LAST_VREG" handler. The narrow "LOAD_LAST_VREG" handler ends up last,
+   // corresponding to the last wide handler.
+
+%  if is_static:
 %    non_range_load_vreg("w1", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  non_range_load_vreg("w2", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  non_range_load_vreg("w3", ".Lsetup_finished", ".Lnon_range_load_regs")
+%  non_range_load_vreg("w5", ".Lsetup_finished", ".Lsetup_finished")  // See above for ordering.
 %  non_range_load_vreg("w4", ".Lsetup_finished", "LOAD_LAST_VREG")
-%  non_range_load_vreg("w5", ".Lsetup_finished", ".Lsetup_finished")
 
-%  if is_static or is_string_init:
+%  if is_static:
 %    non_range_load_vreg("x1", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  non_range_load_vreg("x2", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  non_range_load_vreg("x3", ".Lsetup_finished", "LOAD_LAST_VREG")
@@ -1019,11 +997,11 @@
 %  non_range_load_vreg("s1", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  if is_static:
 %    non_range_load_vreg("s2", ".Lsetup_finished", ".Lnon_range_load_regs")
+%    non_range_load_vreg("s4", ".Lsetup_finished", ".Lsetup_finished")  // See above for ordering.
 %    non_range_load_vreg("s3", ".Lsetup_finished", "LOAD_LAST_VREG")
-%    non_range_load_vreg("s4", ".Lsetup_finished", ".Lsetup_finished")
 %  else:
+%    non_range_load_vreg("s3", ".Lsetup_finished", ".Lsetup_finished")  // See above for ordering.
 %    non_range_load_vreg("s2", ".Lsetup_finished", "LOAD_LAST_VREG")
-%    non_range_load_vreg("s3", ".Lsetup_finished", ".Lsetup_finished")
 
 %  non_range_load_vreg("d0", ".Lsetup_finished", ".Lnon_range_load_regs")
 %  if is_static:
@@ -1036,118 +1014,84 @@
 %  pass
 
 .Lsetup_finished_${suffix}:
+%  invoke_code_units = 4 if is_polymorphic else 3
+   FETCH_ADVANCE_INST ${invoke_code_units}
 %  if is_polymorphic:
      bl art_quick_invoke_polymorphic
 %  elif is_custom:
      bl art_quick_invoke_custom
 %  else:
      blr lr
-%  if not is_string_init:
-     SETUP_RETURN_VALUE wCSTMP
-%  pass
-.Ldone_return_${suffix}:
-   /* resume execution of caller */
-%  if is_string_init:
-     FETCH w11, 2 // arguments
-     and x11, x11, #0xf
-     GET_VREG w1, w11
-     UPDATE_REGISTERS_FOR_STRING_INIT w1, w0
-
-%  if is_polymorphic:
-     FETCH_ADVANCE_INST 4
-%  else:
-     FETCH_ADVANCE_INST 3
    PREPARE_OPCODE_DISPATCH
+%  setup_return_value("wCSTMP")
    GOTO_OPCODE
 
 %  if not is_custom:
 .Lget_shorty_slow_path_${suffix}:
      GET_SHORTY_AND_LENGTH_SLOW_PATH xSHORTY, wSHORTY_LEN, resume=.Lget_shorty_resume_${suffix}
 
-%def common_invoke_range(is_static=False, suffix="", is_string_init=False, is_polymorphic=False, is_custom=False):
-%  if is_polymorphic:
-     // We always go to compiled code for polymorphic calls.
-%    pass
-%  elif is_custom:
-     // We always go to compiled code for custom calls.
-%    pass
+%def common_invoke_range_fast_path_setup(is_static, suffix):
+   lsr wip2, wINST, #8  // Number of arguments
+%  if is_static:
+     cbz ip2, .Linvoke_fast_path_range_${suffix}
+   add x9, xFP, wARGS, uxtw #2  // location of first dex register value
+   cmp ip2, #2
+   b.lt .Lone_arg_fast_path_range_${suffix}
+   b.eq .Ltwo_args_fast_path_range_${suffix}
+   cmp ip2, #4
+   b.lt .Lthree_args_fast_path_range_${suffix}
+   b.eq .Lfour_args_fast_path_range_${suffix}
+   cmp ip2, #6
+   b.lt .Lfive_args_fast_path_range_${suffix}
+   b.eq .Lsix_args_fast_path_range_${suffix}
+   cmp ip2, #7
+   b.eq .Lseven_args_fast_path_range_${suffix}
+   // Setup x10 to point to the stack location of parameters. We do not need to copy
+   // parameters that are passed in registers to their reserved stack slots.
+   add x10, sp, #8  // Add space for the ArtMethod
+
+.Lloop_over_fast_path_range_${suffix}:
+   sub ip2, ip2, #1
+   ldr wip, [x9, ip2, lsl #2]
+   str wip, [x10, ip2, lsl #2]
+   cmp ip2, #7
+   b.ne .Lloop_over_fast_path_range_${suffix}
+
+.Lseven_args_fast_path_range_${suffix}:
+   ldr w7, [x9, #24]
+.Lsix_args_fast_path_range_${suffix}:
+   ldr w6, [x9, #20]
+.Lfive_args_fast_path_range_${suffix}:
+   ldr w5, [x9, #16]
+.Lfour_args_fast_path_range_${suffix}:
+   ldr w4, [x9, #12]
+.Lthree_args_fast_path_range_${suffix}:
+   ldr w3, [x9, #8]
+.Ltwo_args_fast_path_range_${suffix}:
+   ldr w2, [x9, #4]
+.Lone_arg_fast_path_range_${suffix}:
+%  if is_static:
+     ldr w1, [x9, #0]
 %  else:
-     N2N_ENTRY_POINT_CHECK \
-         x2, entrypoint=lr, call_compiled_code=.Lcall_compiled_code_range_${suffix}
-%    if is_string_init:
-       bl nterp_to_nterp_static_range
-%    elif is_static:
-       bl nterp_to_nterp_static_range
-%    else:
-       bl nterp_to_nterp_instance_range
-     b .Ldone_return_range_${suffix}
+     // First argument already in w1.
+%    pass
+%  pass
+.Linvoke_fast_path_range_${suffix}:
 %  pass
 
-.Lcall_compiled_code_range_${suffix}:
+%def common_invoke_range(is_static=False, suffix="", is_polymorphic=False, is_custom=False):
 %  if is_polymorphic:
      // No fast path for polymorphic calls.
 %    pass
 %  elif is_custom:
      // No fast path for custom calls.
 %    pass
-%  elif is_string_init:
-     // No fast path for string.init.
-%    pass
 %  else:
      ldr wip, [x0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
      tbz wip, #ART_METHOD_NTERP_INVOKE_FAST_PATH_FLAG_BIT, .Lfast_path_with_few_args_range_${suffix}
-     lsr wip2, wINST, #8  // Number of arguments
-%    if is_static:
-       cbz ip2, .Linvoke_fast_path_range_${suffix}
-%    else:
-       cmp ip2, #1
-       b.eq .Linvoke_fast_path_range_${suffix}
-     add x9, xFP, wARGS, uxtw #2  // location of first dex register value
-     cmp ip2, #2
-%    if is_static:
-       b.lt .Lone_arg_fast_path_range_${suffix}
-     b.eq .Ltwo_args_fast_path_range_${suffix}
-     cmp ip2, #4
-     b.lt .Lthree_args_fast_path_range_${suffix}
-     b.eq .Lfour_args_fast_path_range_${suffix}
-     cmp ip2, #6
-     b.lt .Lfive_args_fast_path_range_${suffix}
-     b.eq .Lsix_args_fast_path_range_${suffix}
-     cmp ip2, #7
-     b.eq .Lseven_args_fast_path_range_${suffix}
-     // Setup x10 to point to the stack location of parameters. We do not need to copy
-     // parameters that are passed in registers to their reserved stack slots.
-     add x10, sp, #8  // Add space for the ArtMethod
-
-.Lloop_over_fast_path_range_${suffix}:
-     sub ip2, ip2, #1
-     ldr wip, [x9, ip2, lsl #2]
-     str wip, [x10, ip2, lsl #2]
-     cmp ip2, #7
-     b.ne .Lloop_over_fast_path_range_${suffix}
-
-.Lseven_args_fast_path_range_${suffix}:
-     ldr w7, [x9, #24]
-.Lsix_args_fast_path_range_${suffix}:
-     ldr w6, [x9, #20]
-.Lfive_args_fast_path_range_${suffix}:
-     ldr w5, [x9, #16]
-.Lfour_args_fast_path_range_${suffix}:
-     ldr w4, [x9, #12]
-.Lthree_args_fast_path_range_${suffix}:
-     ldr w3, [x9, #8]
-.Ltwo_args_fast_path_range_${suffix}:
-     ldr w2, [x9, #4]
-.Lone_arg_fast_path_range_${suffix}:
-%    if is_static:
-       ldr w1, [x9, #0]
-%    else:
-       // First argument already in w1.
-%      pass
-%    pass
-.Linvoke_fast_path_range_${suffix}:
-     blr lr
+%    common_invoke_range_fast_path_setup(is_static, suffix)
      FETCH_ADVANCE_INST 3
+     blr lr
      PREPARE_OPCODE_DISPATCH
      GOTO_OPCODE
 
@@ -1203,91 +1147,83 @@
      ldp x0, x1, [sp], #16
      FETCH wARGS, 2
 %  else:
-%    if is_polymorphic:
-       FETCH w7, 3
-       GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, \
-           slow_path=.Lget_shorty_range_slow_path_${suffix}, is_proto_index=1
-%    else:
-       FETCH w7, 1
-       GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, \
-           slow_path=.Lget_shorty_range_slow_path_${suffix}
+%    index_code_unit = 3 if is_polymorphic else 1
+     FETCH w7, ${index_code_unit}
+     GET_SHORTY_AND_LENGTH xSHORTY, wSHORTY_LEN, x7, \
+         slow_path=.Lget_shorty_range_slow_path_${suffix}, is_proto_index=${is_polymorphic}
 %  pass
 .Lget_shorty_range_resume_${suffix}:
    // At this point:
    // - x0 contains method
    // - x1 contains 'this' pointer for instance method.
    // - wARGS (x8) contains the first arg
-   // - xSHORTY_LEN (x9) contains the shorty length.
-   // - xSHORTY (x14) contains shorty (in callee-save to switch over return value after call).
+   // - xSHORTY (x10) contains the shorty pointer.
+   // - xSHORTY_LEN (x11) contains the shorty length.
    // - xHIDDEN_ARG (x15) contains the interface method for interface calls.
    // - wINST (w23) contains the number of arguments in bits 15:8.
-   // - except for polymorphic and custom invokes, lr contains the entrypoint.
+   // - lr contains the entrypoint, except for polymorphic and custom invokes.
    ldrb wCSTMP, [xSHORTY], #1  // load return arg character, advance to args at shorty + 1
    sub wSHORTY_LEN, wSHORTY_LEN, 1  // reduce the remaining shorty length.
    // Check for zero args for invoke-custom or string-init.
    // Zero args for invoke-static are handled above.
-%  if is_custom or is_string_init:
-     cbz wSHORTY_LEN, .Lsetup_finished_${suffix}
-%  if is_static or is_string_init:
+%  if is_custom:
+     cbz wSHORTY_LEN, .Lsetup_finished_range_${suffix}
+%  if is_static:
      adr xLOADW, .Lrange_load_w1_${suffix}
-     adr xLOADX, .Lrange_load_x1_${suffix}
 %  else:
      adr xLOADW, .Lrange_load_w2_${suffix}
-     adr xLOADX, .Lrange_load_x2_${suffix}
    adr xLOADS, .Lrange_load_s0_${suffix}
-   adr xLOADD, .Lrange_load_d0_${suffix}
    add xARGS, xFP, wARGS, uxtw #2 // args pointer in the FP array.
-%  if is_static or is_string_init:
+%  if is_static:
      add xINST, sp, #8            // args pointer in the stack out area.
 %  else:
      add xINST, sp, #(8 + 4)      // args pointer in the stack out area; skip `this`
      add xARGS, xARGS, 4          // skip `this`
 %  pass
 
+   // Each load handler has 20 bytes and the copy handler has 16 bytes.
+%  load_w_to_x_offset = 20 * (7 if is_static else 6) + 16
+%  load_s_to_d_offset = 20 * 8 + 16
 .Lrange_load_regs_${suffix}:
    ldrb wip2, [xSHORTY], #1       // Load next character in signature, and increment.
    sub wSHORTY_LEN, wSHORTY_LEN, #1
    cmp wip2, #'J'                 // Is this a long?
    beq .Lrange_load_long_${suffix}
-   cmp w17, #'D'                  // Is this a double?
+   cmp wip2, #'D'                 // Is this a double?
    beq .Lrange_load_double_${suffix}
-   cmp  w17, #'F'                 // Is this a float?
+   cmp wip2, #'F'                 // Is this a float?
    beq .Lrange_load_float_${suffix}
    // Everything else uses a 4-byte GPR.
    br xLOADW
 .Lrange_load_long_${suffix}:
-   br xLOADX
+   add ip2, xLOADW, #${load_w_to_x_offset}
+   br ip2
 .Lrange_load_float_${suffix}:
    br xLOADS
 .Lrange_load_double_${suffix}:
-   br xLOADD
+   add ip2, xLOADS, #${load_s_to_d_offset}
+   br ip2
 
+   // Each handler has exactly five instructions (20 bytes).
 %  def range_load_vreg(reg, done, cont, last=False):
+%    narrow = 'w' if reg[0] == 'w' or reg[0] == 'x' else 's'
+%    reg_number = int(reg[1:])
+%    if reg[0] == 'x' or reg[0] == 'd':
+%      load_narrow_to_wide_offset = load_w_to_x_offset if reg[0] == 'x' else load_s_to_d_offset
+       .org .Lrange_load_${narrow}${reg_number}_${suffix} + ${load_narrow_to_wide_offset}
+%    pass
 .Lrange_load_${reg}_${suffix}:
-     // Note: `GET_VREG_DOUBLE` just forwards args to `GET_WREG_WIDE`.
 %    reg_size = 8 if reg[0] == 'x' or reg[0] == 'd' else 4
      ldr ${reg}, [xARGS], #${reg_size}
-     add xINST, xINST, ${reg_size}
      cbz wSHORTY_LEN, ${done}_${suffix}
-%    if last:
-%      if reg[0] == 'w' or reg[0] == 'x':
-         adr xLOADW, .Lrange_copy32_${suffix}
-         adr xLOADX, .Lrange_copy64_${suffix}
-%      else:
-         adr xLOADS, .Lrange_copy32_${suffix}
-         adr xLOADD, .Lrange_copy64_${suffix}
-%    else:
-%      next_reg_number = int(re.sub(r"[wxsd]", r"", reg)) + 1
-%      if reg[0] == 'w' or reg[0] == 'x':
-         adr xLOADW, .Lrange_load_w${next_reg_number}_${suffix}
-         adr xLOADX, .Lrange_load_x${next_reg_number}_${suffix}
-%      else:
-         adr xLOADS, .Lrange_load_s${next_reg_number}_${suffix}
-         adr xLOADD, .Lrange_load_d${next_reg_number}_${suffix}
+     add xINST, xINST, ${reg_size}
+%    narrow_upper = narrow.upper()
+%    label = r"copy_{}".format(narrow) if last else r"load_{}{}".format(narrow, reg_number + 1)
+     adr xLOAD${narrow_upper}, .Lrange_${label}_${suffix}
      b ${cont}_${suffix}
 %  pass
 
-%  if is_static or is_string_init:
+%  if is_static:
 %    range_load_vreg("w1", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("w2", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("w3", ".Lsetup_finished_range", ".Lrange_load_regs")
@@ -1295,13 +1231,13 @@
 %  range_load_vreg("w5", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("w6", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("w7", ".Lsetup_finished_range", ".Lrange_load_regs", last=True)
-.Lrange_copy32_${suffix}:
+.Lrange_copy_w_${suffix}:
    ldr wip, [xARGS], #4
    str wip, [xINST], #4
    cbz wSHORTY_LEN, .Lsetup_finished_range_${suffix}
    b .Lrange_load_regs_${suffix}
 
-%  if is_static or is_string_init:
+%  if is_static:
 %    range_load_vreg("x1", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("x2", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("x3", ".Lsetup_finished_range", ".Lrange_load_regs")
@@ -1309,7 +1245,8 @@
 %  range_load_vreg("x5", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("x6", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("x7", ".Lsetup_finished_range", ".Lrange_load_regs", last=True)
-.Lrange_copy64_${suffix}:
+   .org .Lrange_copy_w_${suffix} + ${load_w_to_x_offset}
+.Lrange_copy_x_${suffix}:
    ldr ip, [xARGS], #8
    str ip, [xINST], #8
    cbz wSHORTY_LEN, .Lsetup_finished_range_${suffix}
@@ -1323,6 +1260,11 @@
 %  range_load_vreg("s5", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("s6", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("s7", ".Lsetup_finished_range", ".Lrange_load_regs", last=True)
+.Lrange_copy_s_${suffix}:
+   ldr wip, [xARGS], #4
+   str wip, [xINST], #4
+   cbz wSHORTY_LEN, .Lsetup_finished_range_${suffix}
+   b .Lrange_load_regs_${suffix}
 
 %  range_load_vreg("d0", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("d1", ".Lsetup_finished_range", ".Lrange_load_regs")
@@ -1332,29 +1274,24 @@
 %  range_load_vreg("d5", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("d6", ".Lsetup_finished_range", ".Lrange_load_regs")
 %  range_load_vreg("d7", ".Lsetup_finished_range", ".Lrange_load_regs", last=True)
+   .org .Lrange_copy_s_${suffix} + ${load_s_to_d_offset}
+.Lrange_copy_d_${suffix}:
+   ldr ip, [xARGS], #8
+   str ip, [xINST], #8
+   cbz wSHORTY_LEN, .Lsetup_finished_range_${suffix}
+   b .Lrange_load_regs_${suffix}
 
 .Lsetup_finished_range_${suffix}:
+%  invoke_code_units = 4 if is_polymorphic else 3
+   FETCH_ADVANCE_INST ${invoke_code_units}
 %  if is_polymorphic:
      bl art_quick_invoke_polymorphic
 %  elif is_custom:
      bl art_quick_invoke_custom
 %  else:
      blr lr
-%  if not is_string_init:
-     SETUP_RETURN_VALUE wCSTMP
-%  pass
-.Ldone_return_range_${suffix}:
-   /* resume execution of caller */
-%  if is_string_init:
-     FETCH w11, 2 // arguments
-     GET_VREG w1, w11
-     UPDATE_REGISTERS_FOR_STRING_INIT w1, w0
-
-%  if is_polymorphic:
-     FETCH_ADVANCE_INST 4
-%  else:
-     FETCH_ADVANCE_INST 3
    PREPARE_OPCODE_DISPATCH
+%  setup_return_value("wCSTMP")
    GOTO_OPCODE
 
 %  if not is_custom:
@@ -1725,9 +1662,21 @@ NterpCommonInvokeStaticRange:
 %   common_invoke_range(is_static=True, suffix="invokeStatic")
 
 NterpCommonInvokeInstance:
+%   n2n_entry_point_check("x2", entrypoint="lr", call_compiled_code="1f")
+    bl nterp_to_nterp_instance_non_range
+    FETCH_ADVANCE_INST 3
+    PREPARE_OPCODE_DISPATCH
+    GOTO_OPCODE
+1:
 %   common_invoke_non_range(suffix="invokeInstance")
 
 NterpCommonInvokeInstanceRange:
+%   n2n_entry_point_check("x2", entrypoint="lr", call_compiled_code="1f")
+    bl nterp_to_nterp_instance_range
+    FETCH_ADVANCE_INST 3
+    PREPARE_OPCODE_DISPATCH
+    GOTO_OPCODE
+1:
 %   common_invoke_range(suffix="invokeInstance")
 
 NterpCommonInvokePolymorphic:
@@ -1743,10 +1692,54 @@ NterpCommonInvokeCustomRange:
 %   common_invoke_range(is_static=True, is_custom=True, suffix="invokeCustom")
 
 NterpHandleStringInit:
-%   common_invoke_non_range(is_string_init=True, suffix="stringInit")
+    ubfx wCSTMP, wARGS, #0, #4        // Remember `this` vreg number in a callee-save register.
+    ubfx wip, wINST, #8, #4           // Extract G
+    lsr wARGS, wARGS, #4              // Shift args D-F to C-E for string init.
+    sub wINST, wINST, (1 << 12)       // Adjust the number of arguments.
+    bfi wARGS, wip, #12, #4           // Insert arg G as F for string init.
+%   n2n_entry_point_check("x2", entrypoint="lr", call_compiled_code="1f")
+    bl nterp_to_nterp_static_non_range
+    b .Ldone_return_stringInit
+1:
+    // No string-init method has any 'D', 'F' or 'J' args, so they can all use the fast path.
+#ifndef NDEBUG
+    ldr wip, [x0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
+    tbnz wip, #ART_METHOD_NTERP_INVOKE_FAST_PATH_FLAG_BIT, 9f
+    brk 0
+9:
+#endif  // NDEBUG
+%   common_invoke_non_range_fast_path_setup(is_static=True, suffix="stringInit")
+    blr lr
+.Ldone_return_stringInit:
+    FETCH_ADVANCE_INST 3
+    GET_VREG w1, wCSTMP               // Get `this`.
+    UPDATE_REGISTERS_FOR_STRING_INIT w1, w0
+    PREPARE_OPCODE_DISPATCH
+    GOTO_OPCODE
 
 NterpHandleStringInitRange:
-%   common_invoke_range(is_string_init=True, suffix="stringInit")
+    mov wCSTMP, wARGS                 // Remember `this` vreg number in a callee-save register.
+    add wARGS, wARGS, #1              // Adjust the first argument number.
+    sub wINST, wINST, (1 << 8)        // Adjust the number of arguments.
+%   n2n_entry_point_check("x2", entrypoint="lr", call_compiled_code="1f")
+    bl nterp_to_nterp_static_range
+    b .Ldone_return_range_stringInit
+1:
+    // No string-init method has any 'D', 'F' or 'J' args, so they can all use the fast path.
+#ifndef NDEBUG
+    ldr wip, [x0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
+    tbnz wip, #ART_METHOD_NTERP_INVOKE_FAST_PATH_FLAG_BIT, 9f
+    brk 0
+9:
+#endif  // NDEBUG
+%   common_invoke_range_fast_path_setup(is_static=True, suffix="stringInit")
+    blr lr
+.Ldone_return_range_stringInit:
+    FETCH_ADVANCE_INST 3
+    GET_VREG w1, wCSTMP               // Get `this`.
+    UPDATE_REGISTERS_FOR_STRING_INIT w1, w0
+    PREPARE_OPCODE_DISPATCH
+    GOTO_OPCODE
 
 NterpHotnessCheck:
     ldr x0, [sp]

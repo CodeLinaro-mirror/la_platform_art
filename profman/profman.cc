@@ -59,11 +59,11 @@
 #include "dex/dex_file_types.h"
 #include "dex/method_reference.h"
 #include "dex/type_reference.h"
+#include "inline_cache_format_util.h"
 #include "profile/profile_boot_info.h"
 #include "profile/profile_compilation_info.h"
 #include "profile_assistant.h"
 #include "profman/profman_result.h"
-#include "inline_cache_format_util.h"
 
 namespace art {
 
@@ -175,6 +175,8 @@ NO_RETURN static void Usage(const char *fmt, ...) {
   UsageError("      include it in the final preloaded classes.");
   UsageError("  --preloaded-classes-denylist=file");
   UsageError("      a file listing the classes that should not be preloaded in Zygote");
+  UsageError("  --record-preloaded-classes-denylist");
+  UsageError("      record preloaded classes denylist in the binary profile");
   UsageError("  --upgrade-startup-to-hot=true|false:");
   UsageError("      whether or not to upgrade startup methods to hot");
   UsageError("  --special-package=pkg_name:percentage between 0 and 100");
@@ -393,6 +395,8 @@ class ProfMan final {
                 preloaded_classes_denylist.c_str(), nullptr));  // No post-processing.
         boot_image_options_.preloaded_classes_denylist.insert(
             denylist->begin(), denylist->end());
+      } else if (option == "--record-preloaded-classes-denylist") {
+        boot_image_options_.record_preloaded_classes_denylist = true;
       } else if (option.starts_with("--upgrade-startup-to-hot=")) {
         ParseBoolOption(option,
                         "--upgrade-startup-to-hot=",
@@ -1286,6 +1290,10 @@ class ProfMan final {
       const dex::MethodId* cur_id =
           dex->FindMethodIdByIndex(cur_candidate, method_name, method_proto);
       if (cur_id != nullptr) {
+        if (dex->GetClassData(*cur_class_def) == nullptr) {
+          // Class has no fields or methods.
+          return std::nullopt;
+        }
         if (dex->GetCodeItemOffset(*cur_class_def, dex->GetIndexForMethodId(*cur_id)).has_value()) {
           return ClassMethodReference{TypeReference(dex, cur_candidate),
                                       dex->GetIndexForMethodId(*cur_id)};
@@ -1298,6 +1306,30 @@ class ProfMan final {
       update_slow = !update_slow;
     }
     return std::nullopt;
+  }
+
+  // Process preloaded-classes-denylist. For every class on the list, try to find it in one of the
+  // dex files. If found, add the class to the profile. If not found, this is also fine: we may use
+  // one aggregated denylist that contains classes from different dex files, or the denylist may be
+  // outdated.
+  bool ProcessPreloadedClassesDenylist(const std::vector<std::unique_ptr<const DexFile>>& dex_files,
+                                       /*out*/ ProfileCompilationInfo* profile) {
+    DCHECK(boot_image_options_.record_preloaded_classes_denylist);
+    for (const std::string& klass : boot_image_options_.preloaded_classes_denylist) {
+      // There should be no arrays in preloaded-classes-denylist.
+      CHECK_EQ(klass.find('['), std::string::npos);
+
+      std::string descriptor = DotToDescriptor(klass);
+      TypeReference class_ref(/*dex_file=*/nullptr, dex::TypeIndex());
+      if (FindClassDef(dex_files, descriptor, &class_ref) != nullptr) {
+        if (!profile->AddClassNoPreload(*class_ref.dex_file, class_ref.TypeIndex())) {
+          LOG(ERROR) << "Unable to add class '" << klass
+                     << "' from preloaded-classes-denylist to the profile";
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   // Process a line defining a class or a method and its inline caches.
@@ -1724,6 +1756,10 @@ class ProfMan final {
 
     for (const auto& line : *user_lines) {
       ProcessLine(dex_files, line, &info);
+    }
+
+    if (boot_image_options_.record_preloaded_classes_denylist) {
+      ProcessPreloadedClassesDenylist(dex_files, &info);
     }
 
     // Write the profile file.

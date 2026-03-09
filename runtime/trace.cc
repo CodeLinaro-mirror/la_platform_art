@@ -765,7 +765,9 @@ void Trace::Start(std::unique_ptr<File>&& trace_file_in,
           instrumentation::Instrumentation::kMethodEntered |
               instrumentation::Instrumentation::kMethodExited |
               instrumentation::Instrumentation::kMethodUnwind,
-          UseFastTraceListeners(the_trace_->GetClockSource()));
+          UseFastTraceListeners(the_trace_->GetClockSource())
+              ? instrumentation::Instrumentation::ListenerType::kFastTraceListener
+              : instrumentation::Instrumentation::ListenerType::kSlowTraceListener);
       runtime->GetInstrumentation()->EnableMethodTracing(kTracerInstrumentationKey,
                                                          the_trace_,
                                                          /*needs_interpreter=*/false);
@@ -827,7 +829,9 @@ void Trace::StopTracing(bool flush_entries) {
             instrumentation::Instrumentation::kMethodEntered |
                 instrumentation::Instrumentation::kMethodExited |
                 instrumentation::Instrumentation::kMethodUnwind,
-            UseFastTraceListeners(the_trace_->GetClockSource()));
+            UseFastTraceListeners(the_trace_->GetClockSource())
+                ? instrumentation::Instrumentation::ListenerType::kFastTraceListener
+                : instrumentation::Instrumentation::ListenerType::kSlowTraceListener);
         runtime->GetInstrumentation()->DisableMethodTracing(kTracerInstrumentationKey);
     }
 
@@ -880,9 +884,11 @@ void Trace::RemoveListeners() {
   runtime->GetInstrumentation()->RemoveListener(
       the_trace_,
       instrumentation::Instrumentation::kMethodEntered |
-      instrumentation::Instrumentation::kMethodExited |
-      instrumentation::Instrumentation::kMethodUnwind,
-      UseFastTraceListeners(the_trace_->GetClockSource()));
+          instrumentation::Instrumentation::kMethodExited |
+          instrumentation::Instrumentation::kMethodUnwind,
+      UseFastTraceListeners(the_trace_->GetClockSource())
+          ? instrumentation::Instrumentation::ListenerType::kFastTraceListener
+          : instrumentation::Instrumentation::ListenerType::kSlowTraceListener);
 }
 
 void Trace::FlushThreadBuffer(Thread* self) {
@@ -1097,6 +1103,15 @@ std::string TraceWriter::CreateSummary(int flags) {
   os << StringPrintf("clock-call-overhead-nsec=%" PRIu64 "\n", clock_overhead_ns_);
   os << StringPrintf("vm=art\n");
   os << StringPrintf("pid=%d\n", getpid());
+
+  os << "is_precise_trace=" << (flags & Trace::TraceFlag::kTraceLowOverhead ? "false" : "true")
+     << "\n";
+  std::string compiler_filter;
+  std::string compilation_reason;
+  Runtime::Current()->GetAppInfo()->GetPrimaryApkOptimizationStatus(&compiler_filter,
+                                                                    &compilation_reason);
+  os << "compilation-filter=" << compiler_filter << "\n";
+
   if ((flags & Trace::kTraceCountAllocs) != 0) {
     os << "alloc-count=" << Runtime::Current()->GetStat(KIND_ALLOCATED_OBJECTS) << "\n";
     os << "alloc-size=" << Runtime::Current()->GetStat(KIND_ALLOCATED_BYTES) << "\n";

@@ -74,15 +74,6 @@ flag {
 }
 
 flag {
-  name: "post_ur_job"
-  namespace: "art_cloud"
-  description: "Flag to enable post unattended reboot job."
-  bug: "426478053"
-  is_fixed_read_only: false
-  is_exported: false
-}
-
-flag {
   name: "enable_profile_code_rw"
   namespace: "art_performance"
   description: "Flag to control on-demand method tracing feature"
@@ -105,6 +96,15 @@ flag {
   namespace: "system_performance"
   description: "Flag to enable explicit madvise of the vdex type lookup table"
   bug: "428102886"
+  is_fixed_read_only: false
+  is_exported: false
+}
+
+flag {
+  name: "madvise_optimized_readahead"
+  namespace: "system_performance"
+  description: "Flag to enable optimized readahead settings for dex/odex madvise"
+  bug: "309384435"
   is_fixed_read_only: false
   is_exported: false
 }
@@ -171,4 +171,13 @@ flag {
     bug: "419024976"
     is_fixed_read_only: false
     is_exported: false
+}
+
+flag {
+  name: "hybrid_pre_reboot_dexopt"
+  namespace: "art_cloud"
+  description: "Flag to enable hybrid pre-reboot dexopt for OTA"
+  bug: "477979368"
+  is_fixed_read_only: false
+  is_exported: false
 }

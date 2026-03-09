@@ -720,6 +720,7 @@ class HBasicBlock final : public ArenaObject<kArenaAllocBasicBlock> {
 
 #if defined(ART_ENABLE_CODEGEN_x86) || defined(ART_ENABLE_CODEGEN_x86_64)
 #define FOR_EACH_CONCRETE_INSTRUCTION_X86_COMMON(M)                     \
+  M(X86LoadEffectiveAddress, Instruction)                               \
   M(X86AndNot, Instruction)                                             \
   M(X86MaskOrResetLeastSetBit, Instruction)
 #else
@@ -6382,7 +6383,7 @@ class HLoadMethodHandle final : public HInstruction {
   }
 
   bool CanThrow() const override { return true; }
-
+  bool CanBeNull() const override { return false; }
   bool NeedsEnvironment() const override { return true; }
 
   DECLARE_INSTRUCTION(LoadMethodHandle);
@@ -6454,7 +6455,7 @@ class HLoadMethodType final : public HInstruction {
   }
 
   bool CanThrow() const override { return true; }
-
+  bool CanBeNull() const override { return false; }
   bool NeedsEnvironment() const override { return true; }
 
   DECLARE_INSTRUCTION(LoadMethodType);
@@ -6952,15 +6953,22 @@ class HTypeCheckInstruction : public HVariableInputSizeInstruction {
       SetRawInputAt(2, bitstring_path_to_root);
       SetRawInputAt(3, bitstring_mask);
     } else {
-      DCHECK(target_class_or_null->IsLoadClass());
+      if (kind == kCheckCast) {
+        DCHECK(target_class_or_null->IsLoadClass());
+      } else {
+        DCHECK_EQ(kind, kInstanceOf);
+        DCHECK(target_class_or_null->IsLoadClass() || target_class_or_null->IsFieldAccess());
+        DCHECK_IMPLIES(target_class_or_null->IsFieldAccess(),
+                       target_class_or_null->AsFieldAccess()->HasConstantValue());
+      }
     }
   }
 
-  HLoadClass* GetTargetClass() const {
+  HInstruction* GetTargetClass() const {
     DCHECK_NE(GetTypeCheckKind(), TypeCheckKind::kBitstringCheck);
-    HInstruction* load_class = InputAt(1);
-    DCHECK(load_class->IsLoadClass());
-    return load_class->AsLoadClass();
+    HInstruction* target_class = InputAt(1);
+    DCHECK(target_class->IsLoadClass() || target_class->IsFieldAccess());
+    return target_class;
   }
 
   uint32_t GetBitstringPathToRoot() const {
