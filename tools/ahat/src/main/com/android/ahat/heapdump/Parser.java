@@ -82,6 +82,17 @@ public class Parser {
   }
 
   /**
+   * Creates an hprof Parser that parses a heap dump from a file
+   * with specified chunk size.
+   *
+   * @param hprof file to parse the heap dump from.
+   * @param chunkSize size of the mapping to access the hprof file
+   * @throws IOException if the file cannot be accessed.
+   */
+  private Parser(File hprof, int chunkSize) throws IOException {
+    this.hprof = new HprofBuffer(hprof, chunkSize);
+  }
+  /**
    * Sets the proguard map to use for deobfuscating the heap.
    *
    * @param map proguard map to use to deobfuscate the heap.
@@ -146,6 +157,21 @@ public class Parser {
   public static AhatSnapshot parseHeapDump(File hprof, ProguardMap map)
       throws IOException, HprofFormatException {
     return new Parser(hprof).map(map).parse();
+  }
+
+  /**
+   * Parses a heap dump from a File with given proguard map and a chunk size
+   *
+   * @param hprof the hprof file to parse
+   * @param map the proguard map for deobfuscation
+   * @param chunkSize the size of the mapping to access the hprof file
+   * @return the parsed heap dump
+   * @throws IOException if the heap dump could not be read
+   * @throws HprofFormatException if the heap dump is not properly formatted
+   */
+  public static AhatSnapshot parseHeapDump(File hprof, ProguardMap map, int chunkSize)
+      throws IOException, HprofFormatException {
+    return new Parser(hprof, chunkSize).map(map).parse();
   }
 
   /**
@@ -919,96 +945,63 @@ public class Parser {
   }
 
   /**
-   * SeekableByteChannel interface for ByteBuffer.
-   */
-  private static class ByteBufferChannel implements SeekableByteChannel {
-    private final ByteBuffer mBuffer;
-
-    ByteBufferChannel(ByteBuffer buffer) {
-      mBuffer = buffer;
-    }
-
-    @Override
-    public long position() throws IOException {
-      return mBuffer.position();
-    }
-
-    @Override
-    public SeekableByteChannel position(long newPosition) throws IOException {
-      mBuffer.position((int) newPosition);
-      return this;
-    }
-
-    @Override
-    public int read(ByteBuffer dst) throws IOException {
-      int read = 0;
-      while (dst.hasRemaining() && mBuffer.hasRemaining()) {
-        dst.put(mBuffer.get());
-        read++;
-      }
-      return read;
-    }
-
-    @Override
-    public long size() throws IOException {
-      return mBuffer.capacity();
-    }
-
-    @Override
-    public SeekableByteChannel truncate(long size) throws IOException {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int write(ByteBuffer src) throws IOException {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public boolean isOpen() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void close() throws IOException {
-      throw new UnsupportedOperationException();
-    }
-  }
-
-  /**
    * Wrapper around a ByteBuffer that presents a uniform interface for
    * accessing data from an hprof file.
    */
   private static class HprofBuffer {
     private boolean mIdSize8;
-    private final SeekableByteChannel mChannel;
-    private final ByteBuffer mBuffer = ByteBuffer.allocate(1024);
+    private final FileChannel mChannel;
+    private ByteBuffer mBuffer;
     private long mBufferStartPosition = 0;
+    private long mSize;
+    private final int mChunkSize;
+
+    private static final int DEFAULT_CHUNK_SIZE = 1024 * 1024;
 
     HprofBuffer(File path) throws IOException {
+      this(path, DEFAULT_CHUNK_SIZE);
+    }
+
+    HprofBuffer(File path, int chunkSize) throws IOException {
       mChannel = FileChannel.open(path.toPath(), StandardOpenOption.READ);
-      mBuffer.flip();
+      mSize = mChannel.size();
+      mChunkSize = chunkSize;
+      mBuffer = remap(0L);
     }
 
     HprofBuffer(ByteBuffer buffer) {
-      mChannel = new ByteBufferChannel(buffer);
-      mBuffer.flip();
+      mChannel = null;
+      mSize = mChunkSize = buffer.limit();
+      mBuffer = buffer;
     }
 
-    private void readChannel(ByteBuffer dst) throws IOException {
-      if (mChannel.read(dst) <= 0) {
+    /**
+     * mBuffer is used as a window to access data from different part of the file.
+     * This method updates this window by mapping at the specified start position.
+     */
+    private ByteBuffer remap(long start) throws IOException {
+      long size = Math.min(mChunkSize, mSize - start);
+      mBuffer = mChannel.map(FileChannel.MapMode.READ_ONLY, start, size);
+      mBufferStartPosition = start;
+      return mBuffer;
+    }
+
+    /**
+     * Returns a ByteBuffer as a window into the file where the next number of
+     * bytes could be accessed. In the case of source being a ByteBuffer, the
+     * window is that whole ByteBuffer, and there should always be enough bytes
+     * to read.
+     */
+    private ByteBuffer read(int bytesToRead) throws IOException {
+      if (mBuffer.remaining() >= bytesToRead) {
+        return mBuffer;
+      }
+      if (mChannel == null) {
+        // if this is not file based, this means there are not enough bytes to read
         throw new BufferUnderflowException();
       }
-    }
-
-    private ByteBuffer read(int num_bytes) throws IOException {
-      while (num_bytes > mBuffer.remaining()) {
-        mBufferStartPosition = mChannel.position() - mBuffer.remaining();
-        mBuffer.compact();
-        readChannel(mBuffer);
-        mBuffer.flip();
-      }
-      return mBuffer;
+      // update mBuffer by mapping into the next chunk
+      return remap(mBufferStartPosition + mBuffer.position());
     }
 
     void setIdSize8() {
@@ -1016,14 +1009,14 @@ public class Parser {
     }
 
     boolean hasRemaining() throws IOException {
-      return mBuffer.hasRemaining() || mChannel.position() < mChannel.size();
+      return mBuffer.hasRemaining() || mBufferStartPosition + mBuffer.position() < mSize;
     }
 
     /**
      * Returns the size of the file in bytes.
      */
     long size() throws IOException {
-      return mChannel.size();
+      return mSize;
     }
 
     /**
@@ -1037,10 +1030,16 @@ public class Parser {
      * Seek to the given absolution position in the file.
      */
     void seek(long position) throws IOException {
-      mChannel.position(position);
-      mBuffer.clear();
-      mBuffer.flip();
-      mBufferStartPosition = position;
+      if (mChannel == null) {
+        mBuffer.position((int) position);
+        return;
+      }
+      long offset = position - mBufferStartPosition;
+      if (offset >= 0 && offset < mBuffer.limit()) {
+        mBuffer.position((int) offset);
+        return;
+      }
+      remap(position);
     }
 
     /**
@@ -1096,15 +1095,20 @@ public class Parser {
         mBuffer.get(bytes);
         return;
       }
-
-      ByteBuffer buf = ByteBuffer.wrap(bytes);
-      buf.put(mBuffer);
-      while (buf.hasRemaining()) {
-        readChannel(buf);
+      ByteBuffer target = ByteBuffer.wrap(bytes);
+      int bytesToRead;
+      while ((bytesToRead = target.remaining()) > 0) {
+        ByteBuffer source = read(bytesToRead);
+        int nbytes = Math.min(source.remaining(), bytesToRead);
+        // temporarily change source.limit to copy nbytes to target
+        int originalLimit = source.limit();
+        try {
+          source.limit(source.position() + nbytes);
+          target.put(source);
+        } finally {
+          source.limit(originalLimit);
+        }
       }
-      mBuffer.clear();
-      mBuffer.flip();
-      mBufferStartPosition = mChannel.position();
     }
 
     short getShort() throws IOException {

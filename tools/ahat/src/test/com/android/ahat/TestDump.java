@@ -28,10 +28,14 @@ import com.android.ahat.heapdump.Site;
 import com.android.ahat.heapdump.Value;
 import com.android.ahat.proguard.ProguardMap;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -75,7 +79,7 @@ public class TestDump {
   /**
    * Read the named resource into a ByteBuffer.
    */
-  private static ByteBuffer dataBufferFromResource(String name) throws IOException {
+  static ByteBuffer getResourceAsByteBuffer(String name) throws IOException {
     ClassLoader loader = TestDump.class.getClassLoader();
     InputStream is = loader.getResourceAsStream(name);
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -85,6 +89,34 @@ public class TestDump {
       baos.write(buf, 0, read);
     }
     return ByteBuffer.wrap(baos.toByteArray());
+  }
+
+  /**
+   * Export the resource of name into a file with the same name in path
+   */
+  static File getResourceAsFile(String name) throws IOException {
+    Path heapFile = Files.createTempFile(name, ".hprof");
+    ClassLoader loader = TestDump.class.getClassLoader();
+    InputStream is = loader.getResourceAsStream(name);
+    Files.copy(is, heapFile, StandardCopyOption.REPLACE_EXISTING);
+    return heapFile.toFile();
+  }
+
+  /**
+   * Read the named resource into a ProguardMap
+   */
+  static ProguardMap getProguardMapFromResource(String name) throws IOException {
+    ProguardMap map = new ProguardMap();
+    if (name != null) {
+      try {
+        ClassLoader loader = TestDump.class.getClassLoader();
+        InputStream is = loader.getResourceAsStream(name);
+        map.readFromReader(new InputStreamReader(is));
+      } catch (ParseException e) {
+        throw new IOException("Unable to load proguard map", e);
+      }
+    }
+    return map;
   }
 
   /**
@@ -112,19 +144,10 @@ public class TestDump {
    * the proguard map.
    */
   private void load() throws IOException {
-    ProguardMap map = new ProguardMap();
-    if (mMapResource != null) {
-      try {
-        ClassLoader loader = TestDump.class.getClassLoader();
-        InputStream is = loader.getResourceAsStream(mMapResource);
-        map.readFromReader(new InputStreamReader(is));
-      } catch (ParseException e) {
-        throw new IOException("Unable to load proguard map", e);
-      }
-    }
+    ProguardMap map = getProguardMapFromResource(mMapResource);
 
     try {
-      ByteBuffer hprof = dataBufferFromResource(mHprofResource);
+      ByteBuffer hprof = getResourceAsByteBuffer(mHprofResource);
       mSnapshot = new Parser(hprof).map(map).retained(mRetained).parse();
       mMain = findClass(mSnapshot, "Main");
       assert(mMain != null);
@@ -134,7 +157,7 @@ public class TestDump {
 
     if (mHprofBaseResource != null) {
       try {
-        ByteBuffer hprofBase = dataBufferFromResource(mHprofBaseResource);
+        ByteBuffer hprofBase = getResourceAsByteBuffer(mHprofBaseResource);
         mBaseline = new Parser(hprofBase).map(map).retained(mRetained).parse();
         mBaselineMain = findClass(mBaseline, "Main");
         assert(mBaselineMain != null);
@@ -195,7 +218,7 @@ public class TestDump {
    * Returns a class object in the given heap dump whose name matches the
    * given name, or null if no such class object could be found.
    */
-  private static AhatClassObj findClass(AhatSnapshot snapshot, String name) {
+  static AhatClassObj findClass(AhatSnapshot snapshot, String name) {
     Site root = snapshot.getRootSite();
     Collection<AhatInstance> classes = new ArrayList<AhatInstance>();
     root.getObjects(null, "java.lang.Class", classes);

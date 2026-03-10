@@ -16,10 +16,19 @@
 
 package com.android.ahat;
 
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+
+import com.android.ahat.heapdump.AhatClassObj;
+import com.android.ahat.heapdump.AhatSnapshot;
 import com.android.ahat.heapdump.HprofFormatException;
 import com.android.ahat.heapdump.Parser;
+import com.android.ahat.heapdump.Reachability;
 import com.android.ahat.proguard.ProguardMap;
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.ByteBuffer;
 import org.junit.Test;
 
@@ -30,6 +39,46 @@ public class ParserTest {
    */
   @Test(expected = HprofFormatException.class)
   public void emptyHeapDump() throws IOException, HprofFormatException {
+    // test empty ByteBuffer
     Parser.parseHeapDump(ByteBuffer.allocate(0), new ProguardMap());
+
+    // test empty File
+    File emptyFile = Files.createTempFile("empty", ".hprof").toFile();
+    assertTrue(emptyFile.createNewFile());
+    try {
+      Parser.parseHeapDump(emptyFile, new ProguardMap());
+    } finally {
+      Files.deleteIfExists(emptyFile.toPath());
+    }
+  }
+
+  @Test
+  public void heapDumpAsByteBuffer() throws IOException, HprofFormatException {
+    ByteBuffer hprof = TestDump.getResourceAsByteBuffer("test-dump.hprof");
+    ProguardMap map = TestDump.getProguardMapFromResource("test-dump.map");
+    AhatSnapshot snapshot = Parser.parseHeapDump(hprof, map);
+    AhatClassObj main = TestDump.findClass(snapshot, "Main");
+    assertNotNull(main);
+  }
+
+  @Test
+  public void heapDumpAsFile() throws IOException, HprofFormatException {
+    File hprof = TestDump.getResourceAsFile("test-dump.hprof");
+    ProguardMap map = TestDump.getProguardMapFromResource("test-dump.map");
+
+    try {
+      // test default chunk size
+      AhatSnapshot snapshot = Parser.parseHeapDump(hprof, map);
+      AhatClassObj main = TestDump.findClass(snapshot, "Main");
+      assertNotNull(main);
+
+      // test small chunk size
+      int chunkSize = 256;
+      snapshot = Parser.parseHeapDump(hprof, map, chunkSize);
+      main = TestDump.findClass(snapshot, "Main");
+      assertNotNull(main);
+    } finally {
+      Files.deleteIfExists(hprof.toPath());
+    }
   }
 }
