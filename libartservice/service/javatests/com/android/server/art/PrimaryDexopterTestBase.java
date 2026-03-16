@@ -38,7 +38,6 @@ import com.android.modules.utils.pm.PackageStateModulesUtils;
 import com.android.server.art.DexUseManagerLocal.DexLoader;
 import com.android.server.art.model.Config;
 import com.android.server.art.testing.StaticMockitoRule;
-import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.pm.PackageManagerLocal.FilteredSnapshot;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
@@ -54,7 +53,6 @@ import org.mockito.Mock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadPoolExecutor;
 
 public class PrimaryDexopterTestBase {
@@ -76,7 +74,7 @@ public class PrimaryDexopterTestBase {
     @Mock protected DexUseManagerLocal mDexUseManager;
     @Mock protected StorageManager mStorageManager;
     @Mock protected DexMetadataHelper.Injector mDexMetadataHelperInjector;
-    @Mock protected AsyncExecutor mAsyncExecutor;
+    @Mock protected ThreadPoolExecutor mReporterExecutor;
     protected PackageState mPkgState;
     protected AndroidPackage mPkg;
     protected PackageUserState mPkgUserStateNotInstalled;
@@ -103,7 +101,7 @@ public class PrimaryDexopterTestBase {
         lenient().when(mInjector.getStorageManager()).thenReturn(mStorageManager);
         lenient().when(mInjector.getArtVersion()).thenReturn(ART_VERSION);
         lenient().when(mInjector.getConfig()).thenReturn(mConfig);
-        lenient().when(mInjector.getAsyncExecutor()).thenReturn(mAsyncExecutor);
+        lenient().when(mInjector.getReporterExecutor()).thenReturn(mReporterExecutor);
         lenient().when(mInjector.getDexMetadataHelper()).thenReturn(mDexMetadataHelper);
         lenient().when(mInjector.isPreReboot()).thenReturn(false);
 
@@ -132,12 +130,6 @@ public class PrimaryDexopterTestBase {
         lenient().when(mDexUseManager.isPrimaryDexUsedByOtherApps(any(), any())).thenReturn(false);
 
         lenient().when(mStorageManager.getAllocatableBytes(any())).thenReturn(1l);
-
-        // Swallow the async tasks. They are for metric reporting and are not needed except in
-        // PrimaryDexopterReporterTest, where we override this.
-        lenient()
-                .when(mAsyncExecutor.executeAsync(any(Runnable.class)))
-                .thenReturn(CompletableFuture.completedFuture(null));
 
         // Set up the primary dex loaders to make sure that the secondary ISA is
         // used and dexopted when calling {@link Utils#getUsedPrimaryDexAbis()}.

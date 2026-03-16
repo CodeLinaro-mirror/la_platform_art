@@ -34,6 +34,8 @@ import com.android.server.art.IArtd;
 
 import java.lang.ref.Cleaner;
 import java.lang.ref.Reference;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 /**
  * A helper class that caches a reference to artd, to avoid repetitive calls to `waitForService`,
@@ -73,7 +75,7 @@ public class ArtdRefCache {
     @VisibleForTesting
     public ArtdRefCache(@NonNull Injector injector) {
         mInjector = injector;
-        mDebouncer = new Debouncer(CACHE_TIMEOUT_MS, mInjector.getAsyncExecutor());
+        mDebouncer = new Debouncer(CACHE_TIMEOUT_MS, mInjector::createScheduledExecutor);
     }
 
     @NonNull
@@ -108,6 +110,22 @@ public class ArtdRefCache {
             }
             delayedDropIfNoPinLocked();
             return mArtd;
+        }
+    }
+
+    /**
+     * Resets ArtdRefCache to its initial state. ArtdRefCache is guaranteed to be GC-able after
+     * this call.
+     *
+     * Can only be called when there is no pin.
+     */
+    public void reset() {
+        synchronized (mLock) {
+            if (mPinCount != 0) {
+                throw new IllegalStateException("Cannot reset ArtdRefCache when there are pins");
+            }
+            mArtd = null;
+            mDebouncer.cancel();
         }
     }
 
@@ -213,8 +231,8 @@ public class ArtdRefCache {
         }
 
         @NonNull
-        public AsyncExecutor getAsyncExecutor() {
-            return AsyncExecutor.getInstance();
+        public ScheduledExecutorService createScheduledExecutor() {
+            return Executors.newScheduledThreadPool(1 /* corePoolSize */);
         }
     }
 }

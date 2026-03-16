@@ -48,7 +48,6 @@ import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
 import com.android.server.art.utils.AidlUtils;
 import com.android.server.art.utils.ArtdRefCache;
 import com.android.server.art.utils.AsLog;
-import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.art.utils.Utils;
 import com.android.server.art.utils.Utils.Abi;
 import com.android.server.art.utils.Utils.InitProfileResult;
@@ -378,10 +377,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
                 session.recordResultForRemainingAbis(Dex2OatResult.failedToStart());
                 throw e;
             } finally {
-                mInjector.getAsyncExecutor().executeAsync(session::report).exceptionally(t -> {
-                    AsLog.wtf("Fatal error", t);
-                    return null;
-                });
+                mInjector.getReporterExecutor().execute(session::report);
                 if (profile != null && profile.getTag() == ProfilePath.tmpProfilePath) {
                     mInjector.getArtd().deleteProfile(profile);
                 }
@@ -827,10 +823,13 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     public static class Injector {
         @NonNull private final Context mContext;
         @NonNull private final Config mConfig;
+        @NonNull private final Executor mReporterExecutor;
 
-        public Injector(@NonNull Context context, @NonNull Config config) {
+        public Injector(@NonNull Context context, @NonNull Config config,
+                @NonNull Executor reporterExecutor) {
             mContext = context;
             mConfig = config;
+            mReporterExecutor = reporterExecutor;
 
             // Call the getters for various dependencies, to ensure correct initialization order.
             getUserManager();
@@ -892,8 +891,9 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
             return mConfig;
         }
 
-        public AsyncExecutor getAsyncExecutor() {
-            return AsyncExecutor.getInstance();
+        @NonNull
+        public Executor getReporterExecutor() {
+            return mReporterExecutor;
         }
 
         @NonNull

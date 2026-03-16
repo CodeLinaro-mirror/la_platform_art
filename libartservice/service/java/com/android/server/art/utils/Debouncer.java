@@ -18,28 +18,46 @@ package com.android.server.art.utils;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
-import android.os.Build;
-
-import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.GuardedBy;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * A class that executes commands with a minimum interval.
  *
  * @hide
  */
-@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class Debouncer {
-    @NonNull private final AsyncExecutor mAsyncExecutor;
+    @NonNull private Supplier<ScheduledExecutorService> mScheduledExecutorFactory;
     private final long mIntervalMs;
-    @GuardedBy("this") @Nullable private CompletableFuture<?> mCurrentTask = null;
+    @GuardedBy("this") @Nullable private ScheduledFuture<?> mCurrentTask = null;
+    @GuardedBy("this") @Nullable private ScheduledExecutorService mExecutor = null;
 
-    public Debouncer(long intervalMs, @NonNull AsyncExecutor asyncExecutor) {
-        mAsyncExecutor = asyncExecutor;
+    public Debouncer(
+            long intervalMs, @NonNull Supplier<ScheduledExecutorService> scheduledExecutorFactory) {
+        mScheduledExecutorFactory = scheduledExecutorFactory;
         mIntervalMs = intervalMs;
+    }
+
+    private void runTask(@NonNull Runnable command, @NonNull ScheduledExecutorService executor) {
+        synchronized (this) {
+            // In rare cases, at this point, another task may have been scheduled on the same
+            // executor, and `mExecutor` will be null or a new executor when that task is run, but
+            // that's okay. Either that task won't pass the check below or it will be cancelled.
+            // For simplicity, every task only shuts down its own executor.
+            // We only need to guarantee the following:
+            // - No new task is scheduled on an executor after the executor is shut down.
+            // - Every executor is eventually shut down.
+            if (mExecutor == executor) {
+                mExecutor.shutdown();
+                mExecutor = null;
+            }
+        }
+        command.run();
     }
 
     /**
@@ -48,15 +66,23 @@ public class Debouncer {
      */
     synchronized public void maybeRunAsync(@NonNull Runnable command) {
         if (mCurrentTask != null) {
-            mAsyncExecutor.cancelTask(mCurrentTask);
+            mCurrentTask.cancel(false /* mayInterruptIfRunning */);
         }
-        mCurrentTask = mAsyncExecutor.executeDelayed(command, mIntervalMs);
+        if (mExecutor == null) {
+            mExecutor = mScheduledExecutorFactory.get();
+        }
+        ScheduledExecutorService executor = mExecutor;
+        mCurrentTask = mExecutor.schedule(
+                () -> runTask(command, executor), mIntervalMs, TimeUnit.MILLISECONDS);
     }
 
     synchronized public void cancel() {
         if (mCurrentTask != null) {
-            mAsyncExecutor.cancelTask(mCurrentTask);
-            mCurrentTask = null;
+            mCurrentTask.cancel(false /* mayInterruptIfRunning */);
+        }
+        if (mExecutor != null) {
+            mExecutor.shutdown();
+            mExecutor = null;
         }
     }
 }

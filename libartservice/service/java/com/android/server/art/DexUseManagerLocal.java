@@ -57,7 +57,6 @@ import com.android.server.art.proto.SecondaryDexUseProto;
 import com.android.server.art.proto.SecondaryDexUseRecordProto;
 import com.android.server.art.utils.ArtdRefCache;
 import com.android.server.art.utils.AsLog;
-import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.art.utils.Debouncer;
 import com.android.server.art.utils.Utils;
 import com.android.server.pm.PackageManagerLocal;
@@ -91,6 +90,8 @@ import java.util.Optional;
 import java.util.SequencedMap;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -198,7 +199,7 @@ public class DexUseManagerLocal {
     @VisibleForTesting
     public DexUseManagerLocal(@NonNull Injector injector) {
         mInjector = injector;
-        mDebouncer = new Debouncer(INTERVAL_MS, mInjector.getAsyncExecutor());
+        mDebouncer = new Debouncer(INTERVAL_MS, mInjector::createScheduledExecutor);
         load();
     }
 
@@ -1518,8 +1519,8 @@ public class DexUseManagerLocal {
         }
 
         @NonNull
-        public AsyncExecutor getAsyncExecutor() {
-            return AsyncExecutor.getInstance();
+        public ScheduledExecutorService createScheduledExecutor() {
+            return Executors.newScheduledThreadPool(1 /* corePoolSize */);
         }
 
         @NonNull

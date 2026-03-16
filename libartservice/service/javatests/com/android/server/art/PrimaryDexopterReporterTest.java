@@ -39,7 +39,6 @@ import org.junit.Test;
 import org.mockito.ArgumentMatchers;
 
 import java.nio.file.NoSuchFileException;
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 
 public final class PrimaryDexopterReporterTest extends PrimaryDexopterTestBase {
@@ -83,6 +82,8 @@ public final class PrimaryDexopterReporterTest extends PrimaryDexopterTestBase {
     public void setUp() throws Exception {
         super.setUp();
 
+        lenient().when(mInjector.getReporterExecutor()).thenReturn(Runnable::run);
+
         // By default, none of the profiles are usable.
         lenient().when(mArtd.isProfileUsable(any(), anyString())).thenReturn(false);
         lenient()
@@ -102,12 +103,6 @@ public final class PrimaryDexopterReporterTest extends PrimaryDexopterTestBase {
                 .when(mArtd.getDexoptNeeded(
                         anyString(), anyString(), anyString(), anyString(), anyInt(), any()))
                 .thenReturn(dexoptIsNeeded());
-
-        // Make asynchronous reporting synchronous.
-        lenient().when(mAsyncExecutor.executeAsync(any(Runnable.class))).thenAnswer(invocation -> {
-            invocation.<Runnable>getArgument(0).run();
-            return CompletableFuture.completedFuture(null);
-        });
 
         mockPrimaryDexopter(DEXOPT_PARAMS_SPEED_PROFILE);
     }

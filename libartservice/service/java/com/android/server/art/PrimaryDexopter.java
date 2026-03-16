@@ -47,6 +47,7 @@ import com.android.server.pm.pkg.PackageState;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Executor;
 
 /** @hide */
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -56,10 +57,11 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
     private final FilteredSnapshot mSnapshot;
 
     public PrimaryDexopter(@NonNull Context context, @NonNull Config config,
-            @NonNull FilteredSnapshot snapshot, @NonNull PackageState pkgState,
-            @NonNull AndroidPackage pkg, @NonNull DexoptParams params,
-            @NonNull CancellationSignal cancellationSignal) {
-        this(new Injector(context, config), snapshot, pkgState, pkg, params, cancellationSignal);
+            @NonNull Executor reporterExecutor, @NonNull FilteredSnapshot snapshot,
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg,
+            @NonNull DexoptParams params, @NonNull CancellationSignal cancellationSignal) {
+        this(new Injector(context, config, reporterExecutor), snapshot, pkgState, pkg, params,
+                cancellationSignal);
     }
 
     @VisibleForTesting
