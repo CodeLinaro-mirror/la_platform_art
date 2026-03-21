@@ -17,6 +17,7 @@
 package com.android.server.art;
 
 import static com.android.server.art.testing.TestDataHelper.newPackageState;
+import static com.android.server.art.testing.TestingUtils.NOOP_EXECUTOR;
 import static com.android.server.art.testing.TestingUtils.deepEq;
 
 import static com.google.common.truth.Truth.assertThat;
@@ -41,6 +42,7 @@ import androidx.test.filters.SmallTest;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.server.art.DexUseManagerLocal.CheckedSecondaryDexInfo;
+import com.android.server.art.DexoptTrigger.DexoptComparator;
 import com.android.server.art.OutputArtifacts.PermissionSettings;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.Config;
@@ -50,7 +52,6 @@ import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
 import com.android.server.art.testing.StaticMockitoRule;
 import com.android.server.art.testing.TestingUtils;
 import com.android.server.art.utils.AidlUtils;
-import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
 
@@ -62,9 +63,6 @@ import org.mockito.Mock;
 
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.function.Function;
 
 @SmallTest
 @RunWith(AndroidJUnit4.class)
@@ -99,11 +97,14 @@ public class SecondaryDexopterTest {
             AidlUtils.buildOutputProfileForSecondary(
                     DEX_2, UID, UID, false /* isOtherReadable */, false /* isPreReboot */);
 
-    private final int mDefaultDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
-    private final int mBetterOrSameDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-            | DexoptTrigger.COMPILER_FILTER_IS_SAME
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+    private final DexoptTrigger mDefaultDexoptTrigger =
+            AidlUtils.buildDexoptTrigger(List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                    DexoptComparator.COMPARING_PRIMARY_BOOT_IMAGE_STATUS,
+                    DexoptComparator.COMPARING_EXTRACTION_STATUS));
+    private final DexoptTrigger mProfileChangedDexoptTrigger = AidlUtils.buildDexoptTrigger(
+            List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                    DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+            "profile changed");
 
     private final MergeProfileOptions mMergeProfileOptions = new MergeProfileOptions();
 
@@ -115,7 +116,6 @@ public class SecondaryDexopterTest {
     @Mock private IArtd mArtd;
     @Mock private DexUseManagerLocal mDexUseManager;
     @Mock private DexMetadataHelper.Injector mDexMetadataHelperInjector;
-    @Mock private AsyncExecutor mAsyncExecutor;
     private PackageState mPkgState;
     private AndroidPackage mPkg;
     private CancellationSignal mCancellationSignal;
@@ -151,7 +151,6 @@ public class SecondaryDexopterTest {
         lenient().when(mInjector.isLauncherPackage(any())).thenReturn(false);
         lenient().when(mInjector.getDexUseManager()).thenReturn(mDexUseManager);
         lenient().when(mInjector.getConfig()).thenReturn(mConfig);
-        lenient().when(mInjector.getAsyncExecutor()).thenReturn(mAsyncExecutor);
         lenient().when(mInjector.getDexMetadataHelper()).thenReturn(mDexMetadataHelper);
 
         List<CheckedSecondaryDexInfo> secondaryDexInfo = createSecondaryDexInfo();
@@ -165,7 +164,7 @@ public class SecondaryDexopterTest {
 
         // Dexopt is always needed and successful.
         lenient()
-                .when(mArtd.getDexoptNeeded(any(), any(), any(), any(), anyInt(), any()))
+                .when(mArtd.getDexoptNeeded(any(), any(), any(), any(), any(), any()))
                 .thenReturn(dexoptIsNeeded());
         lenient()
                 .when(mArtd.dexopt(any(), any(), any(), any(), any(), any(), any(), any(), anyInt(),
@@ -177,9 +176,7 @@ public class SecondaryDexopterTest {
                 .thenReturn(mock(IArtdCancellationSignal.class));
 
         // Swallow the async tasks. They are for metric reporting and are not needed here.
-        lenient()
-                .when(mAsyncExecutor.executeAsync(any(Runnable.class)))
-                .thenReturn(CompletableFuture.completedFuture(null));
+        lenient().when(mInjector.getAsyncExecutor()).thenReturn(NOOP_EXECUTOR);
 
         mSecondaryDexopter = new SecondaryDexopter(
                 mInjector, mPkgState, mPkg, mDexoptParams, mCancellationSignal);
@@ -205,7 +202,7 @@ public class SecondaryDexopterTest {
                 deepEq(mMergeProfileOptions));
 
         verify(mArtd).getDexoptNeeded(eq(DEX_1), eq("arm64"), any(), eq("speed-profile"),
-                eq(mBetterOrSameDexoptTrigger), any());
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_1, "arm64",
                 ProfilePath.tmpProfilePath(mDex1PrivateOutputProfile.profilePath), "CLC_FOR_DEX_1");
 
@@ -219,13 +216,13 @@ public class SecondaryDexopterTest {
                 deepEq(mDex2PrivateOutputProfile), deepEq(List.of(DEX_2)),
                 deepEq(mMergeProfileOptions));
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_2), eq("arm64"), any(), eq("speed-profile"), eq(mBetterOrSameDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_2), eq("arm64"), any(), eq("speed-profile"),
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_2, "arm64",
                 ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2");
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_2), eq("arm"), any(), eq("speed-profile"), eq(mBetterOrSameDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_2), eq("arm"), any(), eq("speed-profile"),
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_2, "arm",
                 ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2");
 
@@ -237,8 +234,8 @@ public class SecondaryDexopterTest {
         verify(mArtd, never()).isProfileUsable(deepEq(mDex3RefProfile), any());
         verify(mArtd, never()).mergeProfiles(any(), deepEq(mDex3RefProfile), any(), any(), any());
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_3), eq("arm64"), isNull(), eq("verify"), eq(mDefaultDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_3), eq("arm64"), isNull(), eq("verify"),
+                deepEq(mDefaultDexoptTrigger), any());
         checkDexoptWithNoProfile(verify(mArtd), DEX_3, "arm64", "verify",
                 null /* classLoaderContext */, false /* isPublic */);
     }
