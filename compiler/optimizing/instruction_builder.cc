@@ -1639,14 +1639,13 @@ void HInstructionBuilder::BuildConstructorFenceForAllocation(HInstruction* alloc
 
 static bool IsInImage(ObjPtr<mirror::Class> cls, const CompilerOptions& compiler_options)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(!cls->IsArrayClass());
-  DCHECK(!cls->IsPrimitive());
   if (Runtime::Current()->GetHeap()->ObjectIsInBootImageSpace(cls)) {
     return true;
   }
   if (compiler_options.IsGeneratingImage()) {
-    TypeReference type_ref(&cls->GetDexFile(), cls->GetDexTypeIndex());
-    return compiler_options.IsImageClass(type_ref, /*array_dim=*/ 0u);
+    std::string temp;
+    const char* descriptor = cls->GetDescriptor(&temp);
+    return compiler_options.IsImageClass(descriptor);
   } else {
     return false;
   }
