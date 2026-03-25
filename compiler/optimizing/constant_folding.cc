@@ -34,6 +34,7 @@
 #include "optimizing/data_type.h"
 #include "handle_cache-inl.h"
 #include "optimizing/nodes.h"
+#include "runtime.h"
 
 namespace art HIDDEN {
 
@@ -85,6 +86,7 @@ class HConstantFoldingVisitor final : public CRTPGraphVisitor<HConstantFoldingVi
   void VisitTypeConversion(HTypeConversion* inst);
   void VisitStaticFieldGet(HStaticFieldGet* inst);
   void VisitInstanceFieldGet(HInstanceFieldGet* inst);
+  void VisitLoadConstantTableEntry(HLoadConstantTableEntry* inst);
 
   void FoldFieldValue(HFieldAccess* inst, ObjPtr<mirror::Object> receiver)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -831,7 +833,10 @@ static bool IsUnmodifiableAndInitialized(ArtField* field, const CompilerOptions&
     return true;
   }
 
-  if (IsSdkVersionSetAndAtMost(Runtime::Current()->GetTargetSdkVersion(), SdkVersion::kB)) {
+  uint32_t target_sdk_version = Runtime::Current()->GetTargetSdkVersion();
+  // If target_sdk_verson is not yet set then no assumptions about static final fields can be made.
+  if (IsSdkVersionUnset(target_sdk_version) ||
+      IsSdkVersionSetAndAtMost(target_sdk_version, SdkVersion::kB)) {
     return false;
   }
 
@@ -861,7 +866,9 @@ static bool IsUnmodifiableAndInitialized(ArtField* field, const CompilerOptions&
   }
 
   // Can't use Runtime::GetSdkVersion in the compiler. See Runtime.sdk_version_ comment.
-  if (IsSdkVersionSetAndAtMost(compiler_options.GetAssumeValueOptions().SdkInt(), SdkVersion::kB)) {
+  uint32_t assumed_sdk_int = compiler_options.GetAssumeValueOptions().SdkInt();
+  if (IsSdkVersionUnset(assumed_sdk_int) ||
+      IsSdkVersionSetAndAtMost(assumed_sdk_int, SdkVersion::kB)) {
     return false;
   }
 
@@ -912,6 +919,28 @@ void HConstantFoldingVisitor::VisitInstanceFieldGet(HInstanceFieldGet* inst) {
     Handle<mirror::Object> receiver = input->AsFieldAccess()->GetConstantValue();
     ScopedObjectAccess soa(Thread::Current());
     FoldFieldValue(inst, receiver.Get());
+  }
+}
+
+void HConstantFoldingVisitor::VisitLoadConstantTableEntry(HLoadConstantTableEntry* inst) {
+  if (inst->GetIndex()->IsIntConstant()) {
+    size_t index = dchecked_integral_cast<size_t>(inst->GetIndex()->AsIntConstant()->GetValue());
+    DCHECK_LT(index, inst->GetNumEntries());
+    int64_t value = inst->GetEntry(index);
+    HInstruction* constant = nullptr;
+    if (inst->GetType() == DataType::Type::kInt64) {
+      constant = GetGraph()->GetLongConstant(value);
+    } else if (inst->GetType() == DataType::Type::kFloat64) {
+      constant = GetGraph()->GetDoubleConstant(bit_cast<double, int64_t>(value));
+    } else if (inst->GetType() == DataType::Type::kFloat32) {
+      constant = GetGraph()->GetFloatConstant(
+          bit_cast<float, uint32_t>(dchecked_integral_cast<uint32_t>(value)));
+    } else {
+      constant = GetGraph()->GetIntConstant(dchecked_integral_cast<int32_t>(value));
+    }
+    inst->ReplaceWith(constant);
+    inst->GetBlock()->RemoveInstruction(inst);
+    optimizations_occurred_ = true;
   }
 }
 

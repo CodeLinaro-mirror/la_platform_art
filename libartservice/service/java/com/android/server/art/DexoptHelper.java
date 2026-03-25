@@ -16,11 +16,7 @@
 
 package com.android.server.art;
 
-import static com.android.server.art.ArtManagerLocal.DexoptDoneCallback;
-import static com.android.server.art.model.Config.Callback;
-import static com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
-import static com.android.server.art.model.DexoptResult.PackageDexoptResult;
-
+import android.annotation.FlaggedApi;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.apphibernation.AppHibernationManager;
@@ -32,12 +28,20 @@ import android.os.RemoteException;
 
 import androidx.annotation.RequiresApi;
 
+import com.android.art.rw.flags.Flags;
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.server.art.ArtManagerLocal.DexoptDoneCallback;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.Config;
+import com.android.server.art.model.Config.Callback;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
+import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
+import com.android.server.art.model.DexoptResult.PackageDexoptResult;
 import com.android.server.art.model.OperationProgress;
+import com.android.server.art.model.VerifyDexoptArtifactsResult;
+import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.Utils;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.PackageManagerLocal.FilteredSnapshot;
 import com.android.server.pm.pkg.AndroidPackage;
@@ -195,6 +199,47 @@ public class DexoptHelper {
             // Make sure nothing leaks even if the caller holds `cancellationSignal` forever.
             cancellationSignal.setOnCancelListener(null);
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    @NonNull
+    public VerifyDexoptArtifactsResult verifyDexoptArtifacts(
+            @NonNull FilteredSnapshot snapshot, @NonNull Executor executor) {
+        if (!android.content.pm.Flags.verifiedDexopt()) {
+            return new VerifyDexoptArtifactsResult(false);
+        }
+        List<PackageState> pkgStates =
+                snapshot.getPackageStates()
+                        .values()
+                        .stream()
+                        .filter(this::canDexoptPackage)
+                        .filter(PackageState::shouldVerifyCompilationArtifacts)
+                        .toList();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        AtomicInteger failedCount = new AtomicInteger(0);
+
+        for (PackageState pkgState : pkgStates) {
+            futures.add(CompletableFuture.runAsync(() -> {
+                AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+                try {
+                    if (!verifyDexoptArtifactsPackage(snapshot, pkgState, pkg)) {
+                        failedCount.incrementAndGet();
+                    }
+                } catch (RuntimeException e) {
+                    AsLog.wtf("Unexpected package-level exception during verification", e);
+                }
+            }, executor));
+        }
+
+        futures.forEach(Utils::getFuture);
+        return new VerifyDexoptArtifactsResult(failedCount.get() == 0);
+    }
+
+    /** @return true if the dexopt artifacts are verified successfully. */
+    private boolean verifyDexoptArtifactsPackage(@NonNull FilteredSnapshot snapshot,
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg) {
+        // TODO(b/419024976): handle verify similar to dexopt above.
+        return true;
     }
 
     /**

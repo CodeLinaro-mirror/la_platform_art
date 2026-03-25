@@ -35,6 +35,7 @@
 #include "stack.h"
 #include "thread-inl.h"
 #include "thread.h"
+#include "trace.h"
 #include "unstarted_runtime.h"
 
 namespace art HIDDEN {
@@ -268,8 +269,7 @@ static inline JValue Execute(
     if (kIsDebugBuild) {
       // TODO(b/346542404): Check this precondition prorperly, and shouldn't emit method enter event
       // when unparking a virtual thread.
-      bool is_virtual = kIsVirtualThreadEnabled &&
-                        self->AreVirtualThreadFlagsEnabled(VirtualThreadFlag::kIsVirtual);
+      bool is_virtual = kIsVirtualThreadEnabled && self->IsVirtualThreadMounted();
       if (!is_virtual) {
         CHECK_EQ(shadow_frame.GetDexPC(), 0u);
       }
@@ -303,6 +303,7 @@ static inline JValue Execute(
       }
     }
 
+    TraceLowOverhead::RecordTraceEventIfNeeded(self, method, /*is_entry=*/true);
     instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
     if (UNLIKELY(instrumentation->HasMethodEntryListeners() || shadow_frame.GetForcePopFrame())) {
       instrumentation->MethodEnterEvent(self, method);

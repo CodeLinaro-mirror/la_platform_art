@@ -43,6 +43,8 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
   private AhatBitmapInstance.BitmapDumpData mBitmapDumpData = null;
   private AhatMessageInstance.MessageDumpData mMessageDumpData = null;
   private List<List<AhatInstance>> mDuplicateStrings = null;
+  private List<AhatInstance> mActivityLeaks = null;
+  private Reachability mRetained;
   private long mUptimeMillis = 0;
 
   AhatSnapshot(SuperRoot root,
@@ -56,13 +58,15 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
     mInstances = instances;
     mHeaps = heaps;
     mRootSite = rootSite;
+    mRetained = retained;
     mUptimeMillis = uptimeMillis;
 
     AhatInstance.computeReachability(mSuperRoot, mInstances, progress, mInstances.size());
 
     mBitmapDumpData = AhatBitmapInstance.findBitmapDumpData(mSuperRoot, mInstances);
     mMessageDumpData = AhatMessageInstance.findMessageDumpData(mInstances, progress, mInstances.size());
-    mDuplicateStrings = findDuplicateStrings(mInstances, progress);
+    mDuplicateStrings = findDuplicateStrings(mInstances, progress, retained);
+    mActivityLeaks = findActivityLeaks(mInstances, progress);
 
     for (AhatInstance inst : mInstances) {
       // Add this instance to its site.
@@ -81,28 +85,9 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
       }
     }
 
-    Dominators.Graph<AhatInstance> graph = new Dominators.Graph<AhatInstance>() {
-      @Override
-      public void setDominatorsComputationState(AhatInstance node, Object state) {
-        node.setTemporaryUserData(state);
-      }
-
-      @Override
-      public Object getDominatorsComputationState(AhatInstance node) {
-        return node.getTemporaryUserData();
-      }
-
-      @Override
-      public Iterable<AhatInstance> getReferencesForDominators(AhatInstance node) {
-        return node.getReferencesForDominators(retained);
-      }
-
-      @Override
-      public void setDominator(AhatInstance node, AhatInstance dominator) {
-        node.setDominator(dominator);
-      }
-    };
-    new Dominators(graph).progress(progress, mInstances.size()).computeDominators(mSuperRoot);
+    new Dominators<AhatInstance>(new AhatGraph(retained))
+        .progress(progress, mInstances.size())
+        .computeDominators((AhatInstance) mSuperRoot);
 
     AhatInstance.computeRetainedSize(mSuperRoot, mHeaps.size());
 
@@ -111,6 +96,34 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
     }
 
     mRootSite.prepareForUse(0, mHeaps.size(), retained);
+  }
+
+  private static class AhatGraph implements Dominators.Graph<AhatInstance> {
+    private final Reachability retained;
+
+    AhatGraph(Reachability retained) {
+      this.retained = retained;
+    }
+
+    @Override
+    public void setDominatorsComputationState(AhatInstance node, Object state) {
+      node.setTemporaryUserData(state);
+    }
+
+    @Override
+    public Object getDominatorsComputationState(AhatInstance node) {
+      return node.getTemporaryUserData();
+    }
+
+    @Override
+    public Iterable<AhatInstance> getReferencesForDominators(AhatInstance node) {
+      return node.getReferencesForDominators(retained);
+    }
+
+    @Override
+    public void setDominator(AhatInstance node, AhatInstance dominator) {
+      node.setDominator(dominator);
+    }
   }
 
   /**
@@ -253,7 +266,7 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
   }
 
   /**
-   * Returns duplicate strings in this snapshot
+   * Returns the duplicate strings in this snapshot.
    *
    * @return list of duplicate strings
    */
@@ -261,12 +274,34 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
     return mDuplicateStrings;
   }
 
+  /**
+   * Returns activity leaks in this snapshot.
+   * <p>
+   * The returned list is never null. If there are no leaks, an empty list is
+   * returned.
+   *
+   * @return list of activity leaks
+   */
+  public List<AhatInstance> getActivityLeaks() {
+    return mActivityLeaks;
+  }
+
+  /**
+   * Returns the reachability level that instances must have to be considered
+   * retained in this snapshot.
+   *
+   * @return the reachability level for retained instances
+   */
+  public Reachability getRetainedReachability() {
+    return mRetained;
+  }
+
   private static List<List<AhatInstance>> findDuplicateStrings(
-      Instances<AhatInstance> instances, Progress progress) {
+      Instances<AhatInstance> instances, Progress progress, Reachability retained) {
     progress.start("Analyzing strings", instances.size());
     Map<String, List<AhatInstance>> strings = new HashMap<>();
     for (AhatInstance inst : instances) {
-      if (inst.isInstanceOfClass("java.lang.String")) {
+      if (inst.isInstanceOfClass("java.lang.String") && inst.getReachability().notWeakerThan(retained)) {
         String value = inst.asString();
         if (value != null) {
           List<AhatInstance> list = strings.get(value);
@@ -288,5 +323,46 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
       }
     }
     return duplicates;
+  }
+
+  /**
+   * Identifies likely activity leaks in the snapshot.
+   * <p>
+   * This method scans all strongly reachable instances in the heap dump. It looks for
+   * classes that are subclasses of `android.app.Activity`. If an instance is found
+   * to be strongly reachable and its `mDestroyed` field is true, it is added to the
+   * list of leaks.
+   *
+   * @param instances the list of all instances in the heap dump
+   * @param progress for reporting progress
+   * @return a list of leaked activity instances
+   */
+  private static List<AhatInstance> findActivityLeaks(
+      Instances<AhatInstance> instances, Progress progress) {
+    progress.start("Analyzing activity leaks", instances.size());
+    List<AhatInstance> leaks = new ArrayList<>();
+    for (AhatInstance inst : instances) {
+      progress.advance();
+
+      // An activity can't be leaked if it isn't strongly reachable.
+      if (!inst.isStronglyReachable()) {
+        continue;
+      }
+
+      // Only look at instances of activities.
+      if (inst.getClassObj() == null || !inst.getClassObj().isSubClassOf("android.app.Activity")) {
+        continue;
+      }
+
+      // A non-destroyed activity is not considered a leak.
+      Value value = inst.getField("mDestroyed");
+      if (value == null || !value.isBoolean() || !value.asBoolean()) {
+        continue;
+      }
+
+      leaks.add(inst);
+    }
+    progress.done();
+    return leaks;
   }
 }

@@ -2594,7 +2594,7 @@ class CollectDexCacheVisitor : public DexCacheVisitor {
 // DexFile, OatDexFile, and DexCache are the same as the actual dex location.
 TEST_F(OatFileAssistantBaseTest, GetDexLocation) {
   std::string dex_location = GetScratchDir() + "/TestDex.jar";
-  std::string dex_location_multidex = dex_location + "!classes2.dex";
+  std::string dex_location_multidex = dex_location + "!1";
   std::string oat_location = GetOdexDir() + "/TestDex.odex";
   std::string art_location = GetOdexDir() + "/TestDex.art";
 
@@ -2658,6 +2658,10 @@ TEST_F(OatFileAssistantBaseTest, GetDexLocation) {
 // Test that a dex file on the platform location gets the right hiddenapi domain,
 // regardless of whether it has a backing oat file.
 TEST_F(OatFileAssistantBaseTest, SystemFrameworkDir) {
+  // Host tests rely on ANDROID_ROOT, but it's not supported by
+  // OatFileManager::OpenDexFilesFromOat.
+  TEST_DISABLED_FOR_HOST();
+
   std::string filebase = "OatFileAssistantTestSystemFrameworkDir";
   std::string dex_location = GetAndroidRoot() + "/framework/" + filebase + ".jar";
   Copy(GetDexSrc1(), dex_location);

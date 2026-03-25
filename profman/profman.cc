@@ -64,6 +64,7 @@
 #include "profile/profile_compilation_info.h"
 #include "profile_assistant.h"
 #include "profman/profman_result.h"
+#include "synthetic_class_format_util.h"
 
 namespace art {
 
@@ -540,8 +541,8 @@ class ProfMan final {
             } else {
               // Remove any annotations from the profile key before comparing with the keys we get from apks.
               std::string base_key = ProfileCompilationInfo::GetBaseKeyFromAugmentedKey(profile_key);
-              return profile_filter_keys.find(ProfileFilterKey(base_key, checksum)) !=
-                  profile_filter_keys.end();
+              std::string base_location = DexFileLoader::GetBaseLocation(base_key);
+              return profile_filter_keys.count(ProfileFilterKey(base_location, checksum)) != 0;
             }
         };
 
@@ -567,16 +568,16 @@ class ProfMan final {
 
   bool GetProfileFilterKeyFromApks(std::set<ProfileFilterKey>* profile_filter_keys) {
     return ForEachApkFile([&](File file, const std::string& location) {
+      std::string base_key = ProfileCompilationInfo::GetProfileDexFileBaseKey(location);
       ArtDexFileLoader dex_file_loader(&file, location);
-      std::vector<std::pair<std::string, uint32_t>> checksums;
+      std::vector<uint32_t> checksums;
       std::string error_msg;
       if (!dex_file_loader.GetMultiDexChecksums(&checksums, &error_msg)) {
         LOG(ERROR) << "Open failed for '" << location << "' " << error_msg;
         return false;
       }
-      for (const auto& [multi_dex_location, checksum] : checksums) {
-        profile_filter_keys->emplace(
-            ProfileCompilationInfo::GetProfileDexFileBaseKey(multi_dex_location), checksum);
+      for (const auto checksum : checksums) {
+        profile_filter_keys->emplace(base_key, checksum);
       }
       return true;
     });
@@ -997,22 +998,53 @@ class ProfMan final {
     return output.release();
   }
 
+  // Find class klass_descriptor in the given dex_files and store its reference
+  // in the out parameter class_ref, and/or the in_out class_def parameter if provided.
+  // Return true if a reference of the class was found in any of the dex_files (and the ClassDef
+  // handle was available, if requested).
+  template <typename Container>
+  bool FindClassImpl(const Container& dex_files,
+                     std::string_view klass_descriptor,
+                     /*out*/ TypeReference* class_ref,
+                     /*in_out*/ const dex::ClassDef** class_def = nullptr) {
+    auto find_class_impl = [&](std::string_view desc) {
+      for (const auto& dex_file : dex_files) {
+        const dex::TypeId* type_id = dex_file->FindTypeId(desc);
+        if (type_id == nullptr) {
+          continue;
+        }
+        dex::TypeIndex type_index = dex_file->GetIndexForTypeId(*type_id);
+        if (class_def != nullptr) {
+          *class_def = dex_file->FindClassDef(type_index);
+          if (*class_def == nullptr) {
+            continue;
+          }
+        }
+        *class_ref = TypeReference(std::to_address(dex_file), type_index);
+        return true;
+      }
+      return false;
+    };
+
+    if (find_class_impl(klass_descriptor)) {
+      return true;
+    }
+
+    // Try to find the class with the rewritten name.
+    if (auto rewritten_klass = RewriteSyntheticProfileClassIfNeeded(klass_descriptor)) {
+      return find_class_impl(*rewritten_klass);
+    }
+
+    return false;
+  }
+
   // Find class definition for a descriptor.
   const dex::ClassDef* FindClassDef(const std::vector<std::unique_ptr<const DexFile>>& dex_files,
                                     std::string_view klass_descriptor,
                                     /*out*/ TypeReference* class_ref) {
-    for (const std::unique_ptr<const DexFile>& dex_file : dex_files) {
-      const dex::TypeId* type_id = dex_file->FindTypeId(klass_descriptor);
-      if (type_id != nullptr) {
-        dex::TypeIndex type_index = dex_file->GetIndexForTypeId(*type_id);
-        const dex::ClassDef* class_def = dex_file->FindClassDef(type_index);
-        if (class_def != nullptr) {
-          *class_ref = TypeReference(dex_file.get(), type_index);
-          return class_def;
-        }
-      }
-    }
-    return nullptr;
+    const dex::ClassDef* class_def = nullptr;
+    FindClassImpl(dex_files, klass_descriptor, class_ref, &class_def);
+    return class_def;
   }
 
   // Find class klass_descriptor in the given dex_files and store its reference
@@ -1021,15 +1053,13 @@ class ProfMan final {
   bool FindClass(const std::vector<std::unique_ptr<const DexFile>>& dex_files,
                  std::string_view klass_descriptor,
                  /*out*/ TypeReference* class_ref) {
-    for (const std::unique_ptr<const DexFile>& dex_file_ptr : dex_files) {
-      const DexFile* dex_file = dex_file_ptr.get();
-      const dex::TypeId* type_id = dex_file->FindTypeId(klass_descriptor);
-      if (type_id != nullptr) {
-        *class_ref = TypeReference(dex_file, dex_file->GetIndexForTypeId(*type_id));
-        return true;
-      }
-    }
-    return false;
+    return FindClassImpl(dex_files, klass_descriptor, class_ref);
+  }
+
+  bool FindClass(const DexFile* dex_file,
+                 std::string_view klass_descriptor,
+                 /*out*/ TypeReference* class_ref) {
+    return FindClassImpl(std::array{dex_file}, klass_descriptor, class_ref);
   }
 
   // Find the method specified by method_spec in the class class_ref.
@@ -1513,16 +1543,15 @@ class ProfMan final {
         } else {
           // Get the type-ref the method code will use.
           std::string_view receiver_descriptor = segment.GetReceiverType();
-          const dex::TypeId *type_id = class_ref.dex_file->FindTypeId(receiver_descriptor);
-          if (type_id == nullptr) {
+          TypeReference receiver_ref(/* dex_file= */ nullptr, dex::TypeIndex());
+          if (!FindClass(class_ref.dex_file, receiver_descriptor, &receiver_ref)) {
             LOG(WARNING) << "Could not find class: "
                          << segment.GetReceiverType() << " in dex-file "
                          << class_ref.dex_file << ". Ignoring IC group: '"
                          << segment << "'";
             continue;
           }
-          dex::TypeIndex target_index =
-              class_ref.dex_file->GetIndexForTypeId(*type_id);
+          dex::TypeIndex target_index = receiver_ref.TypeIndex();
 
           GetAllInvokes(resolved_class_method_ref->type_,
                         resolved_class_method_ref->method_index_,

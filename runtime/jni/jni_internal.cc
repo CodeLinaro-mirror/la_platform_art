@@ -22,6 +22,7 @@
 #include <memory>
 #include <utility>
 
+#include "android-base/macros.h"
 #include "art_field-inl.h"
 #include "art_method-alloc-inl.h"
 #include "base/allocator.h"
@@ -36,6 +37,7 @@
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
+#include "dex/modifiers.h"
 #include "dex/primitive.h"
 #include "dex/utf-inl.h"
 #include "fault_handler.h"
@@ -579,6 +581,15 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
     return nullptr;
   }
   return field;
+}
+
+
+jfieldID EncodeArtFieldInternal(ArtField* field) {
+  return reinterpret_cast<jfieldID>(field);
+}
+
+ArtField* DecodeArtFieldInternal(jfieldID fid) {
+  return reinterpret_cast<ArtField*>(fid);
 }
 
 int ThrowNewException(JNIEnv* env, jclass exception_class, const char* msg, jobject cause)
@@ -1610,19 +1621,57 @@ class JNI {
     f->SetObject<false>(o, v);
   }
 
-  static void SetStaticObjectField(JNIEnv* env, jclass, jfieldID fid, jobject java_value) {
-    CHECK_NON_NULL_ARGUMENT_RETURN_VOID(fid);
-    ScopedObjectAccess soa(env);
-    ArtField* f = jni::DecodeArtField<kEnableIndexIds>(fid);
+  static bool IsInitialized(ArtField* f) REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(f->IsStatic()) << f->PrettyField();
+    bool is_prim = f->IsPrimitiveType();
+    bool is_ref = !is_prim;
+    return (is_ref && !f->GetObject(f->GetDeclaringClass()).IsNull()) ||
+            (is_prim && !IsZero(f));
+  }
+
+  static void RecordModificationAttempt(ArtField* f) REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(f->IsStatic()) << f->PrettyField();
+    if (UNLIKELY(f->IsFinal() && !f->IsWriteProtected())) {
+      if (!Runtime::Current()->IsJavaDebuggableAtInit() || IsInitialized(f)) {
+        if (f->GetDeclaringClass()->IsBootStrapClassLoaded()) {
+          Runtime::Current()->GetMetrics()->BcpStaticFinalFieldOverwrite()->AddOne();
+        } else {
+          Runtime::Current()->GetMetrics()->AppStaticFinalFieldOverwrite()->AddOne();
+        }
+      }
+    }
+  }
+
+  static void EnsureModifiable(ArtField* f) REQUIRES_SHARED(Locks::mutator_lock_) {
+    RecordModificationAttempt(f);
     // Android Studio needs to be able to overwrite newly introduced fields in class redefinition
     // process.
     if (IsUnmodifiable(f)) {
       if (!Runtime::Current()->IsJavaDebuggableAtInit()) {
-        LOG(FATAL) << "Can't overwrite value of " << f->PrettyField();
-      } else if (!f->GetObject(f->GetDeclaringClass()).IsNull()) {
-        LOG(FATAL) << "Can't overwrite value of already initialized " << f->PrettyField();
+        LOG(FATAL) << "Cannot set "
+                   << PrettyJavaAccessFlags(f->GetAccessFlags())
+                   << " field "
+                   << ArtField::PrettyField(f)
+                   << " of class "
+                   << f->GetDeclaringClass()->PrettyClass();
+      } else {
+        if (IsInitialized(f)) {
+          LOG(FATAL) << "Cannot set value of already initialized "
+                     << PrettyJavaAccessFlags(f->GetAccessFlags())
+                     << " field "
+                     << ArtField::PrettyField(f)
+                     << " of class "
+                     << f->GetDeclaringClass()->PrettyClass();
+        }
       }
     }
+  }
+
+  static void SetStaticObjectField(JNIEnv* env, jclass, jfieldID fid, jobject java_value) {
+    CHECK_NON_NULL_ARGUMENT_RETURN_VOID(fid);
+    ScopedObjectAccess soa(env);
+    ArtField* f = jni::DecodeArtField<kEnableIndexIds>(fid);
+    EnsureModifiable(f);
     NotifySetObjectField(f, nullptr, java_value);
     ObjPtr<mirror::Object> v = soa.Decode<mirror::Object>(java_value);
     f->SetObject<false>(f->GetDeclaringClass(), v);
@@ -1686,15 +1735,7 @@ class JNI {
   CHECK_NON_NULL_ARGUMENT_RETURN_VOID(fid); \
   ScopedObjectAccess soa(env); \
   ArtField* f = jni::DecodeArtField<kEnableIndexIds>(fid); \
-  /* Android Studio needs to be able to overwrite newly introduced fields in class redefinition */ \
-  /* process. */ \
-  if (IsUnmodifiable(f)) { \
-    if (!Runtime::Current()->IsJavaDebuggableAtInit()) { \
-      LOG(FATAL) << "Can't overwrite value of " << f->PrettyField(); \
-    } else if (!IsZero(f)) { \
-      LOG(FATAL) << "Can't overwrite value of already initialized " << f->PrettyField(); \
-    } \
-  } \
+  EnsureModifiable(f); \
   NotifySetPrimitiveField(f, nullptr, JValue::FromPrimitive<decltype(value)>(value)); \
   f->Set ##fn <false>(f->GetDeclaringClass(), value)
 

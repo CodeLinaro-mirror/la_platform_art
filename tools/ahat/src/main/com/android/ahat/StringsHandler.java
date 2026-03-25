@@ -18,13 +18,18 @@ package com.android.ahat;
 
 import com.android.ahat.heapdump.AhatInstance;
 import com.android.ahat.heapdump.AhatSnapshot;
+import com.android.ahat.heapdump.Reachability;
+import com.android.ahat.heapdump.Reference;
 import com.android.ahat.heapdump.Size;
 import com.android.ahat.heapdump.Sort;
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Queue;
+import java.util.Set;
 
 class StringsHandler implements AhatHandler {
   private static final String STRINGS_ID = "strings";
@@ -32,22 +37,40 @@ class StringsHandler implements AhatHandler {
   private AhatSnapshot mSnapshot;
 
   private static class DuplicateStringInfo {
-    public final int index;
-    public final AhatInstance representative;
-    public final long size;
-    public final int count;
-    public final long sizeCount;
-    public final String heapName;
+    final int index;
+    final AhatInstance representative;
+    final int length;
+    final int count;
+    final Size totalSize;
+    final String heapName;
 
-    public DuplicateStringInfo(int index, List<AhatInstance> instances) {
+    DuplicateStringInfo(int index, List<AhatInstance> instances, Reachability unusedRetained) {
       this.index = index;
       this.representative = instances.get(0);
-      this.size = representative.asString().length();
+      String value = representative.asString();
+      this.length = value == null ? 0 : value.length();
       this.count = instances.size();
-      this.sizeCount = this.size * this.count;
       this.heapName = representative.getHeap().getName();
+
+      // To calculate the total size of this group of duplicate strings, we sum the shallow size
+      // of each String instance and the shallow size of its underlying 'value' array. We use a
+      // HashSet to ensure each object is only counted once, which is important if multiple String
+      // instances share the same 'value' array.
+      Set<AhatInstance> counted = new HashSet<>();
+      Size size = Size.ZERO;
+      for (AhatInstance inst : instances) {
+        if (counted.add(inst)) {
+          size = size.plus(inst.getSize());
+        }
+        AhatInstance valueArray = inst.getRefField("value");
+        if (valueArray != null && counted.add(valueArray)) {
+          size = size.plus(valueArray.getSize());
+        }
+      }
+      this.totalSize = size;
     }
   }
+
 
   public StringsHandler(AhatSnapshot snapshot) {
     mSnapshot = snapshot;
@@ -80,14 +103,15 @@ class StringsHandler implements AhatHandler {
     }
 
     List<DuplicateStringInfo> duplicateInfos = new ArrayList<>(duplicates.size());
+    Reachability retained = mSnapshot.getRetainedReachability();
     for (int i = 0; i < duplicates.size(); ++i) {
-      duplicateInfos.add(new DuplicateStringInfo(i, duplicates.get(i)));
+      duplicateInfos.add(new DuplicateStringInfo(i, duplicates.get(i), retained));
     }
 
-    Comparator<DuplicateStringInfo> sizeCompare = new Comparator<DuplicateStringInfo>() {
+    Comparator<DuplicateStringInfo> lengthCompare = new Comparator<DuplicateStringInfo>() {
       @Override
       public int compare(DuplicateStringInfo i1, DuplicateStringInfo i2) {
-        return Long.compare(i1.size, i2.size);
+        return Integer.compare(i1.length, i2.length);
       }
     };
 
@@ -98,10 +122,10 @@ class StringsHandler implements AhatHandler {
       }
     };
 
-    Comparator<DuplicateStringInfo> sizeCountCompare = new Comparator<DuplicateStringInfo>() {
+    Comparator<DuplicateStringInfo> totalSizeCompare = new Comparator<DuplicateStringInfo>() {
       @Override
       public int compare(DuplicateStringInfo i1, DuplicateStringInfo i2) {
-        return Long.compare(i1.sizeCount, i2.sizeCount);
+        return i1.totalSize.compareTo(i2.totalSize);
       }
     };
 
@@ -113,34 +137,39 @@ class StringsHandler implements AhatHandler {
     };
 
     Sorter<DuplicateStringInfo> sorter = new Sorter<DuplicateStringInfo>(
-        query, sizeCountCompare.reversed());
-    sorter.addKey("size", sizeCompare);
+        query, totalSizeCompare.reversed());
+    sorter.addKey("len", lengthCompare);
     sorter.addKey("count", countCompare);
-    sorter.addKey("sc", sizeCountCompare);
+    sorter.addKey("total", totalSizeCompare);
     sorter.addKey("heap", heapCompare);
     sorter.sort(duplicateInfos);
 
+    SubsetSelector<DuplicateStringInfo> selector =
+        new SubsetSelector<>(query, STRINGS_ID, duplicateInfos);
+
     doc.table(
-        new Column(sorter.link("size", "Size"), Column.Align.RIGHT),
+        new Column(sorter.link("len", "Length"), Column.Align.RIGHT),
         new Column(sorter.link("count", "Count"), Column.Align.RIGHT),
-        new Column(sorter.link("sc", "Size * Count"), Column.Align.RIGHT),
+        new Column(sorter.link("total", "Total Size"), Column.Align.RIGHT),
         new Column(sorter.link("heap", "Heap"), Column.Align.LEFT),
         new Column("Value", Column.Align.LEFT)
     );
 
-    for (DuplicateStringInfo info : duplicateInfos) {
+    for (DuplicateStringInfo info : selector.selected()) {
         doc.row(
-            DocString.format("%,d", info.size),
+            DocString.format("%,d", info.length),
             DocString.link(
                 DocString.formattedUri("strings?id=%d", info.index),
                 DocString.format("%,d", info.count)),
-            DocString.format("%,d", info.sizeCount),
+            DocString.format("%,d", info.totalSize.getSize()),
             DocString.text(info.heapName),
             Summarizer.summarizeString(info.representative)
         );
     }
     doc.end();
+    selector.render(doc);
   }
+
 
   private void printStringInstances(Doc doc, Query query, List<AhatInstance> instances) {
     doc.title("Duplicate String Instances");
@@ -151,7 +180,7 @@ class StringsHandler implements AhatHandler {
         new Column("Heap"),
         new Column("Object"));
 
-    SubsetSelector<AhatInstance> selector = new SubsetSelector(query, STRINGS_ID, instances);
+    SubsetSelector<AhatInstance> selector = new SubsetSelector<>(query, STRINGS_ID, instances);
     for (AhatInstance inst : selector.selected()) {
       AhatInstance base = inst.getBaseline();
       SizeTable.row(doc,
@@ -162,6 +191,4 @@ class StringsHandler implements AhatHandler {
     SizeTable.end(doc);
     selector.render(doc);
   }
-
-
 }
