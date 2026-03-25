@@ -47,9 +47,6 @@
 #include "base/bit_utils.h"
 #include "base/casts.h"
 #include "base/file_utils.h"
-#include "base/globals.h"
-#include "base/locks.h"
-#include "base/macros.h"
 #include "base/memory_tool.h"
 #include "base/mutex.h"
 #include "base/stl_util.h"
@@ -1563,8 +1560,7 @@ static constexpr useconds_t kVirtualThreadSuspendSleepUs = 100;
 
 bool Thread::TrySetMountedVirtualThreadData(MountedVirtualThreadData* e, bool spin) {
   CHECK(kIsVirtualThreadEnabled);
-  DCHECK(this == Thread::Current());
-  DCHECK_EQ(GetMountedVirtualThreadData(), nullptr);
+  DCHECK_EQ(tlsPtr_.mounted_virtual_thread_data.load(std::memory_order_relaxed), nullptr);
   DCHECK_NE(e, nullptr);
   DCHECK_EQ(e->carrier_thread_id_, GetThreadId()) << "The carrier thread must be self";
   while (true) {
@@ -1574,21 +1570,8 @@ bool Thread::TrySetMountedVirtualThreadData(MountedVirtualThreadData* e, bool sp
       ThreadList* thread_list = Runtime::Current()->GetThreadList();
       uint32_t suspension_count = thread_list->GetVirtualThreadSuspendCount(e->virtual_thread_id_);
       if (suspension_count == 0) {
-        if (kIsDebugBuild) {
-          uint32_t another_carrier_id = thread_list->GetCarrierThreadIdByVirtualThreadId(
-              e->virtual_thread_id_);
-          if (another_carrier_id != ThreadList::kInvalidThreadId) {
-            // Release the thread_list_lock_ first before the crash to allow ART dump all threads.
-            Locks::thread_list_lock_->Unlock(this);
-            LOG(FATAL) << ("A virtual thread is being mounted by a second carrier thread! ")
-              << "virtual thread id : " << e->virtual_thread_id_
-              << ", this carrier thread id : " << e->carrier_thread_id_
-              << ", another carrier thread id : " << another_carrier_id;
-            UNREACHABLE();
-          }
-        }
         thread_list->AddMountedVirtualThread(e);
-        SetMountedVirtualThreadData(e);
+        tlsPtr_.mounted_virtual_thread_data.store(e, std::memory_order_relaxed);
         return true;
       }
     }
@@ -1609,8 +1592,7 @@ bool Thread::TrySetMountedVirtualThreadData(MountedVirtualThreadData* e, bool sp
 
 bool Thread::TryClearMountedVirtualThreadData(bool spin) {
   CHECK(kIsVirtualThreadEnabled);
-  DCHECK(this == Thread::Current());
-  MountedVirtualThreadData* e = GetMountedVirtualThreadData();
+  MountedVirtualThreadData* e = tlsPtr_.mounted_virtual_thread_data.load(std::memory_order_relaxed);
   if (e == nullptr) {
     DCHECK_NE(e, nullptr);
     return false;
@@ -1621,11 +1603,11 @@ bool Thread::TryClearMountedVirtualThreadData(bool spin) {
       MutexLock mu(this, *Locks::thread_list_lock_);
       // The virtual thread is suspended by lock inflation if the count isn't 0.
       ThreadList* thread_list = Runtime::Current()->GetThreadList();
-      e = GetMountedVirtualThreadData();
+      e = tlsPtr_.mounted_virtual_thread_data.load(std::memory_order_relaxed);
       uint32_t suspension_count = thread_list->GetVirtualThreadSuspendCount(e->virtual_thread_id_);
       if (suspension_count == 0) {
-        thread_list->RemoveMountedVirtualThread(e);
-        SetMountedVirtualThreadData(nullptr);
+        thread_list->RemoveMountedVirtualThreadByThreadId(e->virtual_thread_id_);
+        tlsPtr_.mounted_virtual_thread_data.store(nullptr, std::memory_order_relaxed);
         return true;
       }
     }

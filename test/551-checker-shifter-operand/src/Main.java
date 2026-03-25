@@ -342,11 +342,8 @@ public class Main {
   public static void $opt$validateExtendByteInt2(int a, byte b) {
     // The conversion to `int` has been optimized away, so there is nothing to merge.
     assertIntEquals (a + $noinline$byteToInt (b), a +  (int)b);
-    // Use try-catch to prevent environment inputs elimination.
-    try {
-      // There is an environment use for `(long)b`, preventing the merge.
-      assertLongEquals(a + $noinline$byteToLong(b), a + (long)b);
-    } catch (Exception e) {}
+    // There is an environment use for `(long)b`, preventing the merge.
+    assertLongEquals(a + $noinline$byteToLong(b), a + (long)b);
   }
 
   /// CHECK-START-ARM: void Main.$opt$validateExtendByteLong(long, byte) instruction_simplifier_arm (after)
@@ -418,11 +415,8 @@ public class Main {
   public static void $opt$validateExtendCharInt2(int a, char b) {
     // The conversion to `int` has been optimized away, so there is nothing to merge.
     assertIntEquals (a + $noinline$charToInt (b), a +  (int)b);
-    // Use try-catch to prevent environment inputs elimination.
-    try {
-      // There is an environment use for `(long)b` and the implicit `(long)a`, preventing the merge.
-      assertLongEquals(a + $noinline$charToLong(b), a + (long)b);
-    } catch (Exception e) {}
+    // There is an environment use for `(long)b` and the implicit `(long)a`, preventing the merge.
+    assertLongEquals(a + $noinline$charToLong(b), a + (long)b);
   }
 
   /// CHECK-START-ARM: void Main.$opt$validateExtendCharLong(long, char) instruction_simplifier_arm (after)
@@ -493,11 +487,8 @@ public class Main {
   public static void $opt$validateExtendShortInt2(int a, short b) {
     // The conversion to `int` has been optimized away, so there is nothing to merge.
     assertIntEquals (a + $noinline$shortToInt  (b), a +  (int)b);
-    // Use try-catch to prevent environment inputs elimination.
-    try {
-      // There is an environment use for `(long)b` and the implicit `(long)a`, preventing the merge.
-      assertLongEquals(a + $noinline$shortToLong (b), a + (long)b);
-    } catch (Exception e) {}
+    // There is an environment use for `(long)b` and the implicit `(long)a`, preventing the merge.
+    assertLongEquals(a + $noinline$shortToLong (b), a + (long)b);
   }
 
   /// CHECK-START-ARM: void Main.$opt$validateExtendShortLong(long, short) instruction_simplifier_arm (after)

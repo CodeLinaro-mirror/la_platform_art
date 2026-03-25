@@ -100,10 +100,6 @@ public class PreRebootDexoptJobTest {
         mPreRebootStatsReporterHarness = new PreRebootStatsReporterHarness();
         mMockClock = new MockClock();
 
-        lenient()
-                .when(mPreRebootStatsReporterHarness.getInjector().getClock())
-                .thenReturn(mMockClock);
-
         // By default, the job is enabled by a build-time flag.
         lenient()
                 .when(SystemProperties.getBoolean(eq("pm.dexopt.disable_bg_dexopt"), anyBoolean()))
@@ -301,7 +297,6 @@ public class PreRebootDexoptJobTest {
         OnUpdateReadyResponse response = Utils.getFuture(mPreRebootDexoptJob.onUpdateReady(
                 otaSlot, false /* isUpdateEngineReady */, JobSynchronicity.ASYNC));
         Utils.getFuture(response.asynchronousJobScheduling());
-        mMockClock.advanceTime(123456);
         mPreRebootDexoptJob.onStartJobImpl(mJobService, mJobParameters);
         assertThat(jobStarted.tryAcquire(TIMEOUT_SEC, TimeUnit.SECONDS)).isTrue();
 
@@ -309,8 +304,6 @@ public class PreRebootDexoptJobTest {
 
         mPreRebootStatsReporterHarness.recordFakeAfterRebootDataAndReport();
         mPreRebootStatsReporterHarness.verifyJobStats(Status.STATUS_FINISHED);
-        mPreRebootStatsReporterHarness.verifyJobLatency(123456);
-        mPreRebootStatsReporterHarness.verifySynchronicity(JobSynchronicity.ASYNC);
     }
 
     @Test
@@ -391,7 +384,6 @@ public class PreRebootDexoptJobTest {
 
         mPreRebootStatsReporterHarness.recordFakeAfterRebootDataAndReport();
         mPreRebootStatsReporterHarness.verifyJobStats(Status.STATUS_FINISHED);
-        mPreRebootStatsReporterHarness.verifySynchronicity(JobSynchronicity.SYNC);
     }
 
     @Test
@@ -521,7 +513,6 @@ public class PreRebootDexoptJobTest {
                 .run(any(), anyBoolean(), any(), any());
 
         // The asynchronous job is started.
-        mMockClock.advanceTime(123456);
         mPreRebootDexoptJob.onStartJobImpl(mJobService, mJobParameters);
 
         mPreRebootDexoptJob.waitForRunningJob();
@@ -536,8 +527,6 @@ public class PreRebootDexoptJobTest {
 
         mPreRebootStatsReporterHarness.recordFakeAfterRebootDataAndReport();
         mPreRebootStatsReporterHarness.verifyJobStats(Status.STATUS_FINISHED);
-        mPreRebootStatsReporterHarness.verifyJobLatency(123456);
-        mPreRebootStatsReporterHarness.verifySynchronicity(JobSynchronicity.HYBRID);
     }
 
     // Tests a hybrid job where the synchronous job times out but the asynchronous job doesn't get a
@@ -580,7 +569,6 @@ public class PreRebootDexoptJobTest {
         // hybrid job should be reported as partially finished.
         mPreRebootStatsReporterHarness.recordFakeAfterRebootDataAndReport();
         mPreRebootStatsReporterHarness.verifyJobStats(Status.STATUS_PARTIALLY_FINISHED);
-        mPreRebootStatsReporterHarness.verifySynchronicity(JobSynchronicity.HYBRID);
     }
 
     // Tests a hybrid job where the synchronous job completes before the timeout.

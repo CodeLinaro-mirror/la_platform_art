@@ -1314,7 +1314,6 @@ class ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_);
   bool VerifyRecordClass(Handle<mirror::Class> klass, ObjPtr<mirror::Class> super)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  bool VerifyValueClass(Handle<mirror::Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void CheckProxyConstructor(ArtMethod* constructor) const
       REQUIRES_SHARED(Locks::mutator_lock_);

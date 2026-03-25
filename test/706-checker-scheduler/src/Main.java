@@ -512,17 +512,13 @@ public class Main {
   /// CHECK:               Div
   public static int intDiv(int arg) {
     int res = 0;
-    // Use a try/catch to prevent cleanup of DivZeroCheck's environment, otherwise it will not act
-    // as a barrier.
-    try {
-      int tmp = arg;
-      for (int i = 1; i < arg; i++) {
-        tmp -= i;
-        res = res / i;  // div-zero check barrier.
-        static_variable++;
-      }
-      res += tmp;
-    } catch (Exception e) {}
+    int tmp = arg;
+    for (int i = 1; i < arg; i++) {
+      tmp -= i;
+      res = res / i;  // div-zero check barrier.
+      static_variable++;
+    }
+    res += tmp;
     return res;
   }
 

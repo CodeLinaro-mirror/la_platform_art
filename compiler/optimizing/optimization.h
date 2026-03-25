@@ -79,7 +79,6 @@ enum class OptimizationPass {
   kConstructorFenceRedundancyElimination,
   kControlFlowSimplifier,
   kDeadCodeElimination,
-  kEnvironmentInputElimination,
   kGlobalValueNumbering,
   kInductionVarAnalysis,
   kInliner,

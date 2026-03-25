@@ -37,7 +37,6 @@ enum class MethodCompilationStat {
   kCompiledIntrinsic,
   kCompiledBytecode,
   kCHAInline,
-  kEnvironmentRedundantInputsRemoved,
   kInlinedInvoke,
   kInlinedLastInvoke,
   kReplacedInvokeWithSimplePattern,

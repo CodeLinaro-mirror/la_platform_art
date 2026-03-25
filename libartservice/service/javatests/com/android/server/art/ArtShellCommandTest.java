@@ -108,10 +108,6 @@ public class ArtShellCommandTest {
         mMockClock = new MockClock();
 
         lenient()
-                .when(mPreRebootStatsReporterHarness.getInjector().getClock())
-                .thenReturn(mMockClock);
-
-        lenient()
                 .when(SystemProperties.getBoolean(eq("dalvik.vm.enable_pr_dexopt"), anyBoolean()))
                 .thenReturn(true);
 

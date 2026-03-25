@@ -254,20 +254,20 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
 
         if (!isEnabled()) {
             mInjector.getStatsReporter().recordJobNotScheduled(
-                    Status.STATUS_NOT_SCHEDULED_DISABLED, synchronicity, isOtaUpdate());
+                    Status.STATUS_NOT_SCHEDULED_DISABLED, isOtaUpdate());
             return new OnUpdateReadyResponse(
                     null /* synchronousJob */, null /* asynchronousJobScheduling */);
         }
 
         if (synchronicity == JobSynchronicity.ASYNC) {
-            var asynchronousJobScheduling =
-                    CompletableFuture.completedFuture(scheduleLocked(synchronicity));
+            var asynchronousJobScheduling = CompletableFuture.completedFuture(
+                    scheduleLocked(false /* continueFromPrevious */));
             return new OnUpdateReadyResponse(null /* synchronousJob */, asynchronousJobScheduling);
         }
 
         if (synchronicity == JobSynchronicity.HYBRID) {
             mTimeLimitMillis = hybridModeSyncTimeLimitMillis;
-            mInjector.getStatsReporter().recordJobScheduled(JobSynchronicity.HYBRID, isOtaUpdate());
+            mInjector.getStatsReporter().recordJobScheduled(false /* isAsync */, isOtaUpdate());
             var synchronousJobTimedOut = new AtomicBoolean(false);
             var asynchronousJobScheduling = new CompletableFuture<@ScheduleStatus Integer>();
             Runnable onJobFinishedLocked = () -> {
@@ -278,7 +278,8 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
                     return;
                 }
                 try {
-                    asynchronousJobScheduling.complete(scheduleLocked(JobSynchronicity.HYBRID));
+                    asynchronousJobScheduling.complete(
+                            scheduleLocked(true /* continueFromPrevious */));
                 } catch (Exception e) {
                     asynchronousJobScheduling.completeExceptionally(e);
                 }
@@ -293,7 +294,7 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
             return new OnUpdateReadyResponse(synchronousJob, asynchronousJobScheduling);
         }
 
-        mInjector.getStatsReporter().recordJobScheduled(JobSynchronicity.SYNC, isOtaUpdate());
+        mInjector.getStatsReporter().recordJobScheduled(false /* isAsync */, isOtaUpdate());
         var synchronousJob = startLocked(null /* onJobFinishedLocked */,
                 getSnapshotMode(otaSlot, isUpdateEngineReady),
                 ReasonMapping.REASON_PRE_REBOOT_DEXOPT);
@@ -381,20 +382,14 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     }
 
     @GuardedBy("this")
-    private @ScheduleStatus int scheduleLocked(JobSynchronicity synchronicity) {
+    private @ScheduleStatus int scheduleLocked(boolean continueFromPrevious) {
         if (this != BackgroundDexoptJobService.getJob(JOB_ID)) {
             throw new IllegalStateException("This job cannot be scheduled");
         }
 
-        if (synchronicity != JobSynchronicity.ASYNC && synchronicity != JobSynchronicity.HYBRID) {
-            throw new IllegalArgumentException("Invalid synchronicity: " + synchronicity);
-        }
-
-        boolean continueFromPrevious = synchronicity == JobSynchronicity.HYBRID;
-
         if (!isEnabled()) {
-            mInjector.getStatsReporter().recordJobNotScheduled(Status.STATUS_NOT_SCHEDULED_DISABLED,
-                    synchronicity, isOtaUpdate(), continueFromPrevious);
+            mInjector.getStatsReporter().recordJobNotScheduled(
+                    Status.STATUS_NOT_SCHEDULED_DISABLED, isOtaUpdate(), continueFromPrevious);
             return ArtFlags.SCHEDULE_DISABLED_BY_SYSPROP;
         }
 
@@ -426,13 +421,12 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         if (result == JobScheduler.RESULT_SUCCESS) {
             AsLog.i("Pre-reboot Dexopt Job scheduled");
             mInjector.getStatsReporter().recordJobScheduled(
-                    synchronicity, isOtaUpdate(), continueFromPrevious);
+                    true /* isAsync */, isOtaUpdate(), continueFromPrevious);
             return ArtFlags.SCHEDULE_SUCCESS;
         } else {
             AsLog.i("Failed to schedule Pre-reboot Dexopt Job");
             mInjector.getStatsReporter().recordJobNotScheduled(
-                    Status.STATUS_NOT_SCHEDULED_JOB_SCHEDULER, synchronicity, isOtaUpdate(),
-                    continueFromPrevious);
+                    Status.STATUS_NOT_SCHEDULED_JOB_SCHEDULER, isOtaUpdate(), continueFromPrevious);
             return ArtFlags.SCHEDULE_JOB_SCHEDULER_FAILURE;
         }
     }

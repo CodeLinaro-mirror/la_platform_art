@@ -23,8 +23,9 @@ import java.io.IOException;
 import org.junit.Test;
 
 public class HandlersTest {
+
   @Test
-  public void rootPathNoCrash() throws IOException {
+  public void overviewNoCrash() throws IOException {
     AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
     AhatHandler handler = new OverviewHandler(snapshot,
         new File("my.hprof.file"),
@@ -33,39 +34,17 @@ public class HandlersTest {
   }
 
   @Test
-  public void overviewNoCrash() throws IOException {
+  public void loopersNoCrash() throws IOException {
     AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
-    AhatHandler handler = new OverviewHandler(
-            snapshot, new File("my.hprof.file"), new File("my.base.hprof.file"));
-    TestHandler.testNoCrash(handler, "http://localhost:7100/overview");
-  }
-
-  @Test
-  public void rootedNoCrash() throws IOException {
-    AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
-    AhatHandler handler = new RootedHandler(snapshot);
-    TestHandler.testNoCrash(handler, "http://localhost:7100/rooted");
-  }
-
-  @Test
-  public void allocationsNoCrash() throws IOException {
-    AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
-    AhatHandler handler = new SiteHandler(snapshot);
-    TestHandler.testNoCrash(handler, "http://localhost:7100/sites");
+    AhatHandler handler = new LoopersHandler(snapshot);
+    TestHandler.testNoCrash(handler, "http://localhost:7100");
   }
 
   @Test
   public void bitmapsNoCrash() throws IOException {
     AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
     AhatHandler handler = new BitmapsHandler(snapshot);
-    TestHandler.testNoCrash(handler, "http://localhost:7100/bitmaps");
-  }
-
-  @Test
-  public void loopersNoCrash() throws IOException {
-    AhatSnapshot snapshot = TestDump.getTestDump().getAhatSnapshot();
-    AhatHandler handler = new LoopersHandler(snapshot);
-    TestHandler.testNoCrash(handler, "http://localhost:7100/loopers");
+    TestHandler.testNoCrash(handler, "http://localhost:7100");
   }
 
   @Test
