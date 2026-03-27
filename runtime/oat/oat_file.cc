@@ -1198,6 +1198,20 @@ bool OatFileBase::Setup(int zip_fd,
     }
   }
 
+  size_t executable_offset = GetOatHeader().GetExecutableOffset();
+  if (executable_offset < GetOatHeader().GetHeaderSize() || executable_offset > Size()) {
+    *error_msg = ErrorPrintf("Invalid executable offset: %zu is not in [%zu, %zu]",
+                             executable_offset,
+                             GetOatHeader().GetHeaderSize(),
+                             Size());
+    return false;
+  }
+
+  if (GetOatHeader().GetKeyValueStoreSize() != 0u &&
+      !GetOatHeader().GetCompilerFilterSafe(error_msg).has_value()) {
+    return false;
+  }
+
   return true;
 }
 

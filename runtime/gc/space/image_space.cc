@@ -2732,6 +2732,9 @@ class ImageSpace::BootImageLoader {
                                   oat_data_begin);
         return false;
       }
+      if (!oat_file->GetOatHeader().AreTrampolineOffsetsValid(error_msg)) {
+        return false;
+      }
     }
     if (validate_oat_file) {
       TimingLogger::ScopedTiming timing("ValidateOatFile", logger);
