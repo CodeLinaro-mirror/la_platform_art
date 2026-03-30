@@ -44,6 +44,7 @@ import android.os.SystemProperties;
 
 import androidx.test.filters.SmallTest;
 
+import com.android.server.art.DexoptTrigger.DexoptComparator;
 import com.android.server.art.OutputArtifacts.PermissionSettings;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.DexoptParams;
@@ -138,22 +139,23 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         params = new Params();
         params.mForce = true;
         params.mShouldDowngrade = false;
-        params.mExpectedDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-                | DexoptTrigger.COMPILER_FILTER_IS_SAME | DexoptTrigger.COMPILER_FILTER_IS_WORSE
-                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+        params.mExpectedDexoptTrigger = AidlUtils.buildDexoptTrigger(
+                List.of(DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+                "force recompilation");
         list.add(params);
 
         params = new Params();
         params.mForce = true;
         params.mShouldDowngrade = true;
-        params.mExpectedDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-                | DexoptTrigger.COMPILER_FILTER_IS_SAME | DexoptTrigger.COMPILER_FILTER_IS_WORSE
-                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+        params.mExpectedDexoptTrigger = AidlUtils.buildDexoptTrigger(
+                List.of(DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+                "force recompilation");
         list.add(params);
 
         params = new Params();
         params.mShouldDowngrade = true;
-        params.mExpectedDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_WORSE;
+        params.mExpectedDexoptTrigger = AidlUtils.buildDexoptTrigger(
+                List.of(DexoptComparator.COMPARING_COMPILER_FILTER_REVERSED));
         list.add(params);
 
         params = new Params();
@@ -253,7 +255,8 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         lenient().when(mArtd.isInDalvikCache(any())).thenReturn(mParams.mIsInDalvikCache);
 
         // By default, no artifacts exist.
-        lenient().when(mArtd.getArtifactsVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
+        lenient().when(mArtd.getOdexVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
+        lenient().when(mArtd.getVdexVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
 
         if (mParams.mCallbackReturnedCompilerFilter != null) {
             mConfig.setAdjustCompilerFilterCallback(
@@ -298,6 +301,8 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                         false /* isOtherReadable */, true /* isOtherExecutable */),
                 buildFsPermission(Process.SYSTEM_UID /* uid */, sharedGid /* gid */,
                         true /* isOtherReadable */),
+                buildFsPermission(Process.SYSTEM_UID /* uid */, sharedGid /* gid */,
+                        true /* isOtherReadable */),
                 null /* seContext */);
 
         // No need to check `generateAppImage`. It is checked in `PrimaryDexopterTest`.
@@ -327,7 +332,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         doReturn(dexoptIsNeeded())
                 .when(mArtd)
                 .getDexoptNeeded(eq("/somewhere/app/foo/base.apk"), eq("arm64"), eq("PCL[]"),
-                        eq(mParams.mExpectedCompilerFilter), eq(mParams.mExpectedDexoptTrigger),
+                        eq(mParams.mExpectedCompilerFilter), deepEq(mParams.mExpectedDexoptTrigger),
                         any());
         doReturn(createArtdDexoptResult(false /* cancelled */, 100 /* wallTimeMs */,
                          400 /* cpuTimeMs */, 30000 /* sizeBytes */, 32000 /* sizeBeforeBytes */))
@@ -344,7 +349,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         doReturn(dexoptIsNeeded())
                 .when(mArtd)
                 .getDexoptNeeded(eq("/somewhere/app/foo/base.apk"), eq("arm"), eq("PCL[]"),
-                        eq(mParams.mExpectedCompilerFilter), eq(mParams.mExpectedDexoptTrigger),
+                        eq(mParams.mExpectedCompilerFilter), deepEq(mParams.mExpectedDexoptTrigger),
                         any());
         doThrow(new ServiceSpecificException(31, "This is an error message."))
                 .when(mArtd)
@@ -361,14 +366,14 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                 .when(mArtd)
                 .getDexoptNeeded(eq("/somewhere/app/foo/split_0.apk"), eq("arm64"),
                         eq("PCL[base.apk]"), eq(mParams.mExpectedCompilerFilter),
-                        eq(mParams.mExpectedDexoptTrigger), any());
+                        deepEq(mParams.mExpectedDexoptTrigger), any());
 
         // The fourth one is normal.
         doReturn(dexoptIsNeeded())
                 .when(mArtd)
                 .getDexoptNeeded(eq("/somewhere/app/foo/split_0.apk"), eq("arm"),
                         eq("PCL[base.apk]"), eq(mParams.mExpectedCompilerFilter),
-                        eq(mParams.mExpectedDexoptTrigger), any());
+                        deepEq(mParams.mExpectedDexoptTrigger), any());
         doReturn(createArtdDexoptResult(false /* cancelled */, 200 /* wallTimeMs */,
                          200 /* cpuTimeMs */, 10000 /* sizeBytes */, 0 /* sizeBeforeBytes */))
                 .when(mArtd)
@@ -466,8 +471,10 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         // Expectations.
         public String mExpectedCallbackInputCompilerFilter = "verify";
         public String mExpectedCompilerFilter = "verify";
-        public int mExpectedDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+        public DexoptTrigger mExpectedDexoptTrigger =
+                AidlUtils.buildDexoptTrigger(List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                        DexoptComparator.COMPARING_PRIMARY_BOOT_IMAGE_STATUS,
+                        DexoptComparator.COMPARING_EXTRACTION_STATUS));
         public boolean mExpectedIsDebuggable = false;
         public boolean mExpectedIsHiddenApiPolicyEnabled = true;
         public boolean mExpectedOutputIsPreReboot = false;
@@ -495,7 +502,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                             + " => "
                             + "expectedCallbackInputCompilerFilter=%s,"
                             + "expectedCompilerFilter=%s,"
-                            + "expectedDexoptTrigger=%d,"
+                            + "expectedDexoptTrigger=%s,"
                             + "expectedIsDebuggable=%b,"
                             + "expectedIsHiddenApiPolicyEnabled=%b,"
                             + "expectedOutputIsPreReboot=%b,"
@@ -506,9 +513,10 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                     mRequestedCompilerFilter, mCallbackReturnedCompilerFilter, mForce,
                     mShouldDowngrade, mSkipIfStorageLow, mIgnoreProfile, mIsPreReboot,
                     mForceCompilerFilter, mAlwaysDebuggable, mExpectedCallbackInputCompilerFilter,
-                    mExpectedCompilerFilter, mExpectedDexoptTrigger, mExpectedIsDebuggable,
-                    mExpectedIsHiddenApiPolicyEnabled, mExpectedOutputIsPreReboot,
-                    mExpectedDeletesRuntimeArtifacts, mExpectedDeletesSdmSdcFiles);
+                    mExpectedCompilerFilter, AidlUtils.toString(mExpectedDexoptTrigger),
+                    mExpectedIsDebuggable, mExpectedIsHiddenApiPolicyEnabled,
+                    mExpectedOutputIsPreReboot, mExpectedDeletesRuntimeArtifacts,
+                    mExpectedDeletesSdmSdcFiles);
         }
     }
 }

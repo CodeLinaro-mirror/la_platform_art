@@ -130,11 +130,19 @@ interface IArtd {
             in com.android.server.art.MergeProfileOptions options);
 
     /**
-     * Returns the visibility of the artifacts.
+     * Returns the visibility of the ODEX and ART files.
      *
      * Throws fatal and non-fatal errors.
      */
-    com.android.server.art.FileVisibility getArtifactsVisibility(
+    com.android.server.art.FileVisibility getOdexVisibility(
+            in com.android.server.art.ArtifactsPath artifactsPath);
+
+    /**
+     * Returns the visibility of the VDEX files.
+     *
+     * Throws fatal and non-fatal errors.
+     */
+    com.android.server.art.FileVisibility getVdexVisibility(
             in com.android.server.art.ArtifactsPath artifactsPath);
 
     /**
@@ -153,15 +161,15 @@ interface IArtd {
             in com.android.server.art.DexMetadataPath dmFile);
 
     /**
-     * Returns true if dexopt is needed. `dexoptTrigger` is a bit field that consists of values
-     * defined in `com.android.server.art.DexoptTrigger`.
+     * Returns whether dexopt is needed and some information about the current dexopt state.
      *
      * Throws fatal and non-fatal errors.
      */
     com.android.server.art.GetDexoptNeededResult getDexoptNeeded(
             @utf8InCpp String dexFile, @utf8InCpp String instructionSet,
             @nullable @utf8InCpp String classLoaderContext, @utf8InCpp String compilerFilter,
-            int dexoptTrigger, in @nullable android.os.ParcelFileDescriptor loggingFd);
+            in com.android.server.art.DexoptTrigger dexoptTrigger,
+            in @nullable android.os.ParcelFileDescriptor loggingFd);
 
     /**
      * Creates a secure dex metadata companion (SDC) file for the secure dex metadata (SDM) file, if

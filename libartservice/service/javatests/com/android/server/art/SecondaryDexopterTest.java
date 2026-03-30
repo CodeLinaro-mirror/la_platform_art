@@ -17,6 +17,7 @@
 package com.android.server.art;
 
 import static com.android.server.art.testing.TestDataHelper.newPackageState;
+import static com.android.server.art.testing.TestingUtils.NOOP_EXECUTOR;
 import static com.android.server.art.testing.TestingUtils.deepEq;
 
 import static com.google.common.truth.Truth.assertThat;
@@ -41,6 +42,7 @@ import androidx.test.filters.SmallTest;
 import androidx.test.runner.AndroidJUnit4;
 
 import com.android.server.art.DexUseManagerLocal.CheckedSecondaryDexInfo;
+import com.android.server.art.DexoptTrigger.DexoptComparator;
 import com.android.server.art.OutputArtifacts.PermissionSettings;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.Config;
@@ -50,7 +52,6 @@ import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
 import com.android.server.art.testing.StaticMockitoRule;
 import com.android.server.art.testing.TestingUtils;
 import com.android.server.art.utils.AidlUtils;
-import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
 
@@ -62,9 +63,6 @@ import org.mockito.Mock;
 
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.function.Function;
 
 @SmallTest
 @RunWith(AndroidJUnit4.class)
@@ -99,11 +97,14 @@ public class SecondaryDexopterTest {
             AidlUtils.buildOutputProfileForSecondary(
                     DEX_2, UID, UID, false /* isOtherReadable */, false /* isPreReboot */);
 
-    private final int mDefaultDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
-    private final int mBetterOrSameDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-            | DexoptTrigger.COMPILER_FILTER_IS_SAME
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+    private final DexoptTrigger mDefaultDexoptTrigger =
+            AidlUtils.buildDexoptTrigger(List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                    DexoptComparator.COMPARING_PRIMARY_BOOT_IMAGE_STATUS,
+                    DexoptComparator.COMPARING_EXTRACTION_STATUS));
+    private final DexoptTrigger mProfileChangedDexoptTrigger = AidlUtils.buildDexoptTrigger(
+            List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                    DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+            "profile changed");
 
     private final MergeProfileOptions mMergeProfileOptions = new MergeProfileOptions();
 
@@ -115,7 +116,6 @@ public class SecondaryDexopterTest {
     @Mock private IArtd mArtd;
     @Mock private DexUseManagerLocal mDexUseManager;
     @Mock private DexMetadataHelper.Injector mDexMetadataHelperInjector;
-    @Mock private AsyncExecutor mAsyncExecutor;
     private PackageState mPkgState;
     private AndroidPackage mPkg;
     private CancellationSignal mCancellationSignal;
@@ -151,7 +151,6 @@ public class SecondaryDexopterTest {
         lenient().when(mInjector.isLauncherPackage(any())).thenReturn(false);
         lenient().when(mInjector.getDexUseManager()).thenReturn(mDexUseManager);
         lenient().when(mInjector.getConfig()).thenReturn(mConfig);
-        lenient().when(mInjector.getAsyncExecutor()).thenReturn(mAsyncExecutor);
         lenient().when(mInjector.getDexMetadataHelper()).thenReturn(mDexMetadataHelper);
 
         List<CheckedSecondaryDexInfo> secondaryDexInfo = createSecondaryDexInfo();
@@ -163,9 +162,13 @@ public class SecondaryDexopterTest {
 
         prepareProfiles();
 
+        // By default, no artifacts exist.
+        lenient().when(mArtd.getOdexVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
+        lenient().when(mArtd.getVdexVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
+
         // Dexopt is always needed and successful.
         lenient()
-                .when(mArtd.getDexoptNeeded(any(), any(), any(), any(), anyInt(), any()))
+                .when(mArtd.getDexoptNeeded(any(), any(), any(), any(), any(), any()))
                 .thenReturn(dexoptIsNeeded());
         lenient()
                 .when(mArtd.dexopt(any(), any(), any(), any(), any(), any(), any(), any(), anyInt(),
@@ -177,9 +180,7 @@ public class SecondaryDexopterTest {
                 .thenReturn(mock(IArtdCancellationSignal.class));
 
         // Swallow the async tasks. They are for metric reporting and are not needed here.
-        lenient()
-                .when(mAsyncExecutor.executeAsync(any(Runnable.class)))
-                .thenReturn(CompletableFuture.completedFuture(null));
+        lenient().when(mInjector.getAsyncExecutor()).thenReturn(NOOP_EXECUTOR);
 
         mSecondaryDexopter = new SecondaryDexopter(
                 mInjector, mPkgState, mPkg, mDexoptParams, mCancellationSignal);
@@ -205,9 +206,10 @@ public class SecondaryDexopterTest {
                 deepEq(mMergeProfileOptions));
 
         verify(mArtd).getDexoptNeeded(eq(DEX_1), eq("arm64"), any(), eq("speed-profile"),
-                eq(mBetterOrSameDexoptTrigger), any());
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_1, "arm64",
-                ProfilePath.tmpProfilePath(mDex1PrivateOutputProfile.profilePath), "CLC_FOR_DEX_1");
+                ProfilePath.tmpProfilePath(mDex1PrivateOutputProfile.profilePath), "CLC_FOR_DEX_1",
+                true /* isVdexOtherReadable */);
 
         verify(mArtd).commitTmpProfile(deepEq(mDex1PrivateOutputProfile.profilePath));
 
@@ -219,15 +221,17 @@ public class SecondaryDexopterTest {
                 deepEq(mDex2PrivateOutputProfile), deepEq(List.of(DEX_2)),
                 deepEq(mMergeProfileOptions));
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_2), eq("arm64"), any(), eq("speed-profile"), eq(mBetterOrSameDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_2), eq("arm64"), any(), eq("speed-profile"),
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_2, "arm64",
-                ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2");
+                ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2",
+                true /* isVdexOtherReadable */);
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_2), eq("arm"), any(), eq("speed-profile"), eq(mBetterOrSameDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_2), eq("arm"), any(), eq("speed-profile"),
+                deepEq(mProfileChangedDexoptTrigger), any());
         checkDexoptWithPrivateProfile(verify(mArtd), DEX_2, "arm",
-                ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2");
+                ProfilePath.tmpProfilePath(mDex2PrivateOutputProfile.profilePath), "CLC_FOR_DEX_2",
+                true /* isVdexOtherReadable */);
 
         verify(mArtd).commitTmpProfile(deepEq(mDex2PrivateOutputProfile.profilePath));
 
@@ -237,10 +241,42 @@ public class SecondaryDexopterTest {
         verify(mArtd, never()).isProfileUsable(deepEq(mDex3RefProfile), any());
         verify(mArtd, never()).mergeProfiles(any(), deepEq(mDex3RefProfile), any(), any(), any());
 
-        verify(mArtd).getDexoptNeeded(
-                eq(DEX_3), eq("arm64"), isNull(), eq("verify"), eq(mDefaultDexoptTrigger), any());
+        verify(mArtd).getDexoptNeeded(eq(DEX_3), eq("arm64"), isNull(), eq("verify"),
+                deepEq(mDefaultDexoptTrigger), any());
         checkDexoptWithNoProfile(verify(mArtd), DEX_3, "arm64", "verify",
-                null /* classLoaderContext */, false /* isPublic */);
+                null /* classLoaderContext */, false /* isOdexOtherReadable */,
+                false /* isVdexOtherReadable */);
+    }
+
+    @Test
+    public void testDexoptDexFileBecomesPublic() throws Exception {
+        // Simulate that DEX_2 was non-other-readable before, resulting in a non-other-readable
+        // vdex, and now DEX_2 becomes other-readable.
+        when(mArtd.getVdexVisibility(argThat(artifactsPath -> artifactsPath.dexPath == DEX_2)))
+                .thenReturn(FileVisibility.NOT_OTHER_READABLE);
+
+        DexoptParams dexoptParams = mDexoptParams.toBuilder().setCompilerFilter("verify").build();
+        mSecondaryDexopter = new SecondaryDexopter(
+                mInjector, mPkgState, mPkg, dexoptParams, mCancellationSignal);
+
+        mSecondaryDexopter.dexopt();
+
+        // It should re-dexopt DEX_2 because the vdex visibility can be improved, unless it
+        // regresses the compiler filter.
+        DexoptTrigger dexoptTrigger = AidlUtils.buildDexoptTrigger(
+                List.of(DexoptComparator.COMPARING_COMPILER_FILTER,
+                        DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+                "vdex visibility is better");
+
+        verify(mArtd).getDexoptNeeded(
+                eq(DEX_2), eq("arm64"), any(), eq("verify"), deepEq(dexoptTrigger), any());
+        checkDexoptWithNoProfile(verify(mArtd), DEX_2, "arm64", "verify", "CLC_FOR_DEX_2",
+                true /* isOdexOtherReadable */, true /* isVdexOtherReadable */);
+
+        verify(mArtd).getDexoptNeeded(
+                eq(DEX_2), eq("arm"), any(), eq("verify"), deepEq(dexoptTrigger), any());
+        checkDexoptWithNoProfile(verify(mArtd), DEX_2, "arm", "verify", "CLC_FOR_DEX_2",
+                true /* isOdexOtherReadable */, true /* isVdexOtherReadable */);
     }
 
     private PackageState createPackageState() {
@@ -331,8 +367,10 @@ public class SecondaryDexopterTest {
     }
 
     private void checkDexoptWithPrivateProfile(IArtd artd, String dexPath, String isa,
-            ProfilePath profile, String classLoaderContext) throws Exception {
-        PermissionSettings permissionSettings = buildPermissionSettings(false /* isPublic */);
+            ProfilePath profile, String classLoaderContext, boolean isVdexOtherReadable)
+            throws Exception {
+        PermissionSettings permissionSettings =
+                buildPermissionSettings(false /* isOdexOtherReadable */, isVdexOtherReadable);
         OutputArtifacts outputArtifacts = AidlUtils.buildOutputArtifacts(dexPath, isa,
                 false /* isInDalvikCache */, permissionSettings, false /* isPreReboot */);
         artd.dexopt(deepEq(outputArtifacts), eq(dexPath), eq(isa), eq(classLoaderContext),
@@ -341,8 +379,10 @@ public class SecondaryDexopterTest {
     }
 
     private void checkDexoptWithNoProfile(IArtd artd, String dexPath, String isa,
-            String compilerFilter, String classLoaderContext, boolean isPublic) throws Exception {
-        PermissionSettings permissionSettings = buildPermissionSettings(isPublic);
+            String compilerFilter, String classLoaderContext, boolean isOdexOtherReadable,
+            boolean isVdexOtherReadable) throws Exception {
+        PermissionSettings permissionSettings =
+                buildPermissionSettings(isOdexOtherReadable, isVdexOtherReadable);
         OutputArtifacts outputArtifacts = AidlUtils.buildOutputArtifacts(dexPath, isa,
                 false /* isInDalvikCache */, permissionSettings, false /* isPreReboot */);
         artd.dexopt(deepEq(outputArtifacts), eq(dexPath), eq(isa), eq(classLoaderContext),
@@ -350,12 +390,15 @@ public class SecondaryDexopterTest {
                 argThat(dexoptOptions -> dexoptOptions.generateAppImage == false), any(), any());
     }
 
-    private PermissionSettings buildPermissionSettings(boolean isPublic) {
+    private PermissionSettings buildPermissionSettings(
+            boolean isOdexOtherReadable, boolean isVdexOtherReadable) {
         FsPermission dirFsPermission = AidlUtils.buildFsPermission(UID /* uid */, UID /* gid */,
                 false /* isOtherReadable */, true /* isOtherExecutable */);
-        FsPermission fileFsPermission =
-                AidlUtils.buildFsPermission(UID /* uid */, UID /* gid */, isPublic);
-        return AidlUtils.buildPermissionSettings(
-                dirFsPermission, fileFsPermission, AidlUtils.buildSeContext("se-info", UID));
+        FsPermission odexFileFsPermission =
+                AidlUtils.buildFsPermission(UID /* uid */, UID /* gid */, isOdexOtherReadable);
+        FsPermission vdexFileFsPermission =
+                AidlUtils.buildFsPermission(UID /* uid */, UID /* gid */, isVdexOtherReadable);
+        return AidlUtils.buildPermissionSettings(dirFsPermission, odexFileFsPermission,
+                vdexFileFsPermission, AidlUtils.buildSeContext("se-info", UID));
     }
 }
