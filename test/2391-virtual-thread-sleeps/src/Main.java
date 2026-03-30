@@ -99,7 +99,7 @@ public class Main {
     private static class SleepingVirtualThreadTestCase implements AutoCloseable {
         private static final JavaLangAccess JLA = SharedSecrets.getJavaLangAccess();
         private static final int CARRIER_THREADS_LIMIT = 32;
-        private static final int JOIN_TIMEOUT_MS = 2 * 1000;
+        private static final long JOIN_TIMEOUT_MS = 10 * 1000;
         private static final int TIMEOUT_MULTIPLIER = 200;
         private final Timer mTimer = new Timer();
         private final int mNumOfThreads;
@@ -182,6 +182,11 @@ public class Main {
                     continue;
                 }
                 t.join(JOIN_TIMEOUT_MS);
+                if (t.isAlive()) {
+                    throw new IllegalStateException("Expect the carrier thread to join "
+                            + "within " + JOIN_TIMEOUT_MS + " ms. "
+                            + "Carrier thread id :" + t.threadId());
+                }
             }
 
             int pendingCount = mPendingTasks.size();
@@ -224,6 +229,11 @@ public class Main {
                 public void run() {
                     try {
                         carrier.join(JOIN_TIMEOUT_MS);
+                        if (carrier.isAlive()) {
+                            throw new IllegalStateException("Expect the carrier thread to join "
+                                    + "within " + JOIN_TIMEOUT_MS + " ms. "
+                                    + "Carrier thread id :" + carrier.threadId());
+                        }
                     } catch (InterruptedException e) {
                         throw new IllegalStateException("virtual thread id: " + virtualThreadId, e);
                     }
@@ -263,6 +273,11 @@ public class Main {
                 public void run() {
                     try {
                         carrier.join(JOIN_TIMEOUT_MS);
+                        if (carrier.isAlive()) {
+                            throw new IllegalStateException("Expect the carrier thread to join "
+                                    + "within " + JOIN_TIMEOUT_MS + " ms. "
+                                    + "Carrier thread id :" + carrier.threadId());
+                        }
                     } catch (InterruptedException e) {
                         throw new IllegalStateException("virtual thread id: " + virtualThreadId, e);
                     }
