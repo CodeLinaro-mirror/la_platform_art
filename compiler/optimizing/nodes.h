@@ -37,6 +37,7 @@
 #include "base/transform_array_ref.h"
 #include "block_namer.h"
 #include "class_root.h"
+#include "com_android_art_flags.h"
 #include "compilation_kind.h"
 #include "data_type.h"
 #include "deoptimization_kind.h"
@@ -1615,6 +1616,12 @@ class HInstruction : public ArenaObject<kArenaAllocInstruction> {
         return false;
       default:
         DCHECK(!IsControlFlow());
+        if (com::android::art::flags::weak_const_string() && GetKind() == kLoadString) {
+          DCHECK(!DoesAnyWrite());
+          // `HLoadString` can throw only OOME. If there's no such intern yet, we can pretend
+          // that we found the memory for the dead string and then collected it with a micro-GC.
+          return true;
+        }
         return !DoesAnyWrite() && !CanThrow();
     }
   }
