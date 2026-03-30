@@ -4001,7 +4001,7 @@ bool HInstructionBuilder::ProcessDexInstruction(const Instruction& instruction, 
 
     case Instruction::MONITOR_ENTER: {
       AppendInstruction(new (allocator_) HMonitorOperation(
-          LoadLocal<DataType::Type::kReference>(instruction.VRegA_11x()),
+          LoadNullCheckedLocal(instruction.VRegA_11x(), dex_pc),
           HMonitorOperation::OperationKind::kEnter,
           dex_pc));
       graph_->SetHasMonitorOperations(true);
@@ -4010,7 +4010,7 @@ bool HInstructionBuilder::ProcessDexInstruction(const Instruction& instruction, 
 
     case Instruction::MONITOR_EXIT: {
       AppendInstruction(new (allocator_) HMonitorOperation(
-          LoadLocal<DataType::Type::kReference>(instruction.VRegA_11x()),
+          LoadNullCheckedLocal(instruction.VRegA_11x(), dex_pc),
           HMonitorOperation::OperationKind::kExit,
           dex_pc));
       graph_->SetHasMonitorOperations(true);
