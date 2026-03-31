@@ -101,7 +101,7 @@ inline ObjPtr<ClassLoader> Class::GetClassLoader() {
 
 template<VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
 inline ObjPtr<ClassExt> Class::GetExtData() {
-  return GetFieldObject<ClassExt, kVerifyFlags, kReadBarrierOption>(
+  return GetFieldObject<ClassExt, kVerifyFlags, kReadBarrierOption, /*kIsVolatile=*/ true>(
       OFFSET_OF_OBJECT_MEMBER(Class, ext_data_));
 }
 
@@ -1305,13 +1305,13 @@ inline void Class::SetClassLoader(ObjPtr<ClassLoader> new_class_loader) {
 }
 
 inline void Class::SetRecursivelyInitialized() {
-  DCHECK_EQ(GetLockOwnerThreadId(), Thread::Current()->GetThreadId());
+  DCHECK(this->IsLockOwnedByMe(Thread::Current()));
   uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
   SetAccessFlags(flags | kAccRecursivelyInitialized);
 }
 
 inline void Class::SetHasDefaultMethods() {
-  DCHECK_EQ(GetLockOwnerThreadId(), Thread::Current()->GetThreadId());
+  DCHECK(this->IsLockOwnedByMe(Thread::Current()));
   uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
   SetAccessFlagsDuringLinking(flags | kAccHasDefaultMethod);
 }
@@ -1454,8 +1454,10 @@ inline void Class::FixThreadId(Class* class_for_descr) {
   if (!IsInitialized()) {
     if (kIsDebugBuild) {
       ClassStatus s = GetStatus();
-      if (s != ClassStatus::kVerified && s != ClassStatus::kRetryVerificationAtRuntime &&
-          s != ClassStatus::kVerifiedNeedsAccessChecks && s != ClassStatus::kResolved) {
+      if (s != ClassStatus::kVerified &&
+          s != ClassStatus::kRetryVerificationAtRuntime &&
+          s != ClassStatus::kVerifiedNeedsAccessChecks &&
+          s != ClassStatus::kResolved) {
         LOG(FATAL_WITHOUT_ABORT) << "Unexpected status " << s
                                  << " when clearing tid: " << GetClinitThreadId();
         std::string storage;

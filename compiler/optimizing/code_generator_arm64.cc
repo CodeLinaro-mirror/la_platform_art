@@ -951,6 +951,46 @@ class CompileOptimizedSlowPathARM64 : public SlowPathCodeARM64 {
   DISALLOW_COPY_AND_ASSIGN(CompileOptimizedSlowPathARM64);
 };
 
+class ConstantTableARM64 : public SlowPathCodeARM64 {
+ public:
+  explicit ConstantTableARM64(HLoadConstantTableEntry* load)
+      : SlowPathCodeARM64(load) {}
+
+  void EmitNativeCode(CodeGenerator* codegen) override {
+    CodeGeneratorARM64* arm64_codegen = down_cast<CodeGeneratorARM64*>(codegen);
+    HLoadConstantTableEntry* load = down_cast<HLoadConstantTableEntry*>(instruction_);
+    size_t entry_size = DataType::Size(load->GetType());
+    DCHECK(IsPowerOfTwo(entry_size));
+
+    // We may need a 4B padding before the table for 8B entries.
+    // The actual size is known only after we construct the `EmissionCheckScope`.
+    size_t max_padding = (entry_size & 8u) >> 1;
+    size_t table_size = RoundUp(entry_size * load->GetEntries().size(), /* code alignment */ 4u);
+    EmissionCheckScope guard(arm64_codegen->GetVIXLAssembler(), max_padding + table_size);
+
+    // Align data, bind the data start and emit the data.
+    vixl::CodeBuffer* buffer = arm64_codegen->GetVIXLAssembler()->GetBuffer();
+    size_t padding = RoundUp(buffer->GetSizeInBytes(), entry_size) - buffer->GetSizeInBytes();
+    DCHECK_LE(padding, max_padding);
+    buffer->EmitZeroedBytes(padding);
+    __ Bind(GetEntryLabel());
+    DCHECK_LT(static_cast<size_t>(GetEntryLabel()->GetLocation() - GetAdrLabel()->GetLocation()),
+              1 * MB);
+    buffer->EmitZeroedBytes(table_size);
+    CodeGenerator::CopyConstantTableData(
+        load, buffer->GetOffsetAddress<uint8_t*>(GetEntryLabel()->GetLocation()));
+  }
+
+  vixl::aarch64::Label* GetAdrLabel() { return &adr_label_; }
+
+  const char* GetDescription() const override {
+    return "ConstantTableARM64";
+  }
+
+ private:
+  vixl::aarch64::Label adr_label_;
+};
+
 #undef __
 
 Location InvokeDexCallingConventionVisitorARM64::GetNextLocation(DataType::Type type) {
@@ -1312,12 +1352,14 @@ void InstructionCodeGeneratorARM64::GenerateMethodEntryExitHook(HInstruction* in
   __ B(gt, slow_path->GetEntryLabel());
 
   Register init_entry = addr;
+  int slots_required =
+      instruction->IsMethodExitHook() ? kNumEntriesForWallClockExit : kNumEntriesForWallClockEntry;
   // Check if there is place in the buffer to store a new entry, if no, take slow path.
   uint32_t trace_buffer_curr_entry_offset =
       Thread::TraceBufferCurrPtrOffset<kArm64PointerSize>().Int32Value();
   __ Ldr(curr_entry, MemOperand(tr, trace_buffer_curr_entry_offset));
-  __ Sub(curr_entry, curr_entry, kNumEntriesForWallClock * sizeof(void*));
   __ Ldr(init_entry, MemOperand(tr, Thread::TraceBufferPtrOffset<kArm64PointerSize>().SizeValue()));
+  __ Sub(curr_entry, curr_entry, slots_required * sizeof(void*));
   __ Cmp(curr_entry, init_entry);
   __ B(lt, slow_path->GetEntryLabel());
 
@@ -1325,20 +1367,25 @@ void InstructionCodeGeneratorARM64::GenerateMethodEntryExitHook(HInstruction* in
   __ Str(curr_entry, MemOperand(tr, trace_buffer_curr_entry_offset));
 
   Register tmp = init_entry;
-  // Record method pointer and trace action.
-  __ Ldr(tmp, MemOperand(sp, 0));
-  // Use last two bits to encode trace method action. For MethodEntry it is 0
-  // so no need to set the bits since they are 0 already.
-  if (instruction->IsMethodExitHook()) {
-    DCHECK_GE(ArtMethod::Alignment(kRuntimePointerSize), static_cast<size_t>(4));
-    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodEnter) == 0);
-    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodExit) == 1);
-    __ Orr(tmp, tmp, Operand(enum_cast<int32_t>(TraceAction::kTraceMethodExit)));
+  // Record method pointer only for MethodEntry events.
+  if (instruction->IsMethodEntryHook()) {
+    __ Ldr(tmp, MemOperand(sp, 0));
+    __ Str(tmp, MemOperand(curr_entry, kMethodOffsetInBytesEntry));
   }
-  __ Str(tmp, MemOperand(curr_entry, kMethodOffsetInBytes));
+
   // Record the timestamp.
   __ Mrs(tmp, (SystemRegister)SYS_CNTVCT_EL0);
-  __ Str(tmp, MemOperand(curr_entry, kTimestampOffsetInBytes));
+  // Use least significant two bits to encode trace method action.
+  __ Lsl(tmp, tmp, 2);
+  if (instruction->IsMethodEntryHook()) {
+    // For MethodEntry, TraceAction encoding is 0.
+    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodEnter) == 0);
+    __ Str(tmp, MemOperand(curr_entry, kTimestampOffsetInBytesEntry));
+  } else {
+    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodExit) == 1);
+    __ Orr(tmp, tmp, Operand(enum_cast<uint64_t>(TraceAction::kTraceMethodExit)));
+    __ Str(tmp, MemOperand(curr_entry, kTimestampOffsetInBytesExit));
+  }
   __ Bind(slow_path->GetExitLabel());
 }
 
@@ -7009,6 +7056,38 @@ void InstructionCodeGeneratorARM64::VisitPackedSwitch(HPackedSwitch* switch_inst
 
     jump_table->EmitTable(codegen_);
   }
+}
+
+void LocationsBuilderARM64::VisitLoadConstantTableEntry(HLoadConstantTableEntry* load) {
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, load);
+  locations->SetInAt(0, Location::RequiresCoreRegister());
+  if (DataType::IsFloatingPointType(load->GetType())) {
+    locations->SetOut(Location::RequiresFpuRegister(), Location::kNoOutputOverlap);
+  } else {
+    locations->SetOut(Location::RequiresCoreRegister(), Location::kNoOutputOverlap);
+  }
+}
+
+void InstructionCodeGeneratorARM64::VisitLoadConstantTableEntry(HLoadConstantTableEntry* load) {
+  Register index = InputRegisterAt(load, 0);
+  CPURegister out = OutputCPURegister(load);
+
+  ConstantTableARM64* data = new (codegen_->GetScopedAllocator()) ConstantTableARM64(load);
+  codegen_->AddSlowPath(data);
+
+  UseScratchRegisterScope temps(GetVIXLAssembler());
+  Register temp = temps.AcquireX();
+
+  {
+    ExactAssemblyScope eas(GetVIXLAssembler(), kInstructionSize, CodeBufferCheckScope::kExactSize);
+    __ bind(data->GetAdrLabel());
+    // Note: ADR can target labels up to 1MB away. We should never emit more than 1MB of code for
+    // any method, doing so would break this ADR as well as jumps to Baker read barrier thunks.
+    __ adr(temp, data->GetEntryLabel());
+  }
+
+  MemOperand source(temp, index, UXTW, DataType::SizeShift(load->GetType()));
+  codegen_->Load(load->GetType(), out, source);
 }
 
 void InstructionCodeGeneratorARM64::GenerateReferenceLoadOneRegister(

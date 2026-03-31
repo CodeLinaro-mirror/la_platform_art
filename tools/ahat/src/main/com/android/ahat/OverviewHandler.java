@@ -17,6 +17,7 @@
 package com.android.ahat;
 
 import com.android.ahat.heapdump.AhatHeap;
+import com.android.ahat.heapdump.AhatInstance;
 import com.android.ahat.heapdump.AhatSnapshot;
 import com.android.ahat.heapdump.Reachability;
 import com.android.ahat.heapdump.Size;
@@ -28,13 +29,11 @@ class OverviewHandler implements AhatHandler {
   private AhatSnapshot mSnapshot;
   private File mHprof;
   private File mBaseHprof;
-  private Reachability mRetained;
 
-  public OverviewHandler(AhatSnapshot snapshot, File hprof, File basehprof, Reachability retained) {
+  public OverviewHandler(AhatSnapshot snapshot, File hprof, File basehprof) {
     mSnapshot = snapshot;
     mHprof = hprof;
     mBaseHprof = basehprof;
-    mRetained = retained;
   }
 
   @Override
@@ -48,7 +47,7 @@ class OverviewHandler implements AhatHandler {
         DocString.format("ahat-%s", OverviewHandler.class.getPackage().getImplementationVersion()));
     doc.description(
         DocString.text("--retained"),
-        DocString.text(mRetained.toString()));
+        DocString.text(mSnapshot.getRetainedReachability().toString()));
     doc.description(DocString.text("hprof file"), DocString.text(mHprof.toString()));
     if (mBaseHprof != null) {
       doc.description(DocString.text("baseline hprof file"), DocString.text(mBaseHprof.toString()));
@@ -57,6 +56,16 @@ class OverviewHandler implements AhatHandler {
 
     doc.section("Bytes Retained by Heap");
     printHeapSizes(doc);
+
+    List<AhatInstance> activityLeaks = mSnapshot.getActivityLeaks();
+    if (!activityLeaks.isEmpty()) {
+      doc.section("Activity Leaks");
+      doc.description(
+          DocString.text("⚠ Found "),
+          DocString.link(
+              DocString.uri("activity-leaks"),
+              DocString.format("%d leaked activities.", activityLeaks.size())));
+    }
   }
 
   private void printHeapSizes(Doc doc) {

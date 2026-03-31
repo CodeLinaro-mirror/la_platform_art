@@ -16,16 +16,6 @@
 
 package com.android.server.art;
 
-import static com.android.server.art.ArtManagerLocal.AdjustCompilerFilterCallback;
-import static com.android.server.art.DexMetadataHelper.DexMetadataInfo;
-import static com.android.server.art.OutputArtifacts.PermissionSettings;
-import static com.android.server.art.ProfilePath.TmpProfilePath;
-import static com.android.server.art.Utils.Abi;
-import static com.android.server.art.Utils.InitProfileResult;
-import static com.android.server.art.model.ArtFlags.DexoptFlags;
-import static com.android.server.art.model.Config.Callback;
-import static com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
-
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.content.Context;
@@ -42,12 +32,25 @@ import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.LocalManagerRegistry;
+import com.android.server.art.ArtManagerLocal.AdjustCompilerFilterCallback;
 import com.android.server.art.Dex2OatStatsReporter.Dex2OatResult;
+import com.android.server.art.DexMetadataHelper.DexMetadataInfo;
+import com.android.server.art.OutputArtifacts.PermissionSettings;
+import com.android.server.art.ProfilePath.TmpProfilePath;
 import com.android.server.art.model.ArtFlags;
+import com.android.server.art.model.ArtFlags.DexoptFlags;
 import com.android.server.art.model.Config;
+import com.android.server.art.model.Config.Callback;
 import com.android.server.art.model.DetailedDexInfo;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
+import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
+import com.android.server.art.utils.AidlUtils;
+import com.android.server.art.utils.ArtdRefCache;
+import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Abi;
+import com.android.server.art.utils.Utils.InitProfileResult;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
@@ -222,7 +225,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
                         var options = GetDexoptNeededOptions.builder()
                                               .setProfileMerged(profileMerged)
                                               .setFlags(mParams.getFlags())
-                                              .setNeedsToBePublic(canBePublic)
+                                              .setCanBePublic(canBePublic)
                                               .build();
 
                         if (mInjector.isPreReboot()) {
@@ -568,14 +571,13 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         ArtifactsPath existingArtifactsPath = AidlUtils.buildArtifactsPathAsInput(
                 target.dexInfo().dexPath(), target.isa(), target.isInDalvikCache());
 
-        if (options.needsToBePublic()
+        if (options.canBePublic()
                 && mInjector.getArtd().getArtifactsVisibility(existingArtifactsPath)
                         == FileVisibility.NOT_OTHER_READABLE) {
-            // Typically, this happens after an app starts being used by other apps.
-            // This case should be the same as force as we have no choice but to trigger a new
-            // dexopt.
-            dexoptTrigger |=
-                    DexoptTrigger.COMPILER_FILTER_IS_SAME | DexoptTrigger.COMPILER_FILTER_IS_WORSE;
+            // Typically, this happens after an app starts being used by other apps and we have a
+            // public profile that can be used. We can re-dexopt the app if it doesn't regress the
+            // compiler filter, as this will allow other apps to use the artifacts as well.
+            dexoptTrigger |= DexoptTrigger.COMPILER_FILTER_IS_SAME;
         }
 
         return dexoptTrigger;
@@ -797,7 +799,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     abstract static class GetDexoptNeededOptions {
         abstract @DexoptFlags int flags();
         abstract boolean profileMerged();
-        abstract boolean needsToBePublic();
+        abstract boolean canBePublic();
 
         static Builder builder() {
             return new AutoValue_Dexopter_GetDexoptNeededOptions.Builder();
@@ -807,7 +809,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         abstract static class Builder {
             abstract Builder setFlags(@DexoptFlags int value);
             abstract Builder setProfileMerged(boolean value);
-            abstract Builder setNeedsToBePublic(boolean value);
+            abstract Builder setCanBePublic(boolean value);
             abstract GetDexoptNeededOptions build();
         }
     }

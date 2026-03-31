@@ -17,6 +17,7 @@
 package com.android.server.art;
 
 import android.annotation.CallbackExecutor;
+import android.annotation.FlaggedApi;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.SystemApi;
@@ -48,6 +49,7 @@ import android.util.Pair;
 
 import androidx.annotation.RequiresApi;
 
+import com.android.art.rw.flags.Flags;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.build.SdkLevel;
@@ -64,8 +66,6 @@ import com.android.server.art.ProfilePath.PrimaryCurProfilePath;
 import com.android.server.art.ProfilePath.WritableProfilePath;
 import com.android.server.art.ReasonMapping.BatchDexoptReason;
 import com.android.server.art.ReasonMapping.BootReason;
-import com.android.server.art.Utils.Abi;
-import com.android.server.art.Utils.InitProfileResult;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.ArtFlags.GetStatusFlags;
 import com.android.server.art.model.ArtFlags.ScheduleStatus;
@@ -80,7 +80,14 @@ import com.android.server.art.model.DexoptResult;
 import com.android.server.art.model.DexoptStatus;
 import com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
 import com.android.server.art.model.OperationProgress;
+import com.android.server.art.model.VerifyDexoptArtifactsResult;
 import com.android.server.art.prereboot.PreRebootStatsReporter;
+import com.android.server.art.utils.AidlUtils;
+import com.android.server.art.utils.ArtdRefCache;
+import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Abi;
+import com.android.server.art.utils.Utils.InitProfileResult;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
@@ -391,6 +398,29 @@ public final class ArtManagerLocal {
         try (var pin = mInjector.createArtdPin()) {
             return mInjector.getDexoptHelper().dexopt(
                     snapshot, List.of(packageName), params, cancellationSignal, Runnable::run);
+        } finally {
+            mCleanupLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Verifies that the dexopt artifacts for packages with {@link
+     * PackageState#shouldVerifyCompilationArtifacts()} are produced by trusted environments.
+     *
+     * @param snapshot the snapshot from {@link PackageManagerLocal} to operate on
+     * @return the verification result
+     * @throws IllegalStateException if the operation encounters an error that should never happen
+     *         (e.g., an internal logic error), such as if the ART daemon is unreachable.
+     */
+    // TODO(b/419024976): when available: @RequiresApi(Build.VERSION_CODES.CINNAMON_BUN_1)
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    @FlaggedApi(Flags.FLAG_SECURE_COMPILATION)
+    @NonNull
+    public VerifyDexoptArtifactsResult verifyDexoptArtifacts(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        mCleanupLock.readLock().lock();
+        try (var pin = mInjector.createArtdPin()) {
+            return mInjector.getDexoptHelper().verifyDexoptArtifacts(snapshot, Runnable::run);
         } finally {
             mCleanupLock.readLock().unlock();
         }

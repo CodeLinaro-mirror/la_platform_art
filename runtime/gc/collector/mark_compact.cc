@@ -117,6 +117,9 @@ static constexpr uint kBlackDenseRegionThreshold = 95U;
 // Flag to force stop-the-world compaction so that we don't use userfaultfd.
 #ifdef ART_FORCE_CMC_STW_COMPACTION
 static constexpr bool kForceSTWCompaction = true;
+#elif defined(ART_TARGET_ANDROID)
+static const bool kForceSTWCompaction =
+    GetBoolProperty("ro.dalvik.vm.force_cmc_stw_compaction", false);
 #else
 static constexpr bool kForceSTWCompaction = false;
 #endif
@@ -4294,14 +4297,6 @@ void MarkCompact::UpdateClassTableClasses(Runtime* runtime, bool immune_class_ta
 void MarkCompact::CompactionPause() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
   Runtime* runtime = Runtime::Current();
-  if (kIsDebugBuild) {
-    DCHECK_EQ(thread_running_gc_, Thread::Current());
-    // TODO(Simulator): Test that this should not operate on the simulated stack when the simulator
-    // supports mark compact.
-    stack_low_addr_ = thread_running_gc_->GetStackEnd<kNativeStackType>();
-    stack_high_addr_ = reinterpret_cast<char*>(stack_low_addr_)
-                       + thread_running_gc_->GetUsableStackSize<kNativeStackType>();
-  }
   {
     ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
     // Refresh data-structures to catch-up on allocations that may have
@@ -4465,7 +4460,6 @@ void MarkCompact::CompactionPause() {
   } else {
     DCHECK_EQ(compaction_buffer_counter_.load(std::memory_order_relaxed), 1);
   }
-  stack_low_addr_ = nullptr;
 }
 
 void MarkCompact::KernelPrepareRangeForUffd(uint8_t* to_addr, uint8_t* from_addr, size_t map_size) {
@@ -5984,17 +5978,22 @@ inline bool MarkCompact::MarkObjectNonNullNoPush(mirror::Object* obj,
     return false;
   } else {
     // Must be a large-object space, otherwise it's a case of heap corruption.
-    if (UNLIKELY(!IsAlignedParam(obj, space::LargeObjectSpace::ObjectAlignment()))) {
+    auto* los = heap_->GetLargeObjectsSpace();
+    if (UNLIKELY(los == nullptr ||
+                 !IsAlignedParam(obj, space::LargeObjectSpace::ObjectAlignment()))) {
+      if (los == nullptr) {
+        LOG(FATAL_WITHOUT_ABORT)
+            << "ref=" << obj
+            << " doesn't belong to any of the spaces and large object space doesn't exist";
+      }
       // Objects in large-object space are aligned to the large-object alignment.
       // So if we have an object which doesn't belong to any space and is not
       // page-aligned as well, then it's memory corruption.
       // TODO: implement protect/unprotect in bump-pointer space.
       heap_->GetVerification()->LogHeapCorruption(holder, offset, obj, /*fatal*/ true);
     }
-    DCHECK_NE(heap_->GetLargeObjectsSpace(), nullptr)
-        << "ref=" << obj
-        << " doesn't belong to any of the spaces and large object space doesn't exist";
-    DCHECK(large_object_space_bitmap_->HasAddress(obj));
+    accounting::LargeObjectBitmap* los_bitmap = los->GetMarkBitmap();
+    DCHECK(los_bitmap->HasAddress(obj));
     if (kParallel) {
       large_object_space_bitmap_->AtomicTestAndSet(obj);
     } else {

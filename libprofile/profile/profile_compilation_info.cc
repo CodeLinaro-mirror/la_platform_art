@@ -2178,7 +2178,7 @@ std::string ProfileCompilationInfo::DumpInfo(const std::vector<const DexFile*>& 
     os << "\n";
   }
 
-  const std::string kFirstDexFileKeySubstitute = "!classes.dex";
+  const std::string kFirstDexFileKeySubstitute = "!0";
 
   for (const std::unique_ptr<DexFileData>& dex_data : info_) {
     os << "\n";
@@ -2186,9 +2186,13 @@ std::string ProfileCompilationInfo::DumpInfo(const std::vector<const DexFile*>& 
       os << dex_data->profile_key;
     } else {
       // Replace the (empty) multidex suffix of the first key with a substitute for easier reading.
-      std::string multidex_suffix = DexFileLoader::GetMultiDexSuffix(
-          GetBaseKeyFromAugmentedKey(dex_data->profile_key));
-      os << (multidex_suffix.empty() ? kFirstDexFileKeySubstitute : multidex_suffix);
+      std::string base_key = GetBaseKeyFromAugmentedKey(dex_data->profile_key);
+      auto [filename, index] = DexFileLoader::SplitMultiDexLocation(base_key);
+      if (filename.size() == base_key.size()) {
+        os << kFirstDexFileKeySubstitute;
+      } else {
+        os << base_key.substr(filename.size());
+      }
     }
     os << " [index=" << static_cast<uint32_t>(dex_data->profile_index) << "]";
     os << " [checksum=" << std::hex << dex_data->checksum << "]" << std::dec;
@@ -2307,6 +2311,16 @@ const ArenaSet<dex::TypeIndex>* ProfileCompilationInfo::GetClasses(
   return &dex_data->class_set;
 }
 
+const ArenaSet<dex::TypeIndex>* ProfileCompilationInfo::GetClassesNoPreload(
+    const DexFile& dex_file) const {
+  const DexFileData* dex_data =
+      FindDexDataUsingAnnotations(&dex_file, ProfileSampleAnnotation::kNone);
+  if (dex_data == nullptr) {
+    return nullptr;
+  }
+  return &dex_data->class_set_no_preload;
+}
+
 bool ProfileCompilationInfo::SameVersion(const ProfileCompilationInfo& other) const {
   return memcmp(version_, other.version_, kProfileVersionSize) == 0;
 }
@@ -2353,7 +2367,7 @@ bool ProfileCompilationInfo::GenerateTestProfile(int fd,
   const uint16_t kFavorSplit = 2;
 
   for (uint16_t i = 0; i < number_of_dex_files; i++) {
-    std::string dex_location = DexFileLoader::GetMultiDexLocation(i, base_dex_location.c_str());
+    std::string dex_location = DexFileLoader::GetMultiDexLocation(base_dex_location.c_str(), i);
     std::string profile_key = info.GetProfileDexFileBaseKey(dex_location);
 
     DexFileData* const data =

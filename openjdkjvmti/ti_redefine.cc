@@ -399,7 +399,7 @@ jvmtiError Redefiner::CanRedefineClass(art::Handle<art::mirror::Class> klass,
     // It's only a problem to try to retransform/redefine a unprepared class if it's happening on
     // the same thread as the class-linking process. If it's on another thread we will be able to
     // wait for the preparation to finish and continue from there.
-    if (klass->GetLockOwnerThreadId() == self->GetThreadId()) {
+    if (klass->IsLockOwnedByMe(self)) {
       *error_msg = "Modification of class " + klass->PrettyClass() +
           " from within the classes ClassLoad callback is not supported to prevent deadlocks." +
           " Please use ClassFileLoadHook directly instead.";
@@ -522,9 +522,9 @@ art::MemMap Redefiner::MoveDataToMemMap(const std::string& original_location,
   std::string modified_location = StringPrintf("%s-transformed", original_location.c_str());
   // A dangling multi-dex location appended to bootclasspath can cause inaccuracy in oat file
   // validation. For simplicity, just convert it to a normal location.
-  size_t pos = modified_location.find(art::DexFileLoader::kMultiDexSeparator);
-  if (pos != std::string::npos) {
-    modified_location[pos] = '-';
+  auto [filename, index] = art::DexFileLoader::SplitMultiDexLocation(modified_location);
+  if (filename.size() < modified_location.size()) {
+    modified_location[filename.size()] = '-';
   }
   art::MemMap map = art::MemMap::MapAnonymous(
       modified_location.c_str(),
