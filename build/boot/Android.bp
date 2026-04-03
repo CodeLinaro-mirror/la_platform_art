@@ -45,7 +45,8 @@ bootclasspath_fragment {
     ],
     image_name: "art",
     dex_preopt: {
-        profile:  "art/build/boot/boot-image-profile.txt",
+        profile: "art/build/boot/boot-image-profile.txt",
+        nopreload_classes: "art/build/boot/nopreload-classes",
     },
     // Must match the ART_APEX_JARS set in build/make/core/envsetup.mk
     contents: [

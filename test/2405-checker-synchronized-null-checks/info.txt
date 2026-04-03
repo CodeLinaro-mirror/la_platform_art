@@ -1,0 +1,2 @@
+Check that null check performed by `monitor-enter` (and `monitor-exit`)
+is passed further down in the tree.

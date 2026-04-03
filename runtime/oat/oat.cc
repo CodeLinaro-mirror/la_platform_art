@@ -19,6 +19,8 @@
 #include <string.h>
 #include <zlib.h>
 
+#include <algorithm>
+
 #include "android-base/logging.h"
 #include "android-base/stringprintf.h"
 #include "arch/instruction_set.h"
@@ -235,6 +237,29 @@ void OatHeader::SetExecutableOffset(uint32_t executable_offset) {
   DCHECK_EQ(executable_offset_, 0U);
 
   executable_offset_ = executable_offset;
+}
+
+bool OatHeader::AreTrampolineOffsetsValid(std::string* error_msg) const {
+  DCHECK(IsValid());
+  std::array<uint32_t, 6> trampoline_offsets = {
+      jni_dlsym_lookup_trampoline_offset_,
+      quick_generic_jni_trampoline_offset_,
+      quick_imt_conflict_trampoline_offset_,
+      quick_resolution_trampoline_offset_,
+      quick_to_interpreter_bridge_offset_,
+      nterp_trampoline_offset_,
+  };
+  if (!std::is_sorted(trampoline_offsets.begin(), trampoline_offsets.end())) {
+    *error_msg = StringPrintf("Trampoline offsets are not sorted: %u, %u, %u, %u, %u, %u",
+                              trampoline_offsets[0],
+                              trampoline_offsets[1],
+                              trampoline_offsets[2],
+                              trampoline_offsets[3],
+                              trampoline_offsets[4],
+                              trampoline_offsets[5]);
+    return false;
+  }
+  return true;
 }
 
 static const void* GetTrampoline(const OatHeader& header, uint32_t offset) {
@@ -483,13 +508,26 @@ uint32_t OatHeader::GetAssumeValueSdkInt() const {
 
 bool OatHeader::IsProfileCodeEnabled() const { return IsKeyEnabled(kEnableProfileCodeKey); }
 
-CompilerFilter::Filter OatHeader::GetCompilerFilter() const {
-  CompilerFilter::Filter filter;
+std::optional<CompilerFilter::Filter> OatHeader::GetCompilerFilterSafe(
+    std::string* error_msg) const {
   const char* key_value = GetStoreValueByKey(kCompilerFilter);
-  CHECK(key_value != nullptr) << "compiler-filter not found in oat header";
-  CHECK(CompilerFilter::ParseCompilerFilter(key_value, &filter))
-      << "Invalid compiler-filter in oat header: " << key_value;
+  if (key_value == nullptr) {
+    *error_msg = "compiler-filter not found in oat header";
+    return std::nullopt;
+  }
+  CompilerFilter::Filter filter;
+  if (!CompilerFilter::ParseCompilerFilter(key_value, &filter)) {
+    *error_msg = StringPrintf("Invalid compiler-filter in oat header: %s", key_value);
+    return std::nullopt;
+  }
   return filter;
+}
+
+CompilerFilter::Filter OatHeader::GetCompilerFilter() const {
+  std::string error_msg;
+  std::optional<CompilerFilter::Filter> filter = GetCompilerFilterSafe(&error_msg);
+  CHECK(filter.has_value()) << error_msg;
+  return *filter;
 }
 
 bool OatHeader::KeyHasValue(const char* key, const char* value, size_t value_size) const {

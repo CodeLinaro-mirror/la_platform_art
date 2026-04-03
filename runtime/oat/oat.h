@@ -140,6 +140,8 @@ class EXPORT PACKED(4) OatHeader {
   uint32_t GetExecutableOffset() const;
   void SetExecutableOffset(uint32_t executable_offset);
 
+  bool AreTrampolineOffsetsValid(std::string* error_msg) const;
+
   const void* GetJniDlsymLookupTrampoline() const;
   uint32_t GetJniDlsymLookupTrampolineOffset() const;
   void SetJniDlsymLookupTrampolineOffset(uint32_t offset);
@@ -187,6 +189,7 @@ class EXPORT PACKED(4) OatHeader {
   size_t GetHeaderSize() const;
   bool IsDebuggable() const;
   bool IsNativeDebuggable() const;
+  std::optional<CompilerFilter::Filter> GetCompilerFilterSafe(std::string* error_msg) const;
   CompilerFilter::Filter GetCompilerFilter() const;
   bool IsConcurrentCopying() const;
   bool RequiresImage() const;

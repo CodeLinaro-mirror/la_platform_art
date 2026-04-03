@@ -21,6 +21,7 @@ import static com.android.server.art.testing.TestDataHelper.newPackageState;
 import static com.google.common.truth.Truth.assertThat;
 
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -28,10 +29,17 @@ import static org.mockito.Mockito.when;
 
 import android.app.ActivityManager;
 import android.app.ActivityManager.RunningAppProcessInfo;
+import android.app.role.RoleManager;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.os.SystemProperties;
 import android.os.UserHandle;
 import android.platform.test.annotations.RequiresFlagsDisabled;
 import android.platform.test.annotations.RequiresFlagsEnabled;
+import android.provider.MediaStore;
 import android.util.SparseArray;
 
 import androidx.test.filters.SmallTest;
@@ -64,6 +72,9 @@ public class UtilsTest {
 
     @Mock private FilteredSnapshot mSnapshot;
     @Mock private DexUseManagerLocal mDexUseManager;
+    @Mock private RoleManager mRoleManager;
+    @Mock private PackageManager mPackageManager;
+    @Mock private Context mContext;
 
     private static final String PKG_NAME = "com.example.foo";
     private static final String WEBVIEW_PKG_NAME = "com.android.webview";
@@ -77,6 +88,9 @@ public class UtilsTest {
         lenient().when(Constants.getNative64BitAbi()).thenReturn("arm64-v8a");
         lenient().when(Constants.getNative32BitAbi()).thenReturn("armeabi-v7a");
         lenient().when(Constants.getWebviewPackageNames()).thenReturn(Set.of(WEBVIEW_PKG_NAME));
+
+        lenient().when(mContext.getSystemService(RoleManager.class)).thenReturn(mRoleManager);
+        lenient().when(mContext.getPackageManager()).thenReturn(mPackageManager);
     }
 
     @Test
@@ -340,6 +354,48 @@ public class UtilsTest {
                            .map(info -> info.pid)
                            .toList())
                 .containsExactly(1000, 1001, 1002, 1004);
+    }
+
+    @Test
+    public void testIsSystemUiPackage() {
+        when(mContext.getString(android.R.string.config_systemUi))
+                .thenReturn("com.android.systemui");
+
+        assertThat(Utils.getSystemUiPackageName(mContext)).isEqualTo("com.android.systemui");
+        assertThat(Utils.isSystemUiPackage(mContext, "com.android.systemui")).isTrue();
+        assertThat(Utils.isSystemUiPackage(mContext, "com.example.other")).isFalse();
+    }
+
+    @Test
+    public void testIsLauncherPackage() {
+        when(mRoleManager.getRoleHolders(RoleManager.ROLE_HOME))
+                .thenReturn(List.of("com.android.launcher"));
+
+        assertThat(Utils.getLauncherPackageNames(mContext)).containsExactly("com.android.launcher");
+        assertThat(Utils.isLauncherPackage(mContext, "com.android.launcher")).isTrue();
+        assertThat(Utils.isLauncherPackage(mContext, "com.example.other")).isFalse();
+    }
+
+    @Test
+    public void testGetCameraPackageNames() {
+        when(mPackageManager.queryIntentActivities(
+                     argThat(intent
+                             -> intent.getAction().equals(
+                                     MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE)),
+                     eq(PackageManager.MATCH_DEFAULT_ONLY | PackageManager.MATCH_DIRECT_BOOT_AWARE
+                             | PackageManager.MATCH_DIRECT_BOOT_UNAWARE)))
+                .thenReturn(List.of(createResolveInfo("com.android.camera1"),
+                        createResolveInfo("com.android.camera2")));
+
+        assertThat(Utils.getCameraPackageNames(mContext))
+                .containsExactly("com.android.camera1", "com.android.camera2");
+    }
+
+    private ResolveInfo createResolveInfo(String packageName) {
+        ResolveInfo info = new ResolveInfo();
+        info.activityInfo = new ActivityInfo();
+        info.activityInfo.packageName = packageName;
+        return info;
     }
 
     private RunningAppProcessInfo createProcessInfo(

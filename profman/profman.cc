@@ -568,7 +568,7 @@ class ProfMan final {
 
   bool GetProfileFilterKeyFromApks(std::set<ProfileFilterKey>* profile_filter_keys) {
     return ForEachApkFile([&](File file, const std::string& location) {
-      std::string base_key = ProfileCompilationInfo::GetProfileDexFileBaseKey(location);
+      std::string base_key(ProfileCompilationInfo::GetLocationBasename(location));
       ArtDexFileLoader dex_file_loader(&file, location);
       std::vector<uint32_t> checksums;
       std::string error_msg;
@@ -1345,6 +1345,13 @@ class ProfMan final {
   bool ProcessPreloadedClassesDenylist(const std::vector<std::unique_ptr<const DexFile>>& dex_files,
                                        /*out*/ ProfileCompilationInfo* profile) {
     DCHECK(boot_image_options_.record_preloaded_classes_denylist);
+
+    if (boot_image_options_.preloaded_classes_denylist.empty() &&
+        !profile->AddNoPreloadMarker(dex_files)) {
+      LOG(ERROR) << "Unable to add no-preload marker to the profile";
+      return false;
+    }
+
     for (const std::string& klass : boot_image_options_.preloaded_classes_denylist) {
       // There should be no arrays in preloaded-classes-denylist.
       CHECK_EQ(klass.find('['), std::string::npos);

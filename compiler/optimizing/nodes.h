@@ -37,6 +37,7 @@
 #include "base/transform_array_ref.h"
 #include "block_namer.h"
 #include "class_root.h"
+#include "com_android_art_flags.h"
 #include "compilation_kind.h"
 #include "data_type.h"
 #include "deoptimization_kind.h"
@@ -1615,6 +1616,12 @@ class HInstruction : public ArenaObject<kArenaAllocInstruction> {
         return false;
       default:
         DCHECK(!IsControlFlow());
+        if (com::android::art::flags::weak_const_string() && GetKind() == kLoadString) {
+          DCHECK(!DoesAnyWrite());
+          // `HLoadString` can throw only OOME. If there's no such intern yet, we can pretend
+          // that we found the memory for the dead string and then collected it with a micro-GC.
+          return true;
+        }
         return !DoesAnyWrite() && !CanThrow();
     }
   }
@@ -8178,6 +8185,50 @@ void ResetEnvironmentInputRecords(HInstruction* instruction);
 // Detects an instruction that is >= 0. As long as the value is carried by
 // a single instruction, arithmetic wrap-around cannot occur.
 bool IsGEZero(HInstruction* instruction);
+
+//
+// Helper functions that determine whether an instruction's environment must be
+// precise, i.e. whether the associated stack map should include vregister mappings.
+//
+
+// Returns whether a graph requires precise HEnvironment.
+//
+// It is true in the following cases:
+//  * Debuggable graph
+//    when we want to observe the values / asynchronously deoptimize.
+//  * Monitor operations
+//    to allow dumping in a stack trace locked dex registers for non-debuggable code.
+inline bool GraphNeedsPreciseEnvironment(HGraph* graph) {
+  return graph->IsDebuggable() || graph->HasMonitorOperations();
+}
+
+// Returns whether instruction requires precise HEnvironment, independently from the graph
+// properties.
+//
+// It is true in the following cases:
+//  * Deoptimization
+//    when we need to obtain the values to restore actual vregisters for interpreter.
+//  * On-stack-replacement (OSR)
+//    when entering compiled for OSR code from the interpreter we need to initialize the compiled
+//    code values with the values from the vregisters. Not all instructions in OSR mode
+//    require a precise HEnvironment, only SuspendChecks in the non-inlined loops do.
+//  * Method local catch blocks
+//    a catch block must see the environment of the instruction from the same method that can
+//    throw to this block.
+//  * First instruction of a catch block
+//    a catch block's first instruction is always Nop that requires precise HEnvironment as
+//    it is used to emit catch block information.
+inline bool InstructionNeedsPreciseEnvironment(HInstruction* instruction, bool osr) {
+  HBasicBlock* bb = instruction->GetBlock();
+  if (instruction->IsDeoptimize() || instruction->CanThrowIntoCatchBlock() || osr) {
+    return true;
+  }
+  if (bb->IsCatchBlock() && bb->GetFirstInstruction() == instruction) {
+    DCHECK(instruction->IsNop());
+    return true;
+  }
+  return false;
+}
 
 }  // namespace art
 
