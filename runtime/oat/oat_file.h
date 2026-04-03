@@ -398,9 +398,10 @@ class OatFile {
   EXPORT ArrayRef<GcRoot<mirror::Object>> GetBssStrings() const;  // Note: typed as `Object`.
 
   // Initialize relocation sections (.data.img.rel.ro and .bss).
-  void InitializeRelocations(ArtMethod* resolution_method,
-                             const void* boot_image_begin,
-                             const void* app_image_begin = nullptr) const;
+  void InitializeRelocations(
+      ArtMethod* resolution_method,
+      const void* boot_image_begin,
+      const std::function<void(ArrayRef<uint32_t>)>* init_app_image_relocations = nullptr) const;
 
   // Finds the associated oat class for a dex_file and descriptor. Returns an invalid OatClass on
   // error and sets found to false.

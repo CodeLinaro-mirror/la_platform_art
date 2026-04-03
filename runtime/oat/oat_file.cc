@@ -1198,6 +1198,20 @@ bool OatFileBase::Setup(int zip_fd,
     }
   }
 
+  size_t executable_offset = GetOatHeader().GetExecutableOffset();
+  if (executable_offset < GetOatHeader().GetHeaderSize() || executable_offset > Size()) {
+    *error_msg = ErrorPrintf("Invalid executable offset: %zu is not in [%zu, %zu]",
+                             executable_offset,
+                             GetOatHeader().GetHeaderSize(),
+                             Size());
+    return false;
+  }
+
+  if (GetOatHeader().GetKeyValueStoreSize() != 0u &&
+      !GetOatHeader().GetCompilerFilterSafe(error_msg).has_value()) {
+    return false;
+  }
+
   return true;
 }
 
@@ -2657,9 +2671,10 @@ static void DCheckIndexToBssMapping(const OatFile* oat_file,
   }
 }
 
-void OatFile::InitializeRelocations(ArtMethod* resolution_method,
-                                    const void* boot_image_begin,
-                                    const void* app_image_begin) const {
+void OatFile::InitializeRelocations(
+    ArtMethod* resolution_method,
+    const void* boot_image_begin,
+    const std::function<void(ArrayRef<uint32_t>)>* init_app_image_relocations) const {
   DCHECK(IsExecutable());
 
   // Initialize the .data.img.rel.ro section.
@@ -2675,10 +2690,10 @@ void OatFile::InitializeRelocations(ArtMethod* resolution_method,
       const_cast<uint32_t&>(relocation) += reinterpret_cast32<uint32_t>(boot_image_begin);
     }
     if (!GetAppImageRelocations().empty()) {
-      CHECK(app_image_begin != nullptr);
-      for (const uint32_t& relocation : GetAppImageRelocations()) {
-        const_cast<uint32_t&>(relocation) += reinterpret_cast32<uint32_t>(app_image_begin);
-      }
+      CHECK(init_app_image_relocations != nullptr);
+      ArrayRef<const uint32_t> relocations = GetAppImageRelocations();
+      (*init_app_image_relocations)(
+          ArrayRef<uint32_t>(const_cast<uint32_t*>(relocations.data()), relocations.size()));
     }
     CheckedCall(mprotect,
                 "protect boot image relocations",

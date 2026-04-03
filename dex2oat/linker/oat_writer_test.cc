@@ -167,6 +167,12 @@ class OatTest : public CommonCompilerDriverTest {
                   OatKeyValueStore& key_value_store,
                   bool verify,
                   CopyOption copy) {
+    if (!key_value_store.Contains(OatHeader::kCompilerFilter)) {
+      // The compiler filter is required for the oat file to be valid.
+      key_value_store.Put(OatHeader::kCompilerFilter,
+                          CompilerFilter::NameOfFilter(CompilerFilter::kSpeed));
+    }
+
     std::unique_ptr<ElfWriter> elf_writer = CreateElfWriterQuick(
         compiler_driver_->GetCompilerOptions(),
         oat_file);
