@@ -93,6 +93,7 @@ class ProfileCompilationInfo {
 
   static constexpr size_t kProfileVersionSize = 4;
   static constexpr uint8_t kIndividualInlineCacheSize = 5;
+  static constexpr dex::TypeIndex kNoPreloadMarker{DexFile::kDexNoIndex16};
 
   // Data structures for encoding the offline representation of inline caches.
   // This is exposed as public in order to make it available to dex2oat compilations
@@ -379,7 +380,26 @@ class ProfileCompilationInfo {
       return false;
     }
     data->class_set_no_preload.insert(type_index);
+    has_no_preload_section = true;
     return true;
+  }
+
+  bool AddNoPreloadMarker(const std::vector<std::unique_ptr<const DexFile>>& dex_files) {
+    // Add no-preload marker for the first dex file (if any): it doesn't matter which dex file,
+    // the marker is only needed to test for the presence of "classes-no-preload" section.
+    DexFileData* const data = dex_files.empty()
+        ? nullptr
+        : GetOrAddDexFileData(dex_files[0].get(), ProfileSampleAnnotation::kNone);
+    if (data == nullptr) {
+      return false;
+    }
+    data->class_set_no_preload.insert(kNoPreloadMarker);
+    has_no_preload_section = true;
+    return true;
+  }
+
+  bool HasNoPreloadSection() const {
+    return has_no_preload_section;
   }
 
   // Add a class with the specified `descriptor` to the profile.
@@ -584,7 +604,7 @@ class ProfileCompilationInfo {
     std::string_view base_key = GetBaseKeyViewFromAugmentedKey(dex_file_data->profile_key);
     for (const auto& dex_file : dex_files) {
       if (dex_checksum == dex_file->GetLocationChecksum() &&
-          base_key == GetProfileDexFileBaseKey(dex_file->GetLocation())) {
+          base_key == GetProfileDexFileBaseKey(dex_file)) {
         return std::addressof(*dex_file);
       }
     }
@@ -625,11 +645,16 @@ class ProfileCompilationInfo {
   // Perform an equality test with the `other` profile information.
   bool Equals(const ProfileCompilationInfo& other);
 
+  // Returns the basename of the location (e.g. "base.apk" from "/dir/base.apk").
+  static std::string_view GetLocationBasename(std::string_view base_location);
+
   // Return the base profile key associated with the given dex location. The base profile key
   // is solely constructed based on the dex location (as opposed to the one produced by
   // GetProfileDexFileAugmentedKey which may include additional metadata like the origin
   // package name)
-  static std::string GetProfileDexFileBaseKey(std::string_view dex_location);
+  static std::string GetProfileDexFileBaseKey(std::string_view base_location,
+                                              std::string_view entry_name);
+  static std::string GetProfileDexFileBaseKey(const DexFile* dex_file);
 
   // Returns a base key without the annotation information.
   static std::string GetBaseKeyFromAugmentedKey(const std::string& profile_key);
@@ -994,7 +1019,7 @@ class ProfileCompilationInfo {
 
   DexFileData* GetOrAddDexFileData(const DexFile* dex_file,
                                    const ProfileSampleAnnotation& annotation) {
-    return GetOrAddDexFileData(GetProfileDexFileAugmentedKey(dex_file->GetLocation(), annotation),
+    return GetOrAddDexFileData(GetProfileDexFileAugmentedKey(dex_file, annotation),
                                dex_file->GetLocationChecksum(),
                                dex_file->NumTypeIds(),
                                dex_file->NumMethodIds());
@@ -1087,7 +1112,7 @@ class ProfileCompilationInfo {
   // The return key will contain a serialized form of the information from the provided
   // annotation. If the annotation is ProfileSampleAnnotation::kNone then no extra info is
   // added to the key and this method is equivalent to GetProfileDexFileBaseKey.
-  static std::string GetProfileDexFileAugmentedKey(const std::string& dex_location,
+  static std::string GetProfileDexFileAugmentedKey(const DexFile* dex_file,
                                                    const ProfileSampleAnnotation& annotation);
 
   // Migrates the annotation from an augmented key to a base key.
@@ -1119,6 +1144,8 @@ class ProfileCompilationInfo {
 
   // The version of the profile.
   uint8_t version_[kProfileVersionSize];
+
+  bool has_no_preload_section = false;
 };
 
 /**
