@@ -88,8 +88,6 @@ class OatKeyValueStore {
   // `bool`.
   void Put(const std::string& k, const char* v) { Put(k, std::string(v)); }
 
-  bool Contains(const std::string& k) const { return map_.find(k) != map_.end(); }
-
  private:
   SafeMap<std::string, std::string> map_;
 

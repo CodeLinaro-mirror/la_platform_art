@@ -25,7 +25,6 @@
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #include "art_method-inl.h"
-#include "base/compiler_filter.h"
 #include "base/file_utils.h"
 #include "base/hash_set.h"
 #include "base/stl_util.h"
@@ -274,8 +273,6 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
                                           Runtime::Current()->GetApexVersions());
       key_value_store.Put(OatHeader::kConcurrentCopying, compiler_options_->EmitReadBarrier());
       key_value_store.Put(OatHeader::kEnableProfileCodeKey, compiler_options_->EnableProfileCode());
-      key_value_store.Put(OatHeader::kCompilerFilter,
-                          CompilerFilter::NameOfFilter(CompilerFilter::kSpeed));
 
       std::vector<std::unique_ptr<ElfWriter>> elf_writers;
       std::vector<std::unique_ptr<OatWriter>> oat_writers;

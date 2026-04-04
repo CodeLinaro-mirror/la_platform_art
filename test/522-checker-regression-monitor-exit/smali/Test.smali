@@ -18,18 +18,12 @@
 .super Ljava/lang/Object;
 
 ## CHECK-START: int Test.synchronizedHashCode(java.lang.Object) dead_code_elimination$initial (before)
-## CHECK:         <<MonEnter:l\d+>> NullCheck
-## CHECK:         MonitorOperation [<<MonEnter>>] kind:enter
-## CHECK:         <<InvokeNullCheck:l\d+>> NullCheck
-## CHECK:         <<MonExit:l\d+>> NullCheck
-## CHECK:         MonitorOperation [<<MonExit>>]  kind:exit
+## CHECK:         MonitorOperation [<<Param:l\d+>>] kind:enter
+## CHECK:         MonitorOperation [<<Param>>]      kind:exit
 
 ## CHECK-START: int Test.synchronizedHashCode(java.lang.Object) dead_code_elimination$initial (after)
-## CHECK:         <<MonEnter:l\d+>> NullCheck
-## CHECK:         MonitorOperation [<<MonEnter>>] kind:enter
-## CHECK:         <<InvokeNullCheck:l\d+>> NullCheck
-## CHECK:         <<MonExit:l\d+>> NullCheck
-## CHECK:         MonitorOperation [<<MonExit>>]  kind:exit
+## CHECK:         MonitorOperation [<<Param:l\d+>>] kind:enter
+## CHECK:         MonitorOperation [<<Param>>]      kind:exit
 
 .method public static synchronizedHashCode(Ljava/lang/Object;)I
   .registers 2

@@ -140,7 +140,7 @@ public class Main {
   /// CHECK:     <<Param2:i\d+>>      ParameterValue
   /// CHECK:                          MonitorOperation
   /// CHECK:     <<Conv:b\d+>>        TypeConversion [<<Param2>>]
-  /// CHECK:                          BoundsCheck [<<Param1>>,<<ArrayLength:i\d+>>] env:[[_,<<Param0>>,_,_]]
+  /// CHECK:     <<NullCheck:l\d+>>   NullCheck [<<Param0>>] env:[[_,<<Param0>>,_,_]]
   private static void $noinline$testEnvCleanupUnrelatedSyncBlock(byte[] buf, int bp, int code) {
     synchronized (buf) {}
     buf[bp] = (byte) code;

@@ -50,7 +50,6 @@ class PrepareForRegisterAllocationVisitor final
   void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke);
   void VisitDeoptimize(HDeoptimize* deoptimize);
   void VisitTypeConversion(HTypeConversion* instruction);
-  void VisitMonitorOperation(HMonitorOperation* instruction);
 
   bool CanMoveClinitCheck(HInstruction* input, HInstruction* user) const;
   bool CanEmitConditionAt(HCondition* condition, HInstruction* user) const;
@@ -378,24 +377,6 @@ void PrepareForRegisterAllocationVisitor::VisitInvokeStaticOrDirect(
   }
 }
 
-// Check that `HEnvironment`s were generated for the same dex instruction.
-static bool AreFromTheSameInstruction(HEnvironment* lhs, HEnvironment* rhs) {
-  while (lhs != nullptr || rhs != nullptr) {
-    if (lhs == nullptr || rhs == nullptr) {
-      // Different environment chain length. This happens when a method is called
-      // once directly and once indirectly through another inlined method.
-      return false;
-    }
-    if (lhs->GetDexPc() != rhs->GetDexPc() ||
-        lhs->GetMethod() != rhs->GetMethod()) {
-      return false;
-    }
-    lhs = lhs->GetParent();
-    rhs = rhs->GetParent();
-  }
-  return true;
-}
-
 bool PrepareForRegisterAllocationVisitor::CanMoveClinitCheck(HInstruction* input,
                                                              HInstruction* user) const {
   // Determine if input and user come from the same dex instruction, so that we can move
@@ -416,8 +397,18 @@ bool PrepareForRegisterAllocationVisitor::CanMoveClinitCheck(HInstruction* input
   // the same inlined graph. Unfortunately, we have to go through the whole environment chain.
   HEnvironment* user_environment = user->GetEnvironment();
   HEnvironment* input_environment = input->GetEnvironment();
-  if (!AreFromTheSameInstruction(user_environment, input_environment)) {
-    return false;
+  while (user_environment != nullptr || input_environment != nullptr) {
+    if (user_environment == nullptr || input_environment == nullptr) {
+      // Different environment chain length. This happens when a method is called
+      // once directly and once indirectly through another inlined method.
+      return false;
+    }
+    if (user_environment->GetDexPc() != input_environment->GetDexPc() ||
+        user_environment->GetMethod() != input_environment->GetMethod()) {
+      return false;
+    }
+    user_environment = user_environment->GetParent();
+    input_environment = input_environment->GetParent();
   }
 
   // Check for code motion taking the input to a different block.
@@ -444,17 +435,6 @@ void PrepareForRegisterAllocationVisitor::VisitTypeConversion(HTypeConversion* i
   if (instruction->IsImplicitConversion()) {
     instruction->ReplaceWith(instruction->GetInput());
     instruction->GetBlock()->RemoveInstruction(instruction);
-  }
-}
-
-void PrepareForRegisterAllocationVisitor::VisitMonitorOperation(HMonitorOperation* instruction) {
-  HInstruction* prev = instruction->GetPrevious();
-  if (prev != nullptr && prev->IsNullCheck()) {
-    HEnvironment* null_check_env = prev->GetEnvironment();
-    HEnvironment* mon_op_env = instruction->GetEnvironment();
-    if (AreFromTheSameInstruction(null_check_env, mon_op_env)) {
-      prev->GetBlock()->RemoveInstruction(prev);
-    }
   }
 }
 

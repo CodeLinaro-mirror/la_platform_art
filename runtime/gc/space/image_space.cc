@@ -995,7 +995,13 @@ class ImageSpace::Loader {
         }
       }
 
-      bool relocations_initialized = false;
+      if (oat_file->IsExecutable() && oat_file->RequiresImage()) {
+        TimingLogger::ScopedTiming timing("InitializeRelocations", &logger);
+        oat_file->InitializeRelocations(Runtime::Current()->GetResolutionMethod(),
+                                        boot_image_spaces.front()->Begin(),
+                                        space->Begin());
+      }
+
       DCHECK_LE(boot_image_space_dependencies, boot_image_spaces.size());
       if (boot_image_space_dependencies != boot_image_spaces.size()) {
         TimingLogger::ScopedTiming timing("DeduplicateInternedStrings", &logger);
@@ -1010,28 +1016,7 @@ class ImageSpace::Loader {
         RemoveInternTableDuplicates(old_spaces, space.get(), &intern_remap);
         if (!intern_remap.empty()) {
           RemapInternedStringDuplicates(intern_remap, space.get());
-          DCHECK(!relocations_initialized);
-          if (com::android::art::flags::load_string_img_rel_ro() &&
-              (oat_file->IsExecutable() && oat_file->RequiresImage())) {
-            TimingLogger::ScopedTiming timing2("InitializeRelocations+RemapStrings", &logger);
-            std::function<void(ArrayRef<uint32_t>)> init_app_image_relocations(
-                AppImageRelocationsCallback</*kRemapStrings=*/ true>(
-                    space->Begin(), &intern_remap));
-            oat_file->InitializeRelocations(Runtime::Current()->GetResolutionMethod(),
-                                            boot_image_spaces.front()->Begin(),
-                                            &init_app_image_relocations);
-            relocations_initialized = true;
-          }
         }
-      }
-
-      if (!relocations_initialized && oat_file->IsExecutable() && oat_file->RequiresImage()) {
-        TimingLogger::ScopedTiming timing("InitializeRelocations", &logger);
-        std::function<void(ArrayRef<uint32_t>)> init_app_image_relocations(
-            AppImageRelocationsCallback</*kRemapStrings=*/ false>(space->Begin()));
-        oat_file->InitializeRelocations(Runtime::Current()->GetResolutionMethod(),
-                                        boot_image_spaces.front()->Begin(),
-                                        &init_app_image_relocations);
       }
 
       const ImageHeader& primary_header = boot_image_spaces.front()->GetImageHeader();
@@ -1513,36 +1498,6 @@ class ImageSpace::Loader {
 
     return map;
   }
-
-  template <bool kRemapStrings>
-  class AppImageRelocationsCallback {
-   public:
-    explicit AppImageRelocationsCallback(
-        uint8_t* app_image_begin,
-        SafeMap<mirror::String*, mirror::String*>* intern_remap = nullptr)
-        : app_image_begin_(reinterpret_cast32<uint32_t>(app_image_begin)),
-          intern_remap_(intern_remap) {
-      DCHECK_EQ(kRemapStrings, intern_remap != nullptr);
-    }
-
-    void operator()(ArrayRef<uint32_t> app_image_relocations) const {
-      for (uint32_t& reloc : app_image_relocations) {
-        uint32_t new_value = reloc + app_image_begin_;
-        if (kRemapStrings) {
-          // Note: Even non-`String` references are cast to `String*` for map lookup.
-          auto it = intern_remap_->find(reinterpret_cast32<mirror::String*>(new_value));
-          if (it != intern_remap_->end()) {
-            new_value = reinterpret_cast32<uint32_t>(it->second);
-          }
-        }
-        reloc = new_value;
-      }
-    }
-
-   private:
-    uint32_t app_image_begin_;
-    SafeMap<mirror::String*, mirror::String*>* intern_remap_;
-  };
 };
 
 void ImageSpace::AppendImageChecksum(uint32_t component_count,
@@ -2730,9 +2685,6 @@ class ImageSpace::BootImageLoader {
                                   space->GetName(),
                                   oat_file->Begin(),
                                   oat_data_begin);
-        return false;
-      }
-      if (!oat_file->GetOatHeader().AreTrampolineOffsetsValid(error_msg)) {
         return false;
       }
     }

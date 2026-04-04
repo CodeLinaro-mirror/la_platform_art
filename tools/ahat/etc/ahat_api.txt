@@ -247,7 +247,6 @@ package com.android.ahat.heapdump {
     method public com.android.ahat.heapdump.Parser map(com.android.ahat.proguard.ProguardMap);
     method public com.android.ahat.heapdump.AhatSnapshot parse() throws com.android.ahat.heapdump.HprofFormatException, java.io.IOException;
     method public static com.android.ahat.heapdump.AhatSnapshot parseHeapDump(java.io.File, com.android.ahat.proguard.ProguardMap) throws com.android.ahat.heapdump.HprofFormatException, java.io.IOException;
-    method public static com.android.ahat.heapdump.AhatSnapshot parseHeapDump(java.io.File, com.android.ahat.proguard.ProguardMap, int) throws com.android.ahat.heapdump.HprofFormatException, java.io.IOException;
     method public static com.android.ahat.heapdump.AhatSnapshot parseHeapDump(java.nio.ByteBuffer, com.android.ahat.proguard.ProguardMap) throws com.android.ahat.heapdump.HprofFormatException, java.io.IOException;
     method public com.android.ahat.heapdump.Parser progress(com.android.ahat.progress.Progress);
     method public com.android.ahat.heapdump.Parser retained(com.android.ahat.heapdump.Reachability);
