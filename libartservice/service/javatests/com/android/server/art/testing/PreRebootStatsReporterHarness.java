@@ -16,6 +16,8 @@
 
 package com.android.server.art.testing;
 
+import static com.android.server.art.testing.TestingUtils.SYNC_EXECUTOR;
+
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.eq;
@@ -39,14 +41,17 @@ import java.util.function.Supplier;
 
 public class PreRebootStatsReporterHarness {
     private Injector mInjector = mock(Injector.class);
+    private MockClock mMockClock = new MockClock();
 
     public PreRebootStatsReporterHarness() throws Exception {
         File tempFile = File.createTempFile("pre-reboot-stats", ".pb");
         tempFile.deleteOnExit();
 
         lenient().when(mInjector.getFilename()).thenReturn(tempFile.getAbsolutePath());
+        lenient().when(mInjector.getClock()).thenReturn(mMockClock);
+
         // Make asynchronous reporting synchronous.
-        lenient().when(mInjector.getExecutor()).thenReturn(Runnable::run);
+        lenient().when(mInjector.getAsyncExecutor()).thenReturn(SYNC_EXECUTOR);
     }
 
     public Injector getInjector() {

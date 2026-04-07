@@ -57,8 +57,10 @@ import com.android.server.art.proto.SecondaryDexUseProto;
 import com.android.server.art.proto.SecondaryDexUseRecordProto;
 import com.android.server.art.utils.ArtdRefCache;
 import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.art.utils.Debouncer;
 import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Clock;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
@@ -90,8 +92,6 @@ import java.util.Optional;
 import java.util.SequencedMap;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -199,7 +199,7 @@ public class DexUseManagerLocal {
     @VisibleForTesting
     public DexUseManagerLocal(@NonNull Injector injector) {
         mInjector = injector;
-        mDebouncer = new Debouncer(INTERVAL_MS, mInjector::createScheduledExecutor);
+        mDebouncer = new Debouncer(INTERVAL_MS, mInjector.getAsyncExecutor());
         load();
     }
 
@@ -481,7 +481,7 @@ public class DexUseManagerLocal {
         // `Process.isSdkSandboxUid` returns true.
         boolean isolatedProcess = mInjector.isIsolatedUid(mInjector.getCallingUid())
                 || mInjector.isPrivateComputeCoreUid(mInjector.getCallingUid());
-        long lastUsedAtMs = mInjector.getCurrentTimeMillis();
+        long lastUsedAtMs = mInjector.getClock().currentTimeMillis();
 
         for (var entry : classLoaderContextByDexContainerFile.entrySet()) {
             String dexPath = Utils.assertNonEmpty(entry.getKey());
@@ -1509,8 +1509,8 @@ public class DexUseManagerLocal {
             return ArtdRefCache.getInstance().getArtd();
         }
 
-        public long getCurrentTimeMillis() {
-            return System.currentTimeMillis();
+        public Clock getClock() {
+            return Clock.DEFAULT;
         }
 
         @NonNull
@@ -1519,8 +1519,8 @@ public class DexUseManagerLocal {
         }
 
         @NonNull
-        public ScheduledExecutorService createScheduledExecutor() {
-            return Executors.newScheduledThreadPool(1 /* corePoolSize */);
+        public AsyncExecutor getAsyncExecutor() {
+            return AsyncExecutor.getInstance();
         }
 
         @NonNull

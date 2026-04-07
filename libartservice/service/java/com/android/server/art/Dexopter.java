@@ -35,6 +35,7 @@ import com.android.server.LocalManagerRegistry;
 import com.android.server.art.ArtManagerLocal.AdjustCompilerFilterCallback;
 import com.android.server.art.Dex2OatStatsReporter.Dex2OatResult;
 import com.android.server.art.DexMetadataHelper.DexMetadataInfo;
+import com.android.server.art.DexoptTrigger.DexoptComparator;
 import com.android.server.art.OutputArtifacts.PermissionSettings;
 import com.android.server.art.ProfilePath.TmpProfilePath;
 import com.android.server.art.model.ArtFlags;
@@ -48,6 +49,7 @@ import com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
 import com.android.server.art.utils.AidlUtils;
 import com.android.server.art.utils.ArtdRefCache;
 import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.art.utils.Utils;
 import com.android.server.art.utils.Utils.Abi;
 import com.android.server.art.utils.Utils.InitProfileResult;
@@ -377,7 +379,10 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
                 session.recordResultForRemainingAbis(Dex2OatResult.failedToStart());
                 throw e;
             } finally {
-                mInjector.getReporterExecutor().execute(session::report);
+                mInjector.getAsyncExecutor().executeAsync(session::report).exceptionally(t -> {
+                    AsLog.wtf("Fatal error", t);
+                    return null;
+                });
                 if (profile != null && profile.getTag() == ProfilePath.tmpProfilePath) {
                     mInjector.getArtd().deleteProfile(profile);
                 }
@@ -535,7 +540,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     @NonNull
     GetDexoptNeededResult getDexoptNeeded(@NonNull DexoptTarget<DexInfoType> target,
             @NonNull GetDexoptNeededOptions options) throws RemoteException {
-        int dexoptTrigger = getDexoptTrigger(target, options);
+        DexoptTrigger dexoptTrigger = getDexoptTrigger(target, options);
 
         // The result should come from artd even if all the bits of `dexoptTrigger` are set
         // because the result also contains information about the usable VDEX file.
@@ -549,23 +554,25 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         return result;
     }
 
-    int getDexoptTrigger(@NonNull DexoptTarget<DexInfoType> target,
+    DexoptTrigger getDexoptTrigger(@NonNull DexoptTarget<DexInfoType> target,
             @NonNull GetDexoptNeededOptions options) throws RemoteException {
         if ((options.flags() & ArtFlags.FLAG_FORCE) != 0) {
-            return DexoptTrigger.COMPILER_FILTER_IS_BETTER | DexoptTrigger.COMPILER_FILTER_IS_SAME
-                    | DexoptTrigger.COMPILER_FILTER_IS_WORSE
-                    | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE
-                    | DexoptTrigger.NEED_EXTRACTION;
+            return AidlUtils.buildDexoptTrigger(
+                    List.of(DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT),
+                    "force recompilation");
         }
 
         if ((options.flags() & ArtFlags.FLAG_SHOULD_DOWNGRADE) != 0) {
-            return DexoptTrigger.COMPILER_FILTER_IS_WORSE;
+            return AidlUtils.buildDexoptTrigger(
+                    List.of(DexoptComparator.COMPARING_COMPILER_FILTER_REVERSED));
         }
 
-        int dexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
+        List<Integer> dexoptComparators = new ArrayList<>();
+        dexoptComparators.add(DexoptComparator.COMPARING_COMPILER_FILTER);
+
         if (options.profileMerged()) {
-            dexoptTrigger |= DexoptTrigger.COMPILER_FILTER_IS_SAME;
+            dexoptComparators.add(DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT);
+            return AidlUtils.buildDexoptTrigger(dexoptComparators, "profile changed");
         }
 
         ArtifactsPath existingArtifactsPath = AidlUtils.buildArtifactsPathAsInput(
@@ -577,10 +584,14 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
             // Typically, this happens after an app starts being used by other apps and we have a
             // public profile that can be used. We can re-dexopt the app if it doesn't regress the
             // compiler filter, as this will allow other apps to use the artifacts as well.
-            dexoptTrigger |= DexoptTrigger.COMPILER_FILTER_IS_SAME;
+            dexoptComparators.add(DexoptComparator.CUSTOM_TARGET_IS_BETTER_THAN_CURRENT);
+            return AidlUtils.buildDexoptTrigger(
+                    dexoptComparators, "target artifacts visibility is better");
         }
 
-        return dexoptTrigger;
+        dexoptComparators.add(DexoptComparator.COMPARING_PRIMARY_BOOT_IMAGE_STATUS);
+        dexoptComparators.add(DexoptComparator.COMPARING_EXTRACTION_STATUS);
+        return AidlUtils.buildDexoptTrigger(dexoptComparators);
     }
 
     private ArtdDexoptResult dexoptFile(@NonNull DexoptTarget<DexInfoType> target,
@@ -823,13 +834,10 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     public static class Injector {
         @NonNull private final Context mContext;
         @NonNull private final Config mConfig;
-        @NonNull private final Executor mReporterExecutor;
 
-        public Injector(@NonNull Context context, @NonNull Config config,
-                @NonNull Executor reporterExecutor) {
+        public Injector(@NonNull Context context, @NonNull Config config) {
             mContext = context;
             mConfig = config;
-            mReporterExecutor = reporterExecutor;
 
             // Call the getters for various dependencies, to ensure correct initialization order.
             getUserManager();
@@ -891,9 +899,8 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
             return mConfig;
         }
 
-        @NonNull
-        public Executor getReporterExecutor() {
-            return mReporterExecutor;
+        public AsyncExecutor getAsyncExecutor() {
+            return AsyncExecutor.getInstance();
         }
 
         @NonNull

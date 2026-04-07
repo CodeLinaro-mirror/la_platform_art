@@ -27,6 +27,7 @@ import com.android.server.art.ArtManagerLocal;
 import com.android.server.art.ArtStatsLog;
 import com.android.server.art.ReasonMapping;
 import com.android.server.art.model.DexoptStatus;
+import com.android.server.art.model.OperationProgress;
 import com.android.server.art.prereboot.PreRebootDriver.PreRebootResult;
 import com.android.server.art.proto.PreRebootStats;
 import com.android.server.art.proto.PreRebootStats.FailureReason;
@@ -35,7 +36,9 @@ import com.android.server.art.proto.PreRebootStats.JobType;
 import com.android.server.art.proto.PreRebootStats.Status;
 import com.android.server.art.utils.ArtdRefCache;
 import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.AsyncExecutor;
 import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Clock;
 import com.android.server.pm.PackageManagerLocal;
 
 import java.io.File;
@@ -53,7 +56,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ForkJoinPool;
 import java.util.function.Function;
 
 /**
@@ -100,20 +102,34 @@ public class PreRebootStatsReporter {
     }
 
     public void recordJobScheduled(boolean isAsync, boolean isOtaUpdate) {
-        PreRebootStats.Builder statsBuilder = PreRebootStats.newBuilder();
-        statsBuilder.setStatus(Status.STATUS_SCHEDULED)
+        recordJobScheduled(isAsync, isOtaUpdate, false /* continueFromPrevious */);
+    }
+
+    public void recordJobScheduled(
+            boolean isAsync, boolean isOtaUpdate, boolean continueFromPrevious) {
+        PreRebootStats.Builder statsBuilder =
+                continueFromPrevious ? load() : PreRebootStats.newBuilder();
+        statsBuilder
+                .setStatus(continueFromPrevious ? Status.STATUS_PARTIALLY_FINISHED
+                                                : Status.STATUS_SCHEDULED)
                 .setJobType(isOtaUpdate ? JobType.JOB_TYPE_OTA : JobType.JOB_TYPE_MAINLINE);
         // Omit job_scheduled_timestamp_millis to indicate a synchronous job.
         if (isAsync) {
-            statsBuilder.setJobScheduledTimestampMillis(mInjector.getCurrentTimeMillis());
+            statsBuilder.setJobScheduledTimestampMillis(mInjector.getClock().currentTimeMillis());
         }
         save(statsBuilder);
     }
 
     public void recordJobNotScheduled(@NonNull Status reason, boolean isOtaUpdate) {
+        recordJobNotScheduled(reason, isOtaUpdate, false /* continueFromPrevious */);
+    }
+
+    public void recordJobNotScheduled(
+            @NonNull Status reason, boolean isOtaUpdate, boolean continueFromPrevious) {
         Utils.check(reason == Status.STATUS_NOT_SCHEDULED_DISABLED
                 || reason == Status.STATUS_NOT_SCHEDULED_JOB_SCHEDULER);
-        PreRebootStats.Builder statsBuilder = PreRebootStats.newBuilder();
+        PreRebootStats.Builder statsBuilder =
+                continueFromPrevious ? load() : PreRebootStats.newBuilder();
         statsBuilder.setStatus(reason).setJobType(
                 isOtaUpdate ? JobType.JOB_TYPE_OTA : JobType.JOB_TYPE_MAINLINE);
         save(statsBuilder);
@@ -126,8 +142,8 @@ public class PreRebootStatsReporter {
             return;
         }
 
-        JobRun.Builder runBuilder =
-                JobRun.newBuilder().setJobStartedTimestampMillis(mInjector.getCurrentTimeMillis());
+        JobRun.Builder runBuilder = JobRun.newBuilder().setJobStartedTimestampMillis(
+                mInjector.getClock().currentTimeMillis());
         statsBuilder.setStatus(Status.STATUS_STARTED)
                 .clearFailureReason()
                 .addJobRuns(runBuilder)
@@ -175,7 +191,7 @@ public class PreRebootStatsReporter {
         Utils.check(lastRun.getJobEndedTimestampMillis() == 0);
 
         JobRun.Builder runBuilder = JobRun.newBuilder(lastRun).setJobEndedTimestampMillis(
-                mInjector.getCurrentTimeMillis());
+                mInjector.getClock().currentTimeMillis());
 
         Utils.check(result.status() == Status.STATUS_FINISHED
                 || result.status() == Status.STATUS_FAILED
@@ -209,12 +225,10 @@ public class PreRebootStatsReporter {
         }
 
         public void reportAsync() {
-            new CompletableFuture()
-                    .runAsync(this::report, mInjector.getExecutor())
-                    .exceptionally(t -> {
-                        AsLog.e("Failed to report stats", t);
-                        return null;
-                    });
+            mInjector.getAsyncExecutor().executeAsync(this::report).exceptionally(t -> {
+                AsLog.e("Failed to report stats", t);
+                return null;
+            });
         }
 
         public void report() {
@@ -279,6 +293,14 @@ public class PreRebootStatsReporter {
         }
     }
 
+    public OperationProgress getProgress() {
+        PreRebootStats.Builder statsBuilder = load();
+        return OperationProgress.create(statsBuilder.getOptimizedPackageCount()
+                        + statsBuilder.getFailedPackageCount()
+                        + statsBuilder.getSkippedPackageCount(),
+                statsBuilder.getTotalPackageCount(), null /* packageDexoptResult */);
+    }
+
     @VisibleForTesting
     public static int getStatusForStatsd(@NonNull Status status) {
         return switch (status) {
@@ -286,9 +308,11 @@ public class PreRebootStatsReporter {
             case STATUS_SCHEDULED ->
                 ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_SCHEDULED;
             case STATUS_STARTED -> ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_STARTED;
+            case STATUS_PARTIALLY_FINISHED ->
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_PARTIALLY_FINISHED;
+            case STATUS_FAILED -> ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FAILED;
             case STATUS_FINISHED ->
                 ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FINISHED;
-            case STATUS_FAILED -> ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FAILED;
             case STATUS_CANCELLED ->
                 ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_CANCELLED;
             case STATUS_ABORTED_SYSTEM_REQUIREMENTS ->
@@ -388,8 +412,8 @@ public class PreRebootStatsReporter {
             return FILENAME;
         }
 
-        public long getCurrentTimeMillis() {
-            return System.currentTimeMillis();
+        public Clock getClock() {
+            return Clock.DEFAULT;
         }
 
         @NonNull
@@ -426,8 +450,8 @@ public class PreRebootStatsReporter {
         }
 
         @NonNull
-        public Executor getExecutor() {
-            return ForkJoinPool.commonPool();
+        public AsyncExecutor getAsyncExecutor() {
+            return AsyncExecutor.getInstance();
         }
     }
 }
