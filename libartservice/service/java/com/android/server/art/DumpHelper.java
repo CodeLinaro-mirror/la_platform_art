@@ -16,10 +16,6 @@
 
 package com.android.server.art;
 
-import static com.android.server.art.DexUseManagerLocal.CheckedSecondaryDexInfo;
-import static com.android.server.art.DexUseManagerLocal.DexLoader;
-import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
-
 import android.annotation.NonNull;
 import android.os.Build;
 import android.os.RemoteException;
@@ -31,6 +27,12 @@ import androidx.annotation.RequiresApi;
 import com.android.art.rw.flags.Flags;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.LocalManagerRegistry;
+import com.android.server.art.DexUseManagerLocal.CheckedSecondaryDexInfo;
+import com.android.server.art.DexUseManagerLocal.DexLoader;
+import com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
+import com.android.server.art.utils.IndentingPrintWriter;
+import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Clock;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.PackageState;
 
@@ -229,7 +231,7 @@ public class DumpHelper {
 
     private void dumpPackageScores(@NonNull IndentingPrintWriter ipw,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
-        long now = mInjector.getCurrentTimeMillis();
+        long now = mInjector.getClock().currentTimeMillis();
         ipw.printf("Current Time (ms): %d\n", now);
         snapshot.getPackageStates()
                 .values()
@@ -241,7 +243,7 @@ public class DumpHelper {
                                         pkgState.getPackageName(), now)))
                 .sorted(Comparator.<Pair<String, Double>>comparingDouble(pair -> pair.second)
                                 .reversed()
-                                .thenComparing(Comparator.comparing(pair -> pair.first)))
+                                .thenComparing(pair -> pair.first))
                 .forEach(pair -> ipw.printf("%s - %.4f\n", pair.first, pair.second));
     }
 
@@ -281,8 +283,8 @@ public class DumpHelper {
             return GlobalInjector.getInstance().getDexUseManager();
         }
 
-        public long getCurrentTimeMillis() {
-            return System.currentTimeMillis();
+        public Clock getClock() {
+            return Clock.DEFAULT;
         }
     }
 }

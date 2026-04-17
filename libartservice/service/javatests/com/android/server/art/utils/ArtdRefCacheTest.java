@@ -14,9 +14,7 @@
  * limitations under the License.
  */
 
-package com.android.server.art;
-
-import static android.os.IBinder.DeathRecipient;
+package com.android.server.art.utils;
 
 import static com.google.common.truth.Truth.assertThat;
 
@@ -30,9 +28,11 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import android.os.IBinder;
+import android.os.IBinder.DeathRecipient;
 
 import androidx.test.filters.SmallTest;
 
+import com.android.server.art.IArtd;
 import com.android.server.art.testing.MockClock;
 
 import org.junit.Before;
@@ -41,9 +41,6 @@ import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
-
-import java.lang.ref.PhantomReference;
-import java.lang.ref.ReferenceQueue;
 
 @SmallTest
 @RunWith(MockitoJUnitRunner.StrictStubs.class)
@@ -58,9 +55,7 @@ public class ArtdRefCacheTest {
     public void setUp() throws Exception {
         mMockClock = new MockClock();
 
-        lenient()
-                .when(mInjector.createScheduledExecutor())
-                .thenAnswer(invocation -> mMockClock.createScheduledExecutor());
+        lenient().when(mInjector.getAsyncExecutor()).thenReturn(mMockClock.getAsyncExecutor());
         lenient().when(mInjector.getArtd()).thenReturn(mArtd);
 
         lenient().when(mArtd.asBinder()).thenReturn(mBinder);
@@ -215,27 +210,5 @@ public class ArtdRefCacheTest {
         }
 
         verify(mInjector, times(3)).getArtd();
-    }
-
-    @Test
-    public void testReset() throws Exception {
-        var queue = new ReferenceQueue<ArtdRefCache>();
-        var phantomRef = new PhantomReference(mArtdRefCache, queue);
-
-        try (var pin = mArtdRefCache.new Pin()) {
-            mArtdRefCache.getArtd();
-        }
-
-        // Mockito mocks hold the arguments of historical calls. `reset` removes them.
-        reset(mBinder);
-
-        mArtdRefCache.reset();
-        mArtdRefCache = null;
-        mMockClock.advanceTime(0); // Flush the task queue.
-        Runtime.getRuntime().gc();
-        Runtime.getRuntime().runFinalization();
-
-        // The reference is enqueued if it's GC-able.
-        assertThat(phantomRef.isEnqueued()).isTrue();
     }
 }

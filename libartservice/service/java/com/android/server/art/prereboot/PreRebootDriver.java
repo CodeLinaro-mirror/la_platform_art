@@ -36,18 +36,18 @@ import com.android.server.LocalManagerRegistry;
 import com.android.server.art.ArtJni;
 import com.android.server.art.ArtManagerLocal;
 import com.android.server.art.ArtModuleServiceInitializer;
-import com.android.server.art.ArtdRefCache;
-import com.android.server.art.AsLog;
 import com.android.server.art.GlobalInjector;
 import com.android.server.art.IArtd;
 import com.android.server.art.IDexoptChrootSetup;
 import com.android.server.art.PreRebootDexoptJob;
 import com.android.server.art.ReasonMapping;
-import com.android.server.art.Utils;
 import com.android.server.art.model.BatchDexoptParams;
 import com.android.server.art.prereboot.PreRebootManagerInterface.SystemRequirementException;
 import com.android.server.art.proto.PreRebootStats.FailureReason;
 import com.android.server.art.proto.PreRebootStats.Status;
+import com.android.server.art.utils.ArtdRefCache;
+import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.Utils;
 import com.android.server.pm.PackageManagerLocal;
 
 import dalvik.system.DelegateLastClassLoader;
@@ -94,14 +94,16 @@ public class PreRebootDriver {
      * @param mapSnapshotsForOta Whether to map/unmap snapshots. Only applicable to an OTA update.
      */
     public @NonNull PreRebootResult run(@Nullable String otaSlot, boolean mapSnapshotsForOta,
-            @NonNull CancellationSignal cancellationSignal) {
+            @NonNull CancellationSignal cancellationSignal, @NonNull String reason) {
+        Utils.check(reason == ReasonMapping.REASON_PRE_REBOOT_DEXOPT
+                || reason == ReasonMapping.REASON_PRE_REBOOT_DEXOPT_SYNC);
         try {
             try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
                 BatchDexoptParams params = mInjector.getArtManagerLocal().getBatchDexoptParams(
-                        snapshot, ReasonMapping.REASON_PRE_REBOOT_DEXOPT, cancellationSignal);
+                        snapshot, reason, cancellationSignal);
                 if (!cancellationSignal.isCanceled()) {
                     setUp(otaSlot, mapSnapshotsForOta);
-                    runFromChroot(cancellationSignal, snapshot, params);
+                    runFromChroot(cancellationSignal, snapshot, params, reason);
                 }
             }
             return new PreRebootResult(Status.STATUS_FINISHED);
@@ -213,7 +215,7 @@ public class PreRebootDriver {
 
     private void runFromChroot(@NonNull CancellationSignal cancellationSignal,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
-            @NonNull BatchDexoptParams params)
+            @NonNull BatchDexoptParams params, @NonNull String reason)
             throws ReflectiveOperationException, IOException, ErrnoException {
         // Load the new `service-art.jar` on top of the current classloader, which has the old
         // system server, framework, and Libcore.
@@ -249,10 +251,10 @@ public class PreRebootDriver {
         preRebootManagerClass
                 .getMethod("run", ArtModuleServiceManager.class, Context.class,
                         CancellationSignal.class, PackageManagerLocal.FilteredSnapshot.class,
-                        byte[].class)
+                        byte[].class, String.class)
                 .invoke(preRebootManager, ArtModuleServiceInitializer.getArtModuleServiceManager(),
                         mInjector.getContext(), cancellationSignal, snapshot,
-                        params.toProto().toByteArray());
+                        params.toProto().toByteArray(), reason);
     }
 
     /**

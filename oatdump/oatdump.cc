@@ -1453,7 +1453,9 @@ class OatDumper {
           soa.Self(),
           vios,
           dex_method_idx,
-          dex_file,
+          // Note this may be different than `dex_file` in case the file was
+          // already registered.
+          dex_cache->GetDexFile(),
           dex_cache,
           *options_.class_loader_,
           class_def,
@@ -1887,7 +1889,9 @@ class ImageDumper {
         indent_os << "\n";
       },  image_space_.Begin(), image_header_.GetPointerSize());
       // Dump the large objects separately.
-      heap->GetLargeObjectsSpace()->GetLiveBitmap()->Walk(dump_visitor);
+      if (heap->GetLargeObjectsSpace() != nullptr) {
+        heap->GetLargeObjectsSpace()->GetLiveBitmap()->Walk(dump_visitor);
+      }
       indent_os << "\n";
     }
     os << "STATS:\n" << std::flush;

@@ -59,22 +59,48 @@ enum class LockReason {
 
 // Storage of a monitor owner id.
 // For a java platform thread, it stores the art::Thread pointer.
+// For a virtual thread, it stores the thread id.
 struct MonitorOwner {
   uintptr_t storage_;
 
-  ALWAYS_INLINE static MonitorOwner FromThread(const Thread* ptr) {
+  // MonitorOwner::FromThread should only be called from the current thread.
+  static MonitorOwner FromThread(const Thread* self);
+  static MonitorOwner FromVirtualThreadId(int32_t id);
+
+  ALWAYS_INLINE static MonitorOwner FromPlatformThread(Thread* ptr) {
     return MonitorOwner(reinterpret_cast<uintptr_t>(ptr));
   }
 
-  ALWAYS_INLINE Thread* GetThreadPtr() const { return reinterpret_cast<Thread*>(storage_); }
+  MonitorOwner() : storage_(reinterpret_cast<uintptr_t>(nullptr)) {}
+
+  ALWAYS_INLINE Thread* GetThreadPtr() const {
+    DCHECK(!IsVirtualThread()) << "virtual thread id: " << GetVirtualThreadId();
+    return reinterpret_cast<Thread*>(storage_);
+  }
 
   ALWAYS_INLINE bool IsNull() const { return storage_ == 0; }
 
+  ALWAYS_INLINE uintptr_t getStorageValue() const { return storage_; }
+
+  bool IsVirtualThread() const;
+  // GetVirtualThreadId() should be called only if IsVirtualThread() returns true.
+  uint32_t GetVirtualThreadId() const;
+
+  // Return the thread id of the owner threads allocated by art::ThreadList.
+  // It isn't the tid of an OS thread, nor the id of java.lang.Thread.
+  // Unlike GetVirtualThreadId(), GetThreadId() can be called for a platform thread owner.
   uint32_t GetThreadId() const;
-  bool operator==(const Thread* t) const;
+  // Return the owner id used by art::MonitorMutex. If the owner is an OS thread, it's effectively
+  // the tid of the OS thread. See art::MonitorMutex::GetSelfId() for the details.
+  pid_t GetMutexOwnerId() const;
+  bool operator==(const Thread* selfOrNull) const;
+  bool operator==(const MonitorOwner other) const { return storage_ == other.storage_; }
   // Check if the Thread is the owner stored in MonitorOwner.
   // This function always returns false if `t` is nullptr.
   bool IsOwner(const Thread* t) const;
+
+ private:
+  explicit MonitorOwner(uintptr_t storage) : storage_(storage) {}
 };
 static_assert(sizeof(MonitorOwner) == sizeof(Thread*), "Expect the size of a pointer");
 static_assert(sizeof(std::atomic<MonitorOwner>) == sizeof(uintptr_t),
@@ -99,21 +125,22 @@ class Monitor {
   static void Init(uint32_t lock_profiling_threshold, uint32_t stack_dump_lock_profiling_threshold);
 
   // Return the thread id of the lock owner or 0 when there is no owner.
+  // IsOwnedByMe is greatly preferred. But we still need this for at least Monitor::FetchState.
   EXPORT static uint32_t GetLockOwnerThreadId(ObjPtr<mirror::Object> obj)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // NO_THREAD_SAFETY_ANALYSIS for mon->Lock.
+  EXPORT static bool IsOwnedByMe(const Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // May temprarily release mutator_lock_. Returns a possibly updated pointer for obj.
   EXPORT static ObjPtr<mirror::Object> MonitorEnter(Thread* thread,
                                                     ObjPtr<mirror::Object> obj,
                                                     bool trylock)
       EXCLUSIVE_LOCK_FUNCTION(obj.Ptr())
-      NO_THREAD_SAFETY_ANALYSIS
       REQUIRES(!Roles::uninterruptible_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // NO_THREAD_SAFETY_ANALYSIS for mon->Unlock.
   EXPORT static bool MonitorExit(Thread* thread, ObjPtr<mirror::Object> obj)
-      NO_THREAD_SAFETY_ANALYSIS
       REQUIRES(!Roles::uninterruptible_)
       REQUIRES_SHARED(Locks::mutator_lock_)
       UNLOCK_FUNCTION(obj.Ptr());
@@ -128,14 +155,12 @@ class Monitor {
   }
 
   // Object.wait().  Also called for class init.
-  // NO_THREAD_SAFETY_ANALYSIS for mon->Wait.
   EXPORT static void Wait(Thread* self,
                           ObjPtr<mirror::Object> obj,
                           int64_t ms,
                           int32_t ns,
                           bool interruptShouldThrow,
-                          ThreadState why)
-      REQUIRES_SHARED(Locks::mutator_lock_) NO_THREAD_SAFETY_ANALYSIS;
+                          ThreadState why) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static ThreadState FetchState(const Thread* thread,
                                 /* out */ ObjPtr<mirror::Object>* monitor_object,
@@ -173,6 +198,9 @@ class Monitor {
   // Is the monitor currently locked? Debug only, provides no memory ordering guarantees.
   bool IsLocked() REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!monitor_lock_);
 
+  // Does the current thread hold the lock?
+  bool IsOwnedByMe(const Thread* self) const REQUIRES_SHARED(Locks::mutator_lock_);
+
   bool HasHashCode() const {
     return hash_code_.load(std::memory_order_relaxed) != 0;
   }
@@ -181,12 +209,15 @@ class Monitor {
     return monitor_id_;
   }
 
-  // Inflate the lock on obj. May fail to inflate for spurious reasons, always re-check.
+  // Inflate the lock on obj.
   // attempt_of_4 is in 1..4 inclusive or 0. A non-zero value indicates that we are retrying
   // up to 4 times, and should only abort on 4. Zero means we are only trying once, with the
   // full suspend timeout instead of a quarter.
   // May temporarily drop and reacquire the mutator lock.
-  static void InflateThinLocked(Thread* self,
+  // Returns true if the lock state and owner thread were unchanged after we suspended the owner,
+  // and false otherwise. May fail to inflate for spurious reasons even if true is returned, always
+  // re-check.
+  static bool InflateThinLocked(Thread* self,
                                 Handle<mirror::Object> obj,
                                 LockWord lock_word,
                                 uint32_t hash_code,
@@ -244,12 +275,6 @@ class Monitor {
   // calling thread must own the lock or the owner must be suspended. There's a race with other
   // threads inflating the lock, installing hash codes and spurious failures. The caller should
   // re-read the lock word following the call.
-  static void Inflate(Thread* self, Thread* owner, ObjPtr<mirror::Object> obj, int32_t hash_code)
-      REQUIRES_SHARED(Locks::mutator_lock_)  // For m->Install(self)
-  {
-    Inflate(self, MonitorOwner::FromThread(owner), std::move(obj), hash_code);
-  }
-
   static void Inflate(Thread* self,
                       MonitorOwner owner,
                       ObjPtr<mirror::Object> obj,
@@ -264,7 +289,7 @@ class Monitor {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   static void FailedUnlock(ObjPtr<mirror::Object> obj,
-                           Thread* expected_owner_thread,
+                           Thread* self,
                            uint32_t found_owner_thread_id,
                            Monitor* mon) REQUIRES(!Locks::thread_list_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -297,10 +322,10 @@ class Monitor {
 
   static std::string PrettyContentionInfo(const std::string& owner_name,
                                           pid_t owner_tid,
+                                          uint32_t virtual_thread_id,
                                           ArtMethod* owners_method,
                                           uint32_t owners_dex_pc,
-                                          size_t num_waiters)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+                                          size_t num_waiters) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Wait on a monitor until timeout, interrupt, or notification.  Used for Object.wait() and
   // (somewhat indirectly) Thread.sleep() and Thread.join().
@@ -361,7 +386,7 @@ class Monitor {
 
   // monitor_lock_ is acquired on outermost acquisition of monitor, and held while the monitor is
   // held.
-  Mutex monitor_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+  MonitorMutex monitor_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
 
   // Pretend to unlock monitor lock.
   void FakeUnlockMonitorLock() RELEASE(monitor_lock_) NO_THREAD_SAFETY_ANALYSIS {}
@@ -426,19 +451,19 @@ class Monitor {
   // At all times, either lock_owner_ is zero, the checksum is valid, or a thread is actively
   // in the process of establishing one of those states. Only one thread at a time can be actively
   // establishing such a state, since writes are protected by the monitor.
-  std::atomic<Thread*> lock_owner_;  // *lock_owner_ may no longer exist!
+  std::atomic<MonitorOwner> lock_owner_;  // *lock_owner_ may no longer exist!
   std::atomic<ArtMethod*> lock_owner_method_;
   std::atomic<uint32_t> lock_owner_dex_pc_;
   std::atomic<uintptr_t> lock_owner_sum_;
 
   // Request lock owner save method and dex_pc. Written asynchronously.
-  std::atomic<Thread*> lock_owner_request_;
+  std::atomic<MonitorOwner> lock_owner_request_;
 
   // Compute method, dex pc, and tid "checksum".
-  uintptr_t LockOwnerInfoChecksum(ArtMethod* m, uint32_t dex_pc, Thread* t);
+  uintptr_t LockOwnerInfoChecksum(ArtMethod* m, uint32_t dex_pc, MonitorOwner owner);
 
-  // Set owning method, dex pc, and tid. owner_ field is set and points to current thread.
-  void SetLockOwnerInfo(ArtMethod* method, uint32_t dex_pc, Thread* t)
+  // Set owning method, dex pc, and tid. owner_ field is set and points to the owner.
+  void SetLockOwnerInfo(ArtMethod* method, uint32_t dex_pc, MonitorOwner owner)
       REQUIRES(monitor_lock_);
 
   // Get owning method and dex pc for the given thread, if available.
@@ -514,12 +539,12 @@ class MonitorList {
 // For use only by the JDWP implementation.
 class MonitorInfo {
  public:
-  MonitorInfo() : owner_(nullptr), entry_count_(0) {}
+  MonitorInfo() : owner_(), entry_count_(0) {}
   MonitorInfo(const MonitorInfo&) = default;
   MonitorInfo& operator=(const MonitorInfo&) = default;
   EXPORT explicit MonitorInfo(ObjPtr<mirror::Object> o) REQUIRES(Locks::mutator_lock_);
 
-  Thread* owner_;
+  MonitorOwner owner_;
   size_t entry_count_;
   std::vector<Thread*> waiters_;
 };

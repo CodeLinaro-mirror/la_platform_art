@@ -101,7 +101,7 @@ inline ObjPtr<ClassLoader> Class::GetClassLoader() {
 
 template<VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
 inline ObjPtr<ClassExt> Class::GetExtData() {
-  return GetFieldObject<ClassExt, kVerifyFlags, kReadBarrierOption>(
+  return GetFieldObject<ClassExt, kVerifyFlags, kReadBarrierOption, /*kIsVolatile=*/ true>(
       OFFSET_OF_OBJECT_MEMBER(Class, ext_data_));
 }
 
@@ -628,11 +628,11 @@ inline void Class::SetClinitThreadId(pid_t new_clinit_thread_id) {
       // check more than once. The DCHECK_EQ below arguably doesn't suffice, because it could only
       // fail for long-running devices.
       int fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
-      if (fd == -1 && errno == EACCES) {
+      if (fd == -1) {
+        CHECK_EQ(errno, EACCES) << strerror(errno);
         LOG(WARNING) << "Cannot read pid_max";
         return;
       }
-      CHECK_NE(fd, -1) << strerror(errno);
       constexpr int64_t kPidMaxLen = 20;
       char buf[kPidMaxLen + 1];
       ssize_t res = read(fd, buf, kPidMaxLen);
@@ -641,6 +641,7 @@ inline void Class::SetClinitThreadId(pid_t new_clinit_thread_id) {
       uint32_t pid_max = atoi(buf);
       CHECK_GE(pid_max, 1024u);                          // Just another sanity check.
       CHECK_EQ((pid_max - 1) & kTidUnusedBitsMask, 0u);  // The real check.
+      close(fd);
     };
     std::call_once(of, check_unused_bits);
   }
@@ -1324,13 +1325,13 @@ inline void Class::SetClassLoader(ObjPtr<ClassLoader> new_class_loader) {
 }
 
 inline void Class::SetRecursivelyInitialized() {
-  DCHECK_EQ(GetLockOwnerThreadId(), Thread::Current()->GetThreadId());
+  DCHECK(this->IsLockOwnedByMe(Thread::Current()));
   uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
   SetAccessFlags(flags | kAccRecursivelyInitialized);
 }
 
 inline void Class::SetHasDefaultMethods() {
-  DCHECK_EQ(GetLockOwnerThreadId(), Thread::Current()->GetThreadId());
+  DCHECK(this->IsLockOwnedByMe(Thread::Current()));
   uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
   SetAccessFlagsDuringLinking(flags | kAccHasDefaultMethod);
 }
@@ -1469,12 +1470,18 @@ ALWAYS_INLINE FLATTEN inline ArtMethod* Class::FindDeclaredClassMethodFast(
   return nullptr;
 }
 
+inline void Class::ClearThreadId() {
+  clinit_thread_id_or_hash_.store(0u, std::memory_order_relaxed);
+}
+
 inline void Class::FixThreadId(Class* class_for_descr) {
   if (!IsInitialized()) {
     if (kIsDebugBuild) {
       ClassStatus s = GetStatus();
-      if (s != ClassStatus::kVerified && s != ClassStatus::kRetryVerificationAtRuntime &&
-          s != ClassStatus::kVerifiedNeedsAccessChecks && s != ClassStatus::kResolved) {
+      if (s != ClassStatus::kVerified &&
+          s != ClassStatus::kRetryVerificationAtRuntime &&
+          s != ClassStatus::kVerifiedNeedsAccessChecks &&
+          s != ClassStatus::kResolved) {
         LOG(FATAL_WITHOUT_ABORT) << "Unexpected status " << s
                                  << " when clearing tid: " << GetClinitThreadId();
         std::string storage;

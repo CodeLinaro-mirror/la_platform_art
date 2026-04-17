@@ -14,11 +14,7 @@
  * limitations under the License.
  */
 
-package com.android.server.art;
-
-import static android.app.ActivityManager.RunningAppProcessInfo;
-
-import static com.android.server.art.ProfilePath.TmpProfilePath;
+package com.android.server.art.utils;
 
 import static java.util.stream.Collectors.toSet;
 
@@ -26,6 +22,7 @@ import android.R;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.app.ActivityManager;
+import android.app.ActivityManager.RunningAppProcessInfo;
 import android.app.role.RoleManager;
 import android.apphibernation.AppHibernationManager;
 import android.content.Context;
@@ -49,6 +46,15 @@ import androidx.annotation.RequiresApi;
 
 import com.android.modules.utils.build.SdkLevel;
 import com.android.modules.utils.pm.PackageStateModulesUtils;
+import com.android.server.art.Constants;
+import com.android.server.art.CopyAndRewriteProfileResult;
+import com.android.server.art.DexUseManagerLocal;
+import com.android.server.art.FileVisibility;
+import com.android.server.art.GlobalInjector;
+import com.android.server.art.IArtd;
+import com.android.server.art.OutputProfile;
+import com.android.server.art.ProfilePath;
+import com.android.server.art.ProfilePath.TmpProfilePath;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.PackageManagerLocal.FilteredSnapshot;
@@ -539,14 +545,6 @@ public final class Utils {
         return uid == Process.SYSTEM_UID || uid == Process.ROOT_UID || uid == Process.SHELL_UID;
     }
 
-    public static void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            AsLog.wtf("Sleep interrupted", e);
-        }
-    }
-
     public static boolean pathStartsWith(@NonNull String path, @NonNull String prefix) {
         check(!prefix.isEmpty() && !path.isEmpty() && prefix.charAt(0) == '/'
                 && path.charAt(0) == '/');
@@ -595,18 +593,18 @@ public final class Utils {
 
     @AutoValue
     public abstract static class Abi {
-        static @NonNull Abi create(
+        public static @NonNull Abi create(
                 @NonNull String name, @NonNull String isa, boolean isPrimaryAbi) {
             return new AutoValue_Utils_Abi(name, isa, isPrimaryAbi);
         }
 
         // The ABI name. E.g., "arm64-v8a".
-        abstract @NonNull String name();
+        public abstract @NonNull String name();
 
         // The instruction set name. E.g., "arm64".
-        abstract @NonNull String isa();
+        public abstract @NonNull String isa();
 
-        abstract boolean isPrimaryAbi();
+        public abstract boolean isPrimaryAbi();
     }
 
     public static class Tracing implements AutoCloseable {
@@ -646,7 +644,7 @@ public final class Utils {
     @AutoValue
     @SuppressWarnings("AutoValueImmutableFields") // Can't use ImmutableList because it's in Guava.
     public abstract static class InitProfileResult {
-        static @NonNull InitProfileResult create(@Nullable ProfilePath profile,
+        public static @NonNull InitProfileResult create(@Nullable ProfilePath profile,
                 boolean isOtherReadable, @NonNull List<String> externalProfileErrors) {
             return new AutoValue_Utils_InitProfileResult(
                     profile, isOtherReadable, Collections.unmodifiableList(externalProfileErrors));
@@ -656,21 +654,35 @@ public final class Utils {
          * The found or initialized profile, or null if there is no reference profile or external
          * profile to use.
          */
-        abstract @Nullable ProfilePath profile();
+        public abstract @Nullable ProfilePath profile();
 
         /**
          * Whether the profile is readable by others.
          *
          * If {@link #profile} returns null, this field is always true.
          */
-        abstract boolean isOtherReadable();
+        public abstract boolean isOtherReadable();
 
         /** Errors encountered when initializing from external profiles. */
-        abstract @NonNull List<String> externalProfileErrors();
+        public abstract @NonNull List<String> externalProfileErrors();
     }
 
     @FunctionalInterface
     private interface ProfileInitializer {
         CopyAndRewriteProfileResult get() throws RemoteException;
+    }
+
+    @FunctionalInterface
+    public interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
+
+        Sleeper DEFAULT = Thread::sleep;
+    }
+
+    @FunctionalInterface
+    public interface Clock {
+        long currentTimeMillis();
+
+        Clock DEFAULT = System::currentTimeMillis;
     }
 }

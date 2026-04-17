@@ -1608,11 +1608,11 @@ class RuntimeImageHelper {
 
     // Clear internal state.
     mirror::Class* copy = reinterpret_cast<mirror::Class*>(objects_.data() + offset);
-    copy->FixThreadId(cls.Ptr());
     if (cls->IsArrayClass()) {
       DCHECK(copy->IsVisiblyInitialized());
     } else {
       copy->SetStatusInternal(cls->IsVerified() ? ClassStatus::kVerified : ClassStatus::kResolved);
+      copy->ClearThreadId();
     }
 
     // Clear static field values.

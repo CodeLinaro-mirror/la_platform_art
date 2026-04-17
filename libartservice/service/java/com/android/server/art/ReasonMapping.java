@@ -16,8 +16,6 @@
 
 package com.android.server.art;
 
-import static com.android.server.art.model.ArtFlags.PriorityClassApi;
-
 import android.annotation.FlaggedApi;
 import android.annotation.NonNull;
 import android.annotation.StringDef;
@@ -31,8 +29,12 @@ import android.text.TextUtils;
 
 import androidx.annotation.RequiresApi;
 
+import com.android.art.rw.flags.Flags;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.art.model.ArtFlags;
+import com.android.server.art.model.ArtFlags.PriorityClassApi;
+import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Clock;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.PackageState;
 
@@ -177,6 +179,9 @@ public class ReasonMapping {
                 // unless explicitly overridden.
                 return getCompilerFilterForReason(REASON_BG_DEXOPT);
             }
+            if (reason.equals(REASON_PRE_REBOOT_DEXOPT_SYNC)) {
+                return getCompilerFilterForReason(REASON_PRE_REBOOT_DEXOPT);
+            }
             throw new IllegalArgumentException("No compiler filter for reason '" + reason + "'");
         }
         if (!Utils.isValidArtServiceCompilerFilter(value)) {
@@ -207,6 +212,7 @@ public class ReasonMapping {
                 return ArtFlags.PRIORITY_INTERACTIVE;
             case REASON_BG_DEXOPT:
             case REASON_PRE_REBOOT_DEXOPT:
+            case REASON_PRE_REBOOT_DEXOPT_SYNC:
             case REASON_POST_UNATTENDED_REBOOT:
             case REASON_INACTIVE:
             case REASON_INSTALL_BULK:
@@ -235,6 +241,8 @@ public class ReasonMapping {
             // The Post unattended reboot job is supposed to use the bg-dexopt concurrency, unless
             // explicitly overridden.
             defaultValue = getConcurrencyForReason(REASON_BG_DEXOPT);
+        } else if (reason.equals(REASON_PRE_REBOOT_DEXOPT_SYNC)) {
+            defaultValue = getConcurrencyForReason(REASON_PRE_REBOOT_DEXOPT);
         }
 
         return SystemProperties.getInt("pm.dexopt." + reason + ".concurrency", defaultValue);
@@ -248,25 +256,31 @@ public class ReasonMapping {
     public List<String> getDefaultPackagesForReason(PackageManagerLocal.FilteredSnapshot snapshot,
             /* @BatchDexoptReason|REASON_INACTIVE */ String reason) {
         var appHibernationManager = mInjector.getAppHibernationManager();
+        long now = mInjector.getClock().currentTimeMillis();
 
-        // Filter out hibernating packages even if the reason is REASON_INACTIVE. This is because
-        // artifacts for hibernating packages are already deleted.
         Stream<PackageInfo> packages =
                 snapshot.getPackageStates()
                         .values()
                         .stream()
+                        // Filter out hibernating packages even if the reason is REASON_INACTIVE.
+                        // This is because artifacts for hibernating packages are already deleted.
                         .filter(pkgState -> Utils.canDexoptPackage(pkgState, appHibernationManager))
                         .map(pkgState
                                 -> new PackageInfo(pkgState,
                                         Utils.getPackageLastActiveTime(pkgState,
                                                 mInjector.getDexUseManager(),
-                                                mInjector.getUserManager())));
+                                                mInjector.getUserManager()),
+                                        Flags.hybridPreRebootDexopt()
+                                                ? mInjector.getDexUseManager()
+                                                          .calculateDecayedPackageScore(
+                                                                  pkgState.getPackageName(), now)
+                                                : 0D));
 
         // "pm.dexopt.downgrade_after_inactive_days" is repurposed to also determine whether to
         // dexopt a package.
         long inactiveMs = TimeUnit.DAYS.toMillis(SystemProperties.getInt(
                 "pm.dexopt.downgrade_after_inactive_days", Integer.MAX_VALUE /* def */));
-        long currentTimeMs = mInjector.getCurrentTimeMillis();
+        long currentTimeMs = mInjector.getClock().currentTimeMillis();
         long thresholdTimeMs = currentTimeMs - inactiveMs;
 
         packages = switch (reason) {
@@ -277,18 +291,30 @@ public class ReasonMapping {
                                         pkgInfo.pkgState().getPackageName()));
             case ReasonMapping.REASON_INACTIVE ->
                 packages.filter(pkgInfo -> pkgInfo.lastActiveTime() <= thresholdTimeMs)
-                        .sorted(Comparator.comparingLong(pkgInfo -> pkgInfo.lastActiveTime()));
+                        .sorted(Comparator.<PackageInfo>comparingDouble(pkgInfo -> pkgInfo.score())
+                                        .thenComparingLong(pkgInfo -> pkgInfo.lastActiveTime()));
             // Don't filter the default package list and no need to sort as in some cases the system
             // time can advance during bootup after package installation and cause filtering to
             // exclude all packages when m.dexopt.downgrade_after_inactive_days is set. See
             // aosp/3237478 for more details.
             case ReasonMapping.REASON_FIRST_BOOT -> packages;
-            default ->
-                packages.filter(pkgInfo -> pkgInfo.lastActiveTime() > thresholdTimeMs)
-                        .sorted(Comparator
-                                        .<PackageInfo>comparingLong(
-                                                pkgInfo -> pkgInfo.lastActiveTime())
-                                        .reversed());
+            default -> {
+                Comparator<PackageInfo> comparator =
+                        Comparator.<PackageInfo>comparingDouble(PackageInfo::score)
+                                .thenComparingLong(PackageInfo::lastActiveTime)
+                                .reversed();
+                if (reason.equals(REASON_PRE_REBOOT_DEXOPT_SYNC)) {
+                    comparator = Comparator
+                                         .comparing((PackageInfo pkgInfo) -> {
+                                             return Constants.getPreRebootDexoptSyncForcedPackages()
+                                                     .contains(pkgInfo.pkgState().getPackageName());
+                                         })
+                                         .reversed()
+                                         .thenComparing(comparator);
+                }
+                yield packages.filter(pkgInfo -> pkgInfo.lastActiveTime() > thresholdTimeMs)
+                        .sorted(comparator);
+            }
         };
 
         return packages.map(pkgInfo -> pkgInfo.pkgState().getPackageName()).toList();
@@ -371,7 +397,7 @@ public class ReasonMapping {
         };
     }
 
-    private record PackageInfo(PackageState pkgState, long lastActiveTime) {}
+    private record PackageInfo(PackageState pkgState, long lastActiveTime, double score) {}
 
     /**
      * Injector pattern for testing purpose.
@@ -411,8 +437,8 @@ public class ReasonMapping {
             return Utils.isLauncherPackage(mContext, packageName);
         }
 
-        public long getCurrentTimeMillis() {
-            return System.currentTimeMillis();
+        public Clock getClock() {
+            return Clock.DEFAULT;
         }
     }
 }

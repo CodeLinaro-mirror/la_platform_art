@@ -83,6 +83,7 @@ static constexpr const char* kAndroidDataDefaultPath = "/data";
 static constexpr const char* kAndroidExpandEnvVar = "ANDROID_EXPAND";
 static constexpr const char* kAndroidExpandDefaultPath = "/mnt/expand";
 static constexpr const char* kAndroidArtRootEnvVar = "ANDROID_ART_ROOT";
+static constexpr const char* kAndroidApexRootEnvVar = "ANDROID_APEX_ROOT";
 static constexpr const char* kApexDefaultPath = "/apex/";
 static constexpr const char* kArtApexDataEnvVar = "ART_APEX_DATA";
 static constexpr const char* kBootImageStem = "boot";
@@ -259,6 +260,30 @@ std::string GetAndroidExpand() {
 
 std::string GetArtApexData() {
   return GetAndroidDir(kArtApexDataEnvVar, kArtApexDataDefaultPath, /*must_exist=*/false);
+}
+
+std::string GetApexRoot() {
+  return GetAndroidDir(kAndroidApexRootEnvVar, kApexDefaultPath, /*must_exist=*/false);
+}
+
+std::vector<std::string> GetMainlineBootImageProfilePaths(
+    const std::vector<std::string>& mainline_bcp_jars) {
+  std::unordered_set<std::string> profiles;
+  std::string apex_root = GetApexRoot();
+
+  for (const std::string& jar : mainline_bcp_jars) {
+    std::string_view apex_name = ApexNameFromLocation(jar);
+    if (apex_name.empty()) {
+      continue;
+    }
+
+    std::string profile = ART_FORMAT("{}/{}/etc/boot-image.prof", apex_root, apex_name);
+
+    if (OS::FileExists(profile.c_str())) {
+      profiles.insert(std::move(profile));
+    }
+  }
+  return std::vector<std::string>(profiles.begin(), profiles.end());
 }
 
 static std::string GetPrebuiltPrimaryBootImageDir(const std::string& android_root) {
@@ -740,6 +765,57 @@ static bool EndsWithSlash(const char* str) {
   return len > 0 && str[len - 1] == '/';
 }
 
+// Returns true if full_path starts with <prefix>/<subdir>, where subdir is optional.
+static bool PathStartsWith(std::string_view full_path, const char* prefix, const char* subdir) {
+  // Build the path which we will check is a prefix of `full_path`. The prefix must
+  // end with a slash, so that "/foo/bar" does not match "/foo/barz".
+  DCHECK(StartsWithSlash(prefix)) << prefix;
+  std::string path_prefix(prefix);
+  if (!EndsWithSlash(path_prefix.c_str())) {
+    path_prefix.append("/");
+  }
+  if (subdir != nullptr) {
+    // If `subdir` is provided, we assume it is provided without a starting slash
+    // but ending with one, e.g. "sub/dir/". `path_prefix` ends with a slash at
+    // this point, so we simply append `subdir`.
+    DCHECK(!StartsWithSlash(subdir) && EndsWithSlash(subdir)) << subdir;
+    path_prefix.append(subdir);
+  }
+
+  return full_path.starts_with(path_prefix);
+}
+
+bool LocationIsOnSystemFramework(std::string_view dex_location) {
+  return PathStartsWith(dex_location, kAndroidRootDefaultPath, /* subdir= */ "framework/");
+}
+
+bool LocationIsOnSystemExtFramework(std::string_view dex_location) {
+  return PathStartsWith(
+             dex_location, kAndroidSystemExtRootDefaultPath, /* subdir= */ "framework/") ||
+         // When the 'system_ext' partition is not present, builds will create
+         // '/system/system_ext' instead.
+         PathStartsWith(
+             dex_location, kAndroidRootDefaultPath, /* subdir= */ "system_ext/framework/");
+}
+
+bool LocationIsOnApex(std::string_view dex_location) {
+  return dex_location.starts_with(GetApexRoot());
+}
+
+std::string_view ApexNameFromLocation(std::string_view dex_location) {
+  std::string apex_root = GetApexRoot();
+  if (!dex_location.starts_with(apex_root)) {
+    return {};
+  }
+  size_t start = apex_root.length();
+  size_t end = dex_location.find('/', start);
+  if (end == std::string_view::npos) {
+    return {};
+  }
+  return dex_location.substr(start, end - start);
+}
+
+#ifndef _WIN32
 // Returns true if `full_path` is located in folder either provided with `env_var`
 // or in `default_path` otherwise. The caller may optionally provide a `subdir`
 // which will be appended to the tested prefix.
@@ -758,60 +834,9 @@ static bool IsLocationOn(std::string_view full_path,
   if (path == nullptr) {
     return false;
   }
-
-  // Build the path which we will check is a prefix of `full_path`. The prefix must
-  // end with a slash, so that "/foo/bar" does not match "/foo/barz".
-  DCHECK(StartsWithSlash(path)) << path;
-  std::string path_prefix(path);
-  if (!EndsWithSlash(path_prefix.c_str())) {
-    path_prefix.append("/");
-  }
-  if (subdir != nullptr) {
-    // If `subdir` is provided, we assume it is provided without a starting slash
-    // but ending with one, e.g. "sub/dir/". `path_prefix` ends with a slash at
-    // this point, so we simply append `subdir`.
-    DCHECK(!StartsWithSlash(subdir) && EndsWithSlash(subdir)) << subdir;
-    path_prefix.append(subdir);
-  }
-
-  return full_path.starts_with(path_prefix);
+  return PathStartsWith(full_path, path, subdir);
 }
-
-bool LocationIsOnSystemFramework(std::string_view full_path) {
-  return IsLocationOn(full_path,
-                      kAndroidRootEnvVar,
-                      kAndroidRootDefaultPath,
-                      /* subdir= */ "framework/");
-}
-
-bool LocationIsOnSystemExtFramework(std::string_view full_path) {
-  return IsLocationOn(full_path,
-                      kAndroidSystemExtRootEnvVar,
-                      kAndroidSystemExtRootDefaultPath,
-                      /* subdir= */ "framework/") ||
-         // When the 'system_ext' partition is not present, builds will create
-         // '/system/system_ext' instead.
-         IsLocationOn(full_path,
-                      kAndroidRootEnvVar,
-                      kAndroidRootDefaultPath,
-                      /* subdir= */ "system_ext/framework/");
-}
-
-bool LocationIsOnApex(std::string_view full_path) {
-  return full_path.starts_with(kApexDefaultPath);
-}
-
-std::string_view ApexNameFromLocation(std::string_view full_path) {
-  if (!full_path.starts_with(kApexDefaultPath)) {
-    return {};
-  }
-  size_t start = strlen(kApexDefaultPath);
-  size_t end = full_path.find('/', start);
-  if (end == std::string_view::npos) {
-    return {};
-  }
-  return full_path.substr(start, end - start);
-}
+#endif
 
 bool LocationIsOnSystem(const std::string& location) {
 #ifdef _WIN32

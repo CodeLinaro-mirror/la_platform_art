@@ -17,6 +17,7 @@
 package com.android.server.art;
 
 import android.annotation.CallbackExecutor;
+import android.annotation.FlaggedApi;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.SystemApi;
@@ -48,6 +49,7 @@ import android.util.Pair;
 
 import androidx.annotation.RequiresApi;
 
+import com.android.art.rw.flags.Flags;
 import com.android.internal.annotations.GuardedBy;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.build.SdkLevel;
@@ -64,8 +66,6 @@ import com.android.server.art.ProfilePath.PrimaryCurProfilePath;
 import com.android.server.art.ProfilePath.WritableProfilePath;
 import com.android.server.art.ReasonMapping.BatchDexoptReason;
 import com.android.server.art.ReasonMapping.BootReason;
-import com.android.server.art.Utils.Abi;
-import com.android.server.art.Utils.InitProfileResult;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.ArtFlags.GetStatusFlags;
 import com.android.server.art.model.ArtFlags.ScheduleStatus;
@@ -80,7 +80,15 @@ import com.android.server.art.model.DexoptResult;
 import com.android.server.art.model.DexoptStatus;
 import com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
 import com.android.server.art.model.OperationProgress;
+import com.android.server.art.model.VerifyDexoptArtifactsResult;
 import com.android.server.art.prereboot.PreRebootStatsReporter;
+import com.android.server.art.utils.AidlUtils;
+import com.android.server.art.utils.ArtdRefCache;
+import com.android.server.art.utils.AsLog;
+import com.android.server.art.utils.Utils;
+import com.android.server.art.utils.Utils.Abi;
+import com.android.server.art.utils.Utils.Clock;
+import com.android.server.art.utils.Utils.InitProfileResult;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
@@ -108,9 +116,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -391,6 +396,29 @@ public final class ArtManagerLocal {
         try (var pin = mInjector.createArtdPin()) {
             return mInjector.getDexoptHelper().dexopt(
                     snapshot, List.of(packageName), params, cancellationSignal, Runnable::run);
+        } finally {
+            mCleanupLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Verifies that the dexopt artifacts for packages with {@link
+     * PackageState#shouldVerifyCompilationArtifacts()} are produced by trusted environments.
+     *
+     * @param snapshot the snapshot from {@link PackageManagerLocal} to operate on
+     * @return the verification result
+     * @throws IllegalStateException if the operation encounters an error that should never happen
+     *         (e.g., an internal logic error), such as if the ART daemon is unreachable.
+     */
+    // TODO(b/419024976): when available: @RequiresApi(Build.VERSION_CODES.CINNAMON_BUN_1)
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    @FlaggedApi(Flags.FLAG_SECURE_COMPILATION)
+    @NonNull
+    public VerifyDexoptArtifactsResult verifyDexoptArtifacts(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        mCleanupLock.readLock().lock();
+        try (var pin = mInjector.createArtdPin()) {
+            return mInjector.getDexoptHelper().verifyDexoptArtifacts(snapshot, Runnable::run);
         } finally {
             mCleanupLock.readLock().unlock();
         }
@@ -976,7 +1004,8 @@ public final class ArtManagerLocal {
                             // artifacts are for an old Mainline version), we should clean them up.
                             statsAfterRebootSession.recordArtifactsEndStatus(
                                     PreRebootStatsReporter.END_STATUS_OBSOLETE,
-                                    mInjector.getCurrentTimeMillis() - status.createdAtMillis);
+                                    mInjector.getClock().currentTimeMillis()
+                                            - status.createdAtMillis);
                             AsLog.i("Staged files discarded: " + status.reason);
                             mInjector.getArtd().cleanUpPreRebootStagedFiles();
                         } else {
@@ -988,7 +1017,8 @@ public final class ArtManagerLocal {
                             // secondary dex files because they are not decrypted before then.
                             statsAfterRebootSession.recordArtifactsEndStatus(
                                     PreRebootStatsReporter.END_STATUS_COMMITTED,
-                                    mInjector.getCurrentTimeMillis() - status.createdAtMillis);
+                                    mInjector.getClock().currentTimeMillis()
+                                            - status.createdAtMillis);
                             mShouldCommitPreRebootStagedFiles = true;
                             // The stats reporting will be deferred to `systemReady`.
                             mStatsAfterRebootSession = statsAfterRebootSession;
@@ -1706,7 +1736,6 @@ public final class ArtManagerLocal {
         @Nullable private final Context mContext;
         @Nullable private final PackageManagerLocal mPackageManagerLocal;
         @Nullable private final Config mConfig;
-        @Nullable private final ThreadPoolExecutor mReporterExecutor;
         @Nullable private BackgroundDexoptJob mBgDexoptJob = null;
         @Nullable private PreRebootDexoptJob mPrDexoptJob = null;
 
@@ -1717,7 +1746,6 @@ public final class ArtManagerLocal {
             mContext = null;
             mPackageManagerLocal = null;
             mConfig = null;
-            mReporterExecutor = null;
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1728,10 +1756,6 @@ public final class ArtManagerLocal {
             mPackageManagerLocal = Objects.requireNonNull(
                     LocalManagerRegistry.getManager(PackageManagerLocal.class));
             mConfig = new Config();
-            mReporterExecutor =
-                    new ThreadPoolExecutor(1 /* corePoolSize */, 1 /* maximumPoolSize */,
-                            60 /* keepTimeAlive */, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
-            mReporterExecutor.allowsCoreThreadTimeOut();
 
             // Call the getters for the dependencies that aren't optional, to ensure correct
             // initialization order.
@@ -1780,19 +1804,13 @@ public final class ArtManagerLocal {
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public DexoptHelper getDexoptHelper() {
-            return new DexoptHelper(getContext(), getConfig(), getReporterExecutor());
+            return new DexoptHelper(getContext(), getConfig());
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public Config getConfig() {
             return mConfig;
-        }
-
-        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-        @NonNull
-        public Executor getReporterExecutor() {
-            return mReporterExecutor;
         }
 
         /** Returns the registered {@link AppHibernationManager} instance. */
@@ -1839,8 +1857,8 @@ public final class ArtManagerLocal {
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-        public long getCurrentTimeMillis() {
-            return System.currentTimeMillis();
+        public Clock getClock() {
+            return Clock.DEFAULT;
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
