@@ -356,13 +356,10 @@ class CompilerOptions final {
 
   EXPORT bool IsImageClass(const char* descriptor) const;
 
-  // Returns whether the given `klass` is listed in the "classes-no-preload" profile section.
+  // Returns whether the given `klass` is a no-preload class (one that is not allowed to be
+  // initialized in zygote, either because it fails initialization, or because it is a logical
+  // error to initialize it once for all processes).
   EXPORT bool IsNoPreloadClass(Handle<mirror::Class> klass) const;
-
-  // Returns whether the given `pretty_descriptor` is in the list of preloaded
-  // classes. `pretty_descriptor` should be the result of calling `PrettyDescriptor`.
-  // TODO(b/383506474): deprecate this and migrate to profile-based detection (`IsNoPreloadClass`).
-  EXPORT bool IsPreloadedClass(std::string_view pretty_descriptor) const;
 
   bool ParseCompilerOptions(const std::vector<std::string>& options,
                             bool ignore_unrecognized,
@@ -481,6 +478,7 @@ class CompilerOptions final {
   // Classes listed in the preloaded-classes file, used for boot image and
   // boot image extension compilation.
   HashSet<std::string> preloaded_classes_;
+  bool ignore_preloaded_classes_ = false;
   CompilerType compiler_type_;
   ImageType image_type_;
   bool multi_image_;
