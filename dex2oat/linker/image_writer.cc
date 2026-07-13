@@ -981,10 +981,17 @@ static bool IsImageClass(const CompilerOptions& compiler_options, ObjPtr<mirror:
     if (array_dim == 0u) {
       return true;
     }
-    // Primitive classes and their arrays are attributed to the first dex file.
-    const DexFile* dex_file = compiler_options.GetDexFilesForOatFile().front();
+    // Search all BCP dex files for the one containing this primitive's TypeId.
+    // QCOM builds prepend vendor jars (e.g. QPerformance.jar) that do not define
+    // primitive TypeIds, so front() may not be the dex file used when the entry
+    // was added to ImageClassMap in compiler_driver.cc.
     std::string_view descriptor = klass->GetPrimitiveDescriptorView();
-    return compiler_options.GetImageClasses().Contains(dex_file, descriptor, array_dim);
+    for (const DexFile* dex_file : compiler_options.GetDexFilesForOatFile()) {
+      if (dex_file->FindTypeId(descriptor) != nullptr) {
+        return compiler_options.GetImageClasses().Contains(dex_file, descriptor, array_dim);
+      }
+    }
+    return false;
   } else {
     TypeReference type_ref(&klass->GetDexFile(), klass->GetDexTypeIndex());
     return compiler_options.IsImageClass(type_ref, array_dim);
