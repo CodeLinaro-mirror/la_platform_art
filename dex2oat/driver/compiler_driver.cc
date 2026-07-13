@@ -1192,6 +1192,22 @@ bool ResolveCatchBlockExceptionsClassVisitor::FindExceptionTypesToResolve(
   return !exception_types_to_resolve_.empty();
 }
 
+// Find the boot classpath dex file that contains a TypeId for the given descriptor.
+// Primitive type descriptors (e.g. "I", "Z") live in core-oj.jar, but QCOM builds prepend
+// vendor jars (e.g. QPerformance.jar) that do not define primitive TypeIds. Searching the
+// full list instead of assuming front() avoids a CHECK failure when front() != core-oj.jar.
+static std::pair<const DexFile*, const dex::TypeId*> FindPrimitiveDexFileAndTypeId(
+    std::string_view descriptor) {
+  for (const DexFile* dex_file :
+       Runtime::Current()->GetClassLinker()->GetBootClassPath()) {
+    const dex::TypeId* type_id = dex_file->FindTypeId(descriptor);
+    if (type_id != nullptr) {
+      return {dex_file, type_id};
+    }
+  }
+  return {nullptr, nullptr};
+}
+
 static inline bool CanIncludeInCurrentImage(ObjPtr<mirror::Class> klass)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(klass != nullptr);
@@ -1219,13 +1235,20 @@ class RecordImageClassesVisitor : public ClassVisitor {
     TypeReference type_ref(nullptr, dex::TypeIndex(DexFile::kDexNoIndex16));
     if (component_type->IsPrimitive() || array_dim != 0u) {
       DCHECK_EQ(can_include_in_image, resolved && CanIncludeInCurrentImage(component_type));
-      // Primitive classes are attributed to the first boot class path dex file.
-      const DexFile* dex_file = component_type->IsPrimitive()
-          ? Runtime::Current()->GetClassLinker()->GetBootClassPath().front()
-          : &component_type->GetDexFile();
-      std::string_view descriptor = component_type->IsPrimitive()
-          ? component_type->GetPrimitiveDescriptorView()
-          : component_type->GetDescriptorView();
+      // Primitive classes are attributed to the boot classpath dex file that defines them.
+      // Note: We search the full BCP rather than using front() because vendor builds may
+      // prepend dex files (e.g. QPerformance.jar) that do not contain primitive TypeIds.
+      const DexFile* dex_file;
+      std::string_view descriptor;
+      if (component_type->IsPrimitive()) {
+        descriptor = component_type->GetPrimitiveDescriptorView();
+        auto [prim_dex_file, type_id_ptr] = FindPrimitiveDexFileAndTypeId(descriptor);
+        CHECK(prim_dex_file != nullptr) << "No BCP dex file contains primitive: " << descriptor;
+        dex_file = prim_dex_file;
+      } else {
+        dex_file = &component_type->GetDexFile();
+        descriptor = component_type->GetDescriptorView();
+      }
       // Use descriptor-based lookup to try and avoid searching for the `TypeId` in the dex file.
       if (can_include_in_image == image_classes_->Contains(dex_file, descriptor, array_dim)) {
         return true;
@@ -1436,10 +1459,10 @@ static void MaybeAddToImageClasses(Thread* self,
   size_t array_dim;
   std::tie(klass, array_dim) = klass->GetInnermostComponentTypeAndArrayDim();
   if (klass->IsPrimitive()) {
-    // Primitive classes are attributed to the first boot class path dex file.
-    const DexFile* dex_file = Runtime::Current()->GetClassLinker()->GetBootClassPath().front();
-    const dex::TypeId* type_id = dex_file->FindTypeId(klass->GetPrimitiveDescriptorView());
-    CHECK(type_id != nullptr);
+    // Primitive classes are attributed to the boot classpath dex file that defines them.
+    std::string_view descriptor = klass->GetPrimitiveDescriptorView();
+    auto [dex_file, type_id] = FindPrimitiveDexFileAndTypeId(descriptor);
+    CHECK(dex_file != nullptr) << "No BCP dex file contains primitive: " << descriptor;
     TypeReference type_ref(dex_file, dex_file->GetIndexForTypeId(*type_id));
     image_classes->Add(type_ref, array_dim);  // Does nothing if already present.
     // No superclasses, interfaces or copied methods' classes to add.
@@ -1551,8 +1574,10 @@ class ClinitImageUpdate {
       TypeReference type_ref(nullptr, dex::TypeIndex(DexFile::kDexNoIndex16));
       if (component_type->IsPrimitive()) {
         // Primitive classes are attributed to the first boot class path dex file.
-        const DexFile* dex_file = Runtime::Current()->GetClassLinker()->GetBootClassPath().front();
         std::string_view descriptor = component_type->GetPrimitiveDescriptorView();
+        auto [prim_dex_file, type_id_ptr] = FindPrimitiveDexFileAndTypeId(descriptor);
+        CHECK(prim_dex_file != nullptr) << "No BCP dex file contains primitive: " << descriptor;
+        const DexFile* dex_file = prim_dex_file;
         // Use descriptor-based lookup to try and avoid searching for the `TypeId` in the dex file.
         if (can_include_in_image ==
             data_->image_classes_->Contains(dex_file, descriptor, array_dim)) {
