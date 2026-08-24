@@ -770,23 +770,33 @@ def default_run(ctx, args, **kwargs):
   # specific profile to run properly.
   if PROFILE or RANDOM_PROFILE:
     profman_cmdline = f"{ANDROID_ART_BIN_DIR}/profman  \
-      --apk={DEX_LOCATION}/{TEST_NAME}.jar \
-      --dex-location={DEX_LOCATION}/{TEST_NAME}.jar"
-
-    if isfile(f"{TEST_NAME}-ex.jar") and SECONDARY_COMPILATION:
-      profman_cmdline = f"{profman_cmdline} \
-        --apk={DEX_LOCATION}/{TEST_NAME}-ex.jar \
-        --dex-location={DEX_LOCATION}/{TEST_NAME}-ex.jar"
-
+        --apk={DEX_LOCATION}/{TEST_NAME}.jar \
+        --dex-location={DEX_LOCATION}/{TEST_NAME}.jar"
     COMPILE_FLAGS = f"{COMPILE_FLAGS} --profile-file={DEX_LOCATION}/{TEST_NAME}.prof"
     FLAGS = f"{FLAGS} -Xcompiler-option --profile-file={DEX_LOCATION}/{TEST_NAME}.prof"
     if PROFILE:
       profman_cmdline = f"{profman_cmdline} --create-profile-from={DEX_LOCATION}/profile \
           --reference-profile-file={DEX_LOCATION}/{TEST_NAME}.prof"
-
     else:
-      profman_cmdline = f"{profman_cmdline} --generate-test-profile={DEX_LOCATION}/{TEST_NAME}.prof \
+      profman_cmdline = f"{profman_cmdline} \
+          --generate-test-profile={DEX_LOCATION}/{TEST_NAME}.prof \
           --generate-test-profile-seed=0"
+
+    if isfile(f"{TEST_NAME}-ex.jar") and SECONDARY_COMPILATION:
+      profman_cmdline_ex = f"{ANDROID_ART_BIN_DIR}/profman  \
+          --apk={DEX_LOCATION}/{TEST_NAME}-ex.jar \
+          --dex-location={DEX_LOCATION}/{TEST_NAME}-ex.jar"
+      COMPILE_FLAGS = f"{COMPILE_FLAGS} --profile-file={DEX_LOCATION}/{TEST_NAME}-ex.prof"
+      FLAGS = f"{FLAGS} -Xcompiler-option --profile-file={DEX_LOCATION}/{TEST_NAME}-ex.prof"
+      if PROFILE:
+        # Note: We're currently using the same `profile` text file as for the primary profile.
+        # This does not allow requesting a duplicate class to be included only in one profile.
+        profman_cmdline_ex = f"{profman_cmdline_ex} --create-profile-from={DEX_LOCATION}/profile \
+            --reference-profile-file={DEX_LOCATION}/{TEST_NAME}-ex.prof"
+      else:
+        profman_cmdline_ex = f"{profman_cmdline_ex} \
+            --generate-test-profile={DEX_LOCATION}/{TEST_NAME}-ex.prof \
+            --generate-test-profile-seed=0"
 
   def write_dex2oat_cmdlines(name: str):
     nonlocal dex2oat_cmdline, dm_cmdline, vdex_cmdline
@@ -963,6 +973,7 @@ def default_run(ctx, args, **kwargs):
   dm_cmdline = re.sub(" +", " ", dm_cmdline)
   vdex_cmdline = re.sub(" +", " ", vdex_cmdline)
   profman_cmdline = re.sub(" +", " ", profman_cmdline)
+  profman_cmdline_ex = re.sub(" +", " ", profman_cmdline_ex)
 
   # Use an empty ASAN_OPTIONS to enable defaults.
   # Note: this is required as envsetup right now exports detect_leaks=0.
@@ -1081,6 +1092,7 @@ def default_run(ctx, args, **kwargs):
 
     ctx.run(f"rm -rf {DEX_LOCATION}/{{oat,dalvik-cache}}/ && mkdir -p {mkdir_locations}")
     ctx.run(f"{profman_cmdline}")
+    ctx.run(f"{profman_cmdline_ex}")
     ctx.run(f"{dex2oat_cmdline}", desc="Dex2oat")
     ctx.run(f"{dm_cmdline}")
     ctx.run(f"{vdex_cmdline}")
@@ -1157,6 +1169,7 @@ def default_run(ctx, args, **kwargs):
     ctx.run(linkroot_cmdline)
     ctx.run(linkroot_overlay_cmdline)
     ctx.run(profman_cmdline)
+    ctx.run(profman_cmdline_ex)
     ctx.run(dex2oat_cmdline, desc="Dex2oat")
     ctx.run(dm_cmdline)
     ctx.run(vdex_cmdline)
